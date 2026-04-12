@@ -1,0 +1,14 @@
+[package]
+name = "orbitxfer-iroh-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+iroh = "0.96"
+iroh-blobs = { version = "0.98", features = ["fs-store"] }
+serde_json = "1"
+futures-lite = "2"
+irpc = { version = "0.12", default-features = false, features = ["stream", "spans", "derive", "varint-util"] }
+fs2 = "0.4"

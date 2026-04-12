@@ -1,0 +1,83 @@
+name: Build OrbitXfer
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: OrbitXfer-iroh-gui/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            OrbitXfer-iroh-cli/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('OrbitXfer-iroh-cli/Cargo.lock') }}
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfuse2
+
+      - name: Build CLI (release)
+        working-directory: OrbitXfer-iroh-cli
+        run: cargo build --release
+
+      - name: Copy CLI into GUI bin
+        shell: bash
+        run: |
+          mkdir -p OrbitXfer-iroh-gui/bin
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp OrbitXfer-iroh-cli/target/release/orbitxfer-iroh-cli.exe OrbitXfer-iroh-gui/bin/orbitxfer-iroh-cli.exe
+          else
+            cp OrbitXfer-iroh-cli/target/release/orbitxfer-iroh-cli OrbitXfer-iroh-gui/bin/orbitxfer-iroh-cli
+            chmod +x OrbitXfer-iroh-gui/bin/orbitxfer-iroh-cli
+          fi
+
+      - name: Install GUI deps
+        working-directory: OrbitXfer-iroh-gui
+        run: npm ci
+
+      - name: Build GUI (mac)
+        if: runner.os == 'macOS'
+        working-directory: OrbitXfer-iroh-gui
+        run: npm run build:mac
+
+      - name: Build GUI (win)
+        if: runner.os == 'Windows'
+        working-directory: OrbitXfer-iroh-gui
+        run: npm run build:win
+
+      - name: Build GUI (linux)
+        if: runner.os == 'Linux'
+        working-directory: OrbitXfer-iroh-gui
+        run: npm run build:linux
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrbitXfer-${{ runner.os }}
+          path: OrbitXfer-iroh-gui/dist/

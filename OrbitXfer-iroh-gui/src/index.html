@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OrbitXfer</title>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --ink: #0f172a;
+      --muted: #475569;
+      --panel: #ffffff;
+      --soft: #f8fafc;
+      --line: #e2e8f0;
+      --primary: #0ea5e9;
+      --primary-dark: #0284c7;
+      --accent: #f97316;
+      --success: #16a34a;
+      --error: #dc2626;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "IBM Plex Sans", sans-serif;
+      background: radial-gradient(circle at top left, #e0f2fe 0%, #fff7ed 45%, #f8fafc 100%);
+      color: var(--ink);
+      min-height: 100vh;
+      padding: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .shell {
+      width: min(1100px, 100%);
+      max-width: 1100px;
+      background: var(--panel);
+      border-radius: 24px;
+      box-shadow: 0 30px 80px rgba(15, 23, 42, 0.15);
+      padding: 36px;
+      display: grid;
+      gap: 24px;
+      animation: rise 0.6s ease;
+    }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    h1 {
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 34px;
+      font-weight: 700;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      margin-top: 6px;
+    }
+
+    .config {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      padding: 16px;
+      background: var(--soft);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+    }
+
+    label {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 6px;
+      display: block;
+    }
+
+    input, textarea {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      font-family: "IBM Plex Sans", sans-serif;
+      font-size: 14px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 20px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-items: stretch;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 20px;
+      background: var(--panel);
+      display: grid;
+      gap: 14px;
+      box-shadow: 0 16px 40px rgba(15, 23, 42, 0.08);
+      min-width: 0;
+      width: 100%;
+    }
+
+        .send-card {
+      contain: layout;
+      min-width: 0;
+      max-width: 100%;
+    }
+
+.card h2 {
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 20px;
+    }
+
+    .row {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .row-inline {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      min-width: 0;
+    }
+
+    .btn {
+      border: none;
+      border-radius: 12px;
+      padding: 10px 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      background: var(--primary);
+      color: #fff;
+    }
+
+    .btn:hover { background: var(--primary-dark); }
+
+    .btn-outline {
+      background: transparent;
+      border: 1px solid var(--line);
+      color: var(--ink);
+    }
+
+    .btn-outline:hover { border-color: var(--primary); color: var(--primary); }
+
+    .btn-secondary {
+      background: var(--accent);
+    }
+
+    .btn-secondary:hover { filter: brightness(0.95); }
+
+    .btn-stop {
+      background: #ef4444;
+    }
+
+    .btn-stop:hover { filter: brightness(0.95); }
+
+    .status {
+      padding: 8px 12px;
+      border-radius: 10px;
+      font-size: 13px;
+    }
+
+    .status-info { background: #eff6ff; color: #1d4ed8; }
+    .status-success { background: #ecfdf3; color: #166534; }
+    .status-error { background: #fef2f2; color: #991b1b; }
+
+    .progress {
+      display: grid;
+      gap: 6px;
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 10px;
+      border-radius: 999px;
+      background: #e2e8f0;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--primary), var(--accent));
+      transition: width 0.25s ease;
+    }
+
+    .progress-meta {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .ticket {
+      background: #0f172a;
+      color: #f8fafc;
+      padding: 12px;
+      border-radius: 12px;
+      font-family: "IBM Plex Sans", monospace;
+      font-size: 12px;
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      max-width: 100%;
+      min-width: 0;
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    .ticket-compact {
+      height: 96px;
+      max-height: 96px;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    .log {
+      background: #0b1220;
+      color: #e2e8f0;
+      border-radius: 12px;
+      padding: 12px;
+      font-size: 12px;
+      height: 160px;
+      overflow-y: auto;
+      display: grid;
+      gap: 6px;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+
+    .log-error { color: #fecaca; }
+
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 720px) {
+      .shell { padding: 24px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div>
+        <h1>OrbitXfer</h1>
+        <p class="subtitle">Iroh-powered transfers with BLAKE3 verification.</p>
+      </div>
+    </header>
+
+    <section class="config hidden" hidden>
+      <div>
+        <label>OrbitXfer CLI Path</label>
+        <input id="cliPath" placeholder="Leave blank to auto-detect" />
+      </div>
+      <div>
+        <label>Store Directory</label>
+        <div class="row-inline">
+          <input id="storeDir" placeholder="Defaults to .orbitxfer-store" />
+          <button class="btn btn-outline" onclick="pickStoreDir()">Browse</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="card send-card">
+        <h2>Send</h2>
+        <div class="row">
+          <label>File to send</label>
+          <div class="row-inline">
+            <input id="sendFile" placeholder="/path/to/file" />
+            <button class="btn btn-outline" onclick="pickFile()">Choose</button>
+          </div>
+        </div>
+        <div class="row-inline">
+          <button id="startSendBtn" class="btn" onclick="startSend()">Start Sharing</button>
+          <button id="stopSendBtn" class="btn btn-stop" onclick="stopSend()" disabled>Stop</button>
+        </div>
+        <div class="row">
+          <label>Ticket creation</label>
+          <div id="sendTicketStatus" class="status status-info">Idle.</div>
+          <div class="progress">
+            <div class="progress-bar">
+              <div id="sendTicketBar" class="progress-fill"></div>
+            </div>
+            <div id="sendTicketProgress" class="progress-meta">—</div>
+          </div>
+        </div>
+        <div class="row hidden" hidden>
+          <label>Raw ticket</label>
+          <div class="ticket ticket-compact" id="ticketValue">—</div>
+          <div class="row-inline">
+            <button id="copyRawBtn" class="btn btn-outline" onclick="copyRawTicket()" disabled>Copy Raw Ticket</button>
+          </div>
+        </div>
+        <div class="row">
+          <label>Share token (includes filename)</label>
+          <div class="ticket ticket-compact" id="shareTokenValue">—</div>
+          <div class="row-inline">
+            <button id="copyShareBtn" class="btn btn-secondary" onclick="copyTicket()" disabled>Copy Share Token</button>
+          </div>
+        </div>
+        <div class="row">
+          <label>Receiver</label>
+          <div id="sendReceiverStatus" class="status status-info">Waiting for receiver…</div>
+        </div>
+        <div class="row">
+          <label>Upload progress</label>
+          <div class="progress">
+            <div class="progress-bar">
+              <div id="sendUploadBar" class="progress-fill"></div>
+            </div>
+            <div id="sendUploadProgress" class="progress-meta">—</div>
+          </div>
+        </div>
+        <div id="sendStatus" class="status status-info">Idle.</div>
+        <div>
+          <label>Log</label>
+          <div id="sendLog" class="log"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Receive</h2>
+        <div class="row">
+          <label>Ticket</label>
+          <textarea id="receiveTicket" placeholder="Paste ticket here"></textarea>
+        </div>
+        <div class="row">
+          <label>Output path</label>
+          <div class="row-inline">
+            <input id="receiveOutput" placeholder="/path/to/save" />
+            <button class="btn btn-outline" onclick="pickOutput()">Choose</button>
+          </div>
+        </div>
+        <div class="row-inline">
+          <button id="startReceiveBtn" class="btn" onclick="startReceive()">Start Download</button>
+          <button id="stopReceiveBtn" class="btn btn-stop" onclick="stopReceive()" disabled>Stop</button>
+        </div>
+        <div class="row">
+          <label>Connection</label>
+          <div id="receiveConnectStatus" class="status status-info">Idle.</div>
+        </div>
+        <div class="row">
+          <label>Download progress</label>
+          <div class="progress">
+            <div class="progress-bar">
+              <div id="receiveDownloadBar" class="progress-fill"></div>
+            </div>
+            <div id="receiveDownloadProgress" class="progress-meta">—</div>
+          </div>
+        </div>
+        <div class="row">
+          <label>Export progress</label>
+          <div class="progress">
+            <div class="progress-bar">
+              <div id="receiveExportBar" class="progress-fill"></div>
+            </div>
+            <div id="receiveExportProgress" class="progress-meta">—</div>
+          </div>
+        </div>
+        <div id="receiveStatus" class="status status-info">Idle.</div>
+        <div>
+          <label>Log</label>
+          <div id="receiveLog" class="log"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="./renderer.js"></script>
+</body>
+</html>

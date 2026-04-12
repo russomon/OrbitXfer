@@ -1,0 +1,57 @@
+{
+  "name": "orbitxfer-iroh-gui",
+  "version": "0.1.42",
+  "description": "GUI wrapper for the OrbitXfer Iroh CLI",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win",
+    "build:linux": "electron-builder --linux"
+  },
+  "build": {
+    "appId": "com.orbitolive.orbitxfer.iroh.gui",
+    "productName": "OrbitXfer",
+    "mac": {
+      "icon": "assets/icon.icns",
+      "extraResources": [
+        {
+          "from": "bin/orbitxfer-iroh-cli",
+          "to": "orbitxfer-iroh-cli"
+        }
+      ]
+    },
+    "files": [
+      "src/**/*",
+      "node_modules/**/*"
+    ],
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "extraResources": [
+        {
+          "from": "bin/orbitxfer-iroh-cli",
+          "to": "orbitxfer-iroh-cli"
+        }
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "extraResources": [
+        {
+          "from": "bin/orbitxfer-iroh-cli.exe",
+          "to": "orbitxfer-iroh-cli.exe"
+        }
+      ]
+    }
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1"
+  },
+  "license": "MIT"
+}

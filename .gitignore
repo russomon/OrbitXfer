@@ -1,0 +1,23 @@
+# OS
+.DS_Store
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Electron build output
+OrbitXfer-iroh-gui/dist/
+
+# Rust
+OrbitXfer-iroh-cli/target/
+
+# Packaged CLI binaries (copied during build)
+OrbitXfer-iroh-gui/bin/orbitxfer-iroh-cli
+OrbitXfer-iroh-gui/bin/orbitxfer-iroh-cli.exe
+
+# Local env
+.env
+.env.*
