@@ -6,13 +6,16 @@ let receiveRunning = false;
 let sendFilename = '';
 let receiveFilenameHint = '';
 let currentTicket = '';
+let currentTicketDirect = '';
+let currentTicketRelay = '';
+let currentTicketFull = '';
 let currentShareToken = '';
 let sendFileSize = null;
 let receiveExpectedSize = null;
 
 const ticketRegex = /receive\s+(\S+)/;
 const ticketPrefix = /^blob/i;
-const tokenPrefix = /^ox1:/i;
+const tokenPrefix = /^ox[12]:/i;
 const progressState = {
   sendTicketTotal: null,
   sendUploadTotal: null,
@@ -73,15 +76,42 @@ function encodeToken(ticket, filename, size) {
   return `ox1:${b64}`;
 }
 
+function encodeTokenV2(directTicket, relayTicket, filename, size) {
+  if (!ticketPrefix.test(directTicket) || !ticketPrefix.test(relayTicket)) return '';
+  const payload = { direct: directTicket, relay: relayTicket };
+  if (filename) payload.name = filename;
+  if (typeof size === 'number' && Number.isFinite(size)) {
+    payload.size = size;
+  }
+  const json = JSON.stringify(payload);
+  const b64 = Buffer.from(json, 'utf8').toString('base64url');
+  return `ox2:${b64}`;
+}
+
 function decodeToken(token) {
   if (!tokenPrefix.test(token)) return null;
   try {
+    const version = token.slice(0, 3).toLowerCase();
     const b64 = token.slice(4);
     const json = Buffer.from(b64, 'base64url').toString('utf8');
     const data = JSON.parse(json);
-    if (!data || typeof data.ticket !== 'string') return null;
+    if (!data || typeof data !== 'object') return null;
+    if (version === 'ox2') {
+      const direct = typeof data.direct === 'string' ? data.direct : '';
+      const relay = typeof data.relay === 'string' ? data.relay : '';
+      const primary = direct || relay;
+      if (!primary) return null;
+      return {
+        ticket: primary,
+        fallbackTicket: direct && relay ? relay : '',
+        filename: typeof data.name === 'string' ? data.name : '',
+        size: typeof data.size === 'number' ? data.size : null
+      };
+    }
+    if (typeof data.ticket !== 'string') return null;
     return {
       ticket: data.ticket,
+      fallbackTicket: '',
       filename: typeof data.name === 'string' ? data.name : '',
       size: typeof data.size === 'number' ? data.size : null
     };
@@ -101,9 +131,10 @@ function extractBlobTicketFromLog() {
 
 function parseTicketInput(rawValue) {
   const raw = (rawValue || '').trim();
-  if (!raw) return { ticket: '', filename: '', size: null };
+  if (!raw) return { ticket: '', fallbackTicket: '', filename: '', size: null };
 
   let ticket = raw;
+  let fallbackTicket = '';
   let filename = '';
   let size = null;
 
@@ -129,7 +160,7 @@ function parseTicketInput(rawValue) {
       if (!ticket) {
         ticket = extractBlobTicket(raw);
       }
-      return { ticket, filename, size };
+      return { ticket, fallbackTicket, filename, size };
     } catch (_) {
       // Fall through to plain parsing.
     }
@@ -142,7 +173,7 @@ function parseTicketInput(rawValue) {
     if (meta.startsWith('name=')) {
       filename = decodeURIComponent(meta.slice(5));
     }
-    return { ticket, filename, size };
+    return { ticket, fallbackTicket, filename, size };
   }
 
   if (tokenPrefix.test(ticket)) {
@@ -150,7 +181,7 @@ function parseTicketInput(rawValue) {
     if (decoded) return decoded;
   }
   ticket = extractBlobTicket(ticket);
-  return { ticket, filename, size };
+  return { ticket, fallbackTicket, filename, size };
 }
 
 function buildShareLink(token, filename) {
@@ -207,6 +238,10 @@ function resetSendUI() {
   setStatus('sendReceiverStatus', 'Waiting for receiver…', 'info');
   const shareEl = document.getElementById('shareTokenValue');
   if (shareEl) shareEl.textContent = '—';
+  currentTicket = '';
+  currentTicketDirect = '';
+  currentTicketRelay = '';
+  currentTicketFull = '';
   currentShareToken = '';
   const copyShare = document.getElementById('copyShareBtn');
   const copyRaw = document.getElementById('copyRawBtn');
@@ -303,6 +338,7 @@ async function startReceive() {
   const inputValue = document.getElementById('receiveTicket').value.trim();
   const parsed = parseTicketInput(inputValue);
   const ticket = parsed.ticket;
+  const fallbackTicket = parsed.fallbackTicket || '';
   if (parsed.filename) {
     receiveFilenameHint = parsed.filename;
   }
@@ -327,7 +363,7 @@ async function startReceive() {
   try {
     const cfg = getConfig();
     const expectedSize = typeof receiveExpectedSize === 'number' ? receiveExpectedSize : null;
-    await ipcRenderer.invoke('start-receive', { ...cfg, ticket, outputPath, expectedSize });
+    await ipcRenderer.invoke('start-receive', { ...cfg, ticket, fallbackTicket, outputPath, expectedSize });
     receiveRunning = true;
     setStatus('receiveStatus', 'Downloading…', 'info');
     toggleReceiveButtons();
@@ -358,16 +394,18 @@ function copyTicket() {
   if (!token) {
     const rawTicket = currentTicket || document.getElementById('ticketValue').textContent.trim();
     const extracted = extractBlobTicket(rawTicket) || extractBlobTicketFromLog();
-    if (extracted) {
-      const size = sendFileSize ?? progressState.sendTicketTotal;
+    const size = sendFileSize ?? progressState.sendTicketTotal;
+    if (currentTicketDirect && currentTicketRelay) {
+      token = encodeTokenV2(currentTicketDirect, currentTicketRelay, sendFilename, size);
+    } else if (extracted) {
       token = encodeToken(extracted, sendFilename, size);
-      currentShareToken = token;
-      if (shareEl) shareEl.textContent = token || '—';
-      const copyShare = document.getElementById('copyShareBtn');
-      const copyRaw = document.getElementById('copyRawBtn');
-      if (copyShare) copyShare.disabled = !token;
-      if (copyRaw) copyRaw.disabled = !extracted;
     }
+    currentShareToken = token;
+    if (shareEl) shareEl.textContent = token || '—';
+    const copyShare = document.getElementById('copyShareBtn');
+    const copyRaw = document.getElementById('copyRawBtn');
+    if (copyShare) copyShare.disabled = !token;
+    if (copyRaw) copyRaw.disabled = !extracted;
   }
 
   if (!tokenPrefix.test(token)) {
@@ -463,6 +501,11 @@ function handleEvent(channel, event) {
       case 'ticket_hashing_complete':
         setStatus('sendTicketStatus', 'Ticket ready.', 'success');
         break;
+      case 'ticket_variants':
+        currentTicketDirect = typeof event.direct === 'string' ? event.direct : '';
+        currentTicketRelay = typeof event.relay === 'string' ? event.relay : '';
+        currentTicketFull = typeof event.full === 'string' ? event.full : '';
+        break;
       case 'ticket_created':
         if (event.ticket) {
           currentTicket = event.ticket;
@@ -471,7 +514,12 @@ function handleEvent(channel, event) {
         if (currentTicket) {
           const size = typeof event.total === 'number' ? event.total : (sendFileSize ?? progressState.sendTicketTotal);
           sendFileSize = size ?? sendFileSize;
-          currentShareToken = encodeToken(currentTicket, sendFilename, size);
+          if (currentTicketDirect && currentTicketRelay) {
+            currentShareToken = encodeTokenV2(currentTicketDirect, currentTicketRelay, sendFilename, size);
+          } else {
+            const baseTicket = currentTicket || currentTicketDirect || currentTicketRelay;
+            currentShareToken = encodeToken(baseTicket, sendFilename, size);
+          }
           const shareEl = document.getElementById('shareTokenValue');
           if (shareEl) {
             shareEl.textContent = currentShareToken || '—';
@@ -606,6 +654,7 @@ function handleEvent(channel, event) {
         );
         setStatus('receiveStatus', 'Saved.', 'success');
         ipcRenderer.invoke('cleanup-transfers').catch(() => {});
+        ipcRenderer.invoke('cleanup-receive-store').catch(() => {});
         break;
       case 'error':
         setStatus('receiveStatus', event.message || 'Receive error.', 'error');
@@ -653,7 +702,12 @@ ipcRenderer.on('process-event', (event, { channel, payload }) => {
     document.getElementById('ticketValue').textContent = currentTicket;
     {
       const size = sendFileSize ?? progressState.sendTicketTotal;
-      currentShareToken = encodeToken(currentTicket, sendFilename, size);
+      if (currentTicketDirect && currentTicketRelay) {
+        currentShareToken = encodeTokenV2(currentTicketDirect, currentTicketRelay, sendFilename, size);
+      } else {
+        const baseTicket = currentTicket || currentTicketDirect || currentTicketRelay;
+        currentShareToken = encodeToken(baseTicket, sendFilename, size);
+      }
     }
     const shareEl = document.getElementById('shareTokenValue');
     if (shareEl) {

@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 
 let mainWindow;
 let sendProcess = null;
@@ -12,6 +13,9 @@ const transferRoots = new Set();
 const tempStores = new Set();
 let currentSendRoot = null;
 let currentSendStore = null;
+let currentReceiveStore = null;
+let receivePoisoned = false;
+const resumeMode = (process.env.ORBITXFER_RESUME_MODE || '1') === '1';
 
 function defaultStoreDir() {
   return path.join(app.getPath('userData'), 'store');
@@ -345,6 +349,9 @@ function processStreamData(channel, data, isError) {
   for (const raw of parts) {
     const line = raw.trim();
     if (!line) continue;
+    if (channel === 'receive' && line.includes('poisoned storage should not be used')) {
+      receivePoisoned = true;
+    }
     appendDebug(`${channel} ${isError ? 'stderr' : 'stdout'} ${line}`);
     const eventIdx = line.indexOf('OX_EVENT ');
     if (eventIdx !== -1) {
@@ -361,11 +368,16 @@ function processStreamData(channel, data, isError) {
   }
 }
 
-function streamProcess(proc, channel) {
+function streamProcess(proc, channel, options = {}) {
   proc.stdout.on('data', (data) => processStreamData(channel, data, false));
   proc.stderr.on('data', (data) => processStreamData(channel, data, true));
   proc.on('close', (code) => {
-    mainWindow?.webContents.send('process-exit', { channel, code });
+    if (typeof options.onExit === 'function') {
+      options.onExit(code);
+    }
+    if (!options.suppressExit) {
+      mainWindow?.webContents.send('process-exit', { channel, code });
+    }
   });
 }
 
@@ -377,6 +389,11 @@ ipcMain.handle('start-send', async (event, { cliPath, storeDir, filePath }) => {
   mainWindow?.webContents.send('process-log', { channel: 'send', message: `CLI: ${resolvedCli}`, isError: false });
   const env = { ...process.env };
   const stageMode = (env.ORBITXFER_STAGE_MODE || 'direct').toLowerCase();
+  if (resumeMode) {
+    env.ORBITXFER_RESUME = '1';
+    env.ORBITXFER_TICKET_MODE = env.ORBITXFER_TICKET_MODE || 'relay_only';
+    env.ORBITXFER_KEY_PATH = env.ORBITXFER_KEY_PATH || path.join(app.getPath('userData'), 'identity.key');
+  }
   let transferRoot = null;
   let stagingRoot = null;
   if (stageMode !== 'direct' && stageMode !== 'none') {
@@ -384,6 +401,7 @@ ipcMain.handle('start-send', async (event, { cliPath, storeDir, filePath }) => {
     currentSendRoot = transferRoot;
     stagingRoot = path.join(transferRoot, 'staging');
   }
+  const storeIsTemp = !storeDir;
   const resolvedStore = storeDir || createTempStoreRoot();
   currentSendStore = resolvedStore;
   fs.mkdirSync(resolvedStore, { recursive: true });
@@ -401,7 +419,9 @@ ipcMain.handle('start-send', async (event, { cliPath, storeDir, filePath }) => {
     });
     appendDebug(`staging_error ${err.message || err}`);
     await cleanupTransferRoot(transferRoot);
-    await cleanupTempStore(resolvedStore);
+    if (storeIsTemp) {
+      await cleanupTempStore(resolvedStore);
+    }
     if (currentSendStore === resolvedStore) {
       currentSendStore = null;
     }
@@ -414,7 +434,9 @@ ipcMain.handle('start-send', async (event, { cliPath, storeDir, filePath }) => {
     sendProcess = null;
     cleanupStagedFile(stagedPath);
     cleanupTransferRoot(transferRoot);
-    cleanupTempStore(resolvedStore);
+    if (storeIsTemp) {
+      cleanupTempStore(resolvedStore);
+    }
     if (currentSendRoot === transferRoot) {
       currentSendRoot = null;
     }
@@ -435,7 +457,7 @@ ipcMain.handle('stop-send', async () => {
   return { stopped: true };
 });
 
-ipcMain.handle('start-receive', async (event, { cliPath, storeDir, ticket, outputPath, expectedSize }) => {
+ipcMain.handle('start-receive', async (event, { cliPath, storeDir, ticket, fallbackTicket, outputPath, expectedSize }) => {
   if (receiveProcess) throw new Error('Receive process already running');
   if (!ticket) throw new Error('Ticket is required');
   if (!outputPath) throw new Error('Output path is required');
@@ -443,10 +465,23 @@ ipcMain.handle('start-receive', async (event, { cliPath, storeDir, ticket, outpu
   const resolvedCli = resolveCliPath(cliPath);
   mainWindow?.webContents.send('process-log', { channel: 'receive', message: `CLI: ${resolvedCli}`, isError: false });
   const env = { ...process.env };
+  receivePoisoned = false;
   if (storeDir) {
     env.ORBITXFER_STORE_DIR = storeDir;
+    currentReceiveStore = storeDir;
+  } else if (resumeMode) {
+    const outputDir = path.dirname(outputPath);
+    const ticketKey = crypto.createHash('sha256').update(ticket).digest('hex').slice(0, 12);
+    const resumeRoot = path.join(outputDir, '.orbitxfer-store');
+    const resumeStore = path.join(resumeRoot, ticketKey);
+    env.ORBITXFER_STORE_DIR = resumeStore;
+    currentReceiveStore = resumeStore;
   } else {
     delete env.ORBITXFER_STORE_DIR;
+    currentReceiveStore = null;
+  }
+  if (currentReceiveStore) {
+    fs.mkdirSync(currentReceiveStore, { recursive: true });
   }
   if (typeof expectedSize === 'number' && Number.isFinite(expectedSize)) {
     env.ORBITXFER_EXPECTED_SIZE = `${Math.floor(expectedSize)}`;
@@ -454,11 +489,58 @@ ipcMain.handle('start-receive', async (event, { cliPath, storeDir, ticket, outpu
     delete env.ORBITXFER_EXPECTED_SIZE;
   }
 
-  receiveProcess = spawn(resolvedCli, ['receive', ticket, outputPath], { env });
-  streamProcess(receiveProcess, 'receive');
-  receiveProcess.on('close', () => {
-    receiveProcess = null;
-  });
+  const primaryTicket = ticket;
+  const secondaryTicket = fallbackTicket || '';
+  let attemptedFallback = false;
+
+  const startAttempt = (ticketValue) => {
+    receiveProcess = spawn(resolvedCli, ['receive', ticketValue, outputPath], { env });
+    streamProcess(receiveProcess, 'receive', {
+      suppressExit: true,
+      onExit: (code) => {
+        receiveProcess = null;
+        if (code === 0) {
+          mainWindow?.webContents.send('process-exit', { channel: 'receive', code });
+          return;
+        }
+        if (!attemptedFallback && secondaryTicket) {
+          attemptedFallback = true;
+          if (receivePoisoned && currentReceiveStore) {
+            try {
+              fs.rmSync(currentReceiveStore, { recursive: true, force: true });
+              fs.mkdirSync(currentReceiveStore, { recursive: true });
+              appendDebug(`cleanup_receive_store_poisoned ${currentReceiveStore}`);
+            } catch (_) {
+              // ignore cleanup failures
+            }
+            receivePoisoned = false;
+          }
+          mainWindow?.webContents.send('process-event', {
+            channel: 'receive',
+            payload: { type: 'download_retry', message: 'Direct connection failed. Trying relay…' }
+          });
+          mainWindow?.webContents.send('process-log', {
+            channel: 'receive',
+            message: 'Direct connection failed. Retrying via relay ticket.',
+            isError: true
+          });
+          startAttempt(secondaryTicket);
+          return;
+        }
+        if (receivePoisoned && currentReceiveStore) {
+          fs.promises
+            .rm(currentReceiveStore, { recursive: true, force: true })
+            .then(() => appendDebug(`cleanup_receive_store_poisoned ${currentReceiveStore}`))
+            .catch(() => {});
+          currentReceiveStore = null;
+          receivePoisoned = false;
+        }
+        mainWindow?.webContents.send('process-exit', { channel: 'receive', code });
+      }
+    });
+  };
+
+  startAttempt(primaryTicket);
 
   return { started: true, cliPath: resolvedCli };
 });
@@ -471,5 +553,18 @@ ipcMain.handle('stop-receive', async () => {
 
 ipcMain.handle('cleanup-transfers', async () => {
   await cleanupStaleTransfers();
+  return { ok: true };
+});
+
+ipcMain.handle('cleanup-receive-store', async () => {
+  if (currentReceiveStore) {
+    try {
+      await fs.promises.rm(currentReceiveStore, { recursive: true, force: true });
+      appendDebug(`cleanup_receive_store ${currentReceiveStore}`);
+    } catch (_) {
+      // ignore cleanup failures
+    }
+    currentReceiveStore = null;
+  }
   return { ok: true };
 });

@@ -8,7 +8,9 @@ anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 iroh = "0.96"
 iroh-blobs = { version = "0.98", features = ["fs-store"] }
+iroh-base = "0.96"
 serde_json = "1"
 futures-lite = "2"
 irpc = { version = "0.12", default-features = false, features = ["stream", "spans", "derive", "varint-util"] }
 fs2 = "0.4"
+getrandom = "0.2"

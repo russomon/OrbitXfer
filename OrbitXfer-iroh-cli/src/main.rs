@@ -3,6 +3,7 @@ use fs2::available_space;
 use futures_lite::StreamExt;
 use irpc::channel::mpsc;
 use iroh::{address_lookup::MemoryLookup, protocol::Router, Endpoint, EndpointAddr};
+use iroh_base::SecretKey;
 use iroh_blobs::{
     api::blobs::{
         AddPathOptions, AddProgressItem, ExportMode, ExportOptions, ExportProgressItem, ImportMode,
@@ -17,17 +18,19 @@ use iroh_blobs::{
 };
 use iroh_blobs::protocol::ObserveRequest;
 use serde_json::json;
+use getrandom::getrandom;
 use std::env;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.37";
+const CLI_VERSION: &str = "0.1.48";
 
 fn print_usage() {
     eprintln!("Usage:");
@@ -54,6 +57,60 @@ fn store_root() -> Result<PathBuf> {
         return Ok(PathBuf::from(profile).join(".orbitxfer-store"));
     }
     Ok(env::current_dir()?.join(".orbitxfer-store"))
+}
+
+fn resolve_identity_key_path() -> Option<PathBuf> {
+    if let Ok(path) = env::var("ORBITXFER_KEY_PATH") {
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    if env::var("ORBITXFER_RESUME").ok().as_deref() == Some("1") {
+        if let Ok(root) = store_root() {
+            return Some(root.join("identity.key"));
+        }
+    }
+    None
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+fn hex_to_bytes(s: &str) -> Result<[u8; 32]> {
+    let cleaned = s.trim();
+    if cleaned.len() != 64 {
+        bail!("invalid secret key length");
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let idx = i * 2;
+        let byte = u8::from_str_radix(&cleaned[idx..idx + 2], 16)
+            .context("invalid secret key hex")?;
+        out[i] = byte;
+    }
+    Ok(out)
+}
+
+fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        let contents = fs::read_to_string(path)?;
+        let bytes = hex_to_bytes(&contents)?;
+        return Ok(SecretKey::from_bytes(&bytes));
+    }
+    let mut bytes = [0u8; 32];
+    getrandom(&mut bytes).map_err(|e| anyhow!("failed to generate identity key: {e}"))?;
+    let key = SecretKey::from_bytes(&bytes);
+    let hex = bytes_to_hex(&key.to_bytes());
+    fs::write(path, hex)?;
+    Ok(key)
 }
 
 
@@ -90,6 +147,18 @@ fn expected_size_from_env() -> Option<u64> {
     env::var("ORBITXFER_EXPECTED_SIZE")
         .ok()
         .and_then(|val| val.parse::<u64>().ok())
+}
+
+fn ticket_mode_from_env() -> String {
+    if let Ok(mode) = env::var("ORBITXFER_TICKET_MODE") {
+        if !mode.is_empty() {
+            return mode;
+        }
+    }
+    if env::var("ORBITXFER_RESUME").ok().as_deref() == Some("1") {
+        return "relay_only".to_string();
+    }
+    "full".to_string()
 }
 
 fn emit_line(line: &str) {
@@ -169,8 +238,6 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
 
     emit_line("Hashing file (this can take a while for large files).");
     emit_event(json!({ "type": "ticket_hashing_start" }));
-
-    let endpoint = Endpoint::bind().await?;
     let store_dir = store_root()?;
     std::fs::create_dir_all(&store_dir)?;
     let store = FsStore::load(store_dir.clone()).await?;
@@ -188,33 +255,51 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
         mode: import_mode_from_env(),
     };
 
-    let mut stream = store.blobs().add_path_with_opts(add_opts).stream().await;
     let mut total_size: Option<u64> = std::fs::metadata(&abs_path).map(|m| m.len()).ok();
     if let Some(size) = total_size {
         emit_event(json!({ "type": "ticket_hashing_size", "total": size }));
     }
+    let mut stream = store.blobs().add_path_with_opts(add_opts).stream().await;
     let mut temp_tag = None;
+    let mut last_emit_bytes = 0u64;
+    let mut last_emit_at = Instant::now();
+    let progress_step_bytes = 4 * 1024 * 1024;
+    let progress_step_time = Duration::from_millis(500);
     while let Some(item) = stream.next().await {
         match item {
             AddProgressItem::Size(size) => {
                 total_size = Some(size);
                 emit_event(json!({ "type": "ticket_hashing_size", "total": size }));
+                last_emit_bytes = 0;
+                last_emit_at = Instant::now();
             }
             AddProgressItem::CopyProgress(bytes) => {
-                emit_event(json!({
-                    "type": "ticket_hashing_progress",
-                    "phase": "copy",
-                    "bytes": bytes,
-                    "total": total_size
-                }));
+                let should_emit = bytes.saturating_sub(last_emit_bytes) >= progress_step_bytes
+                    || last_emit_at.elapsed() >= progress_step_time;
+                if should_emit {
+                    last_emit_bytes = bytes;
+                    last_emit_at = Instant::now();
+                    emit_event(json!({
+                        "type": "ticket_hashing_progress",
+                        "phase": "copy",
+                        "bytes": bytes,
+                        "total": total_size
+                    }));
+                }
             }
             AddProgressItem::OutboardProgress(bytes) => {
-                emit_event(json!({
-                    "type": "ticket_hashing_progress",
-                    "phase": "hash",
-                    "bytes": bytes,
-                    "total": total_size
-                }));
+                let should_emit = bytes.saturating_sub(last_emit_bytes) >= progress_step_bytes
+                    || last_emit_at.elapsed() >= progress_step_time;
+                if should_emit {
+                    last_emit_bytes = bytes;
+                    last_emit_at = Instant::now();
+                    emit_event(json!({
+                        "type": "ticket_hashing_progress",
+                        "phase": "hash",
+                        "bytes": bytes,
+                        "total": total_size
+                    }));
+                }
             }
             AddProgressItem::CopyDone => {
                 emit_event(json!({ "type": "ticket_hashing_phase", "phase": "hash" }));
@@ -253,11 +338,52 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
         "status": format!("{:?}", status)
     }));
 
+    emit_line("Binding endpoint...");
+    let endpoint = if let Some(path) = resolve_identity_key_path() {
+        let key = load_or_create_secret_key(&path)?;
+        emit_line(&format!("Using persistent identity key: {}", path.display()));
+        let bind = timeout(Duration::from_secs(15), Endpoint::builder().secret_key(key).bind())
+            .await
+            .context("endpoint bind timed out")??;
+        bind
+    } else {
+        let bind = timeout(Duration::from_secs(15), Endpoint::bind())
+            .await
+            .context("endpoint bind timed out")??;
+        bind
+    };
+    emit_line("Endpoint bound.");
+
     let _ = endpoint.online().await;
     let full_addr = endpoint.addr();
     emit_line(&format!("Sender endpoint addr: {}", describe_addr(&full_addr)));
 
-    let mode = env::var("ORBITXFER_TICKET_MODE").unwrap_or_else(|_| "full".to_string());
+    let relay_ticket = full_addr
+        .relay_urls()
+        .next()
+        .cloned()
+        .map(|relay| {
+            let relay_addr = EndpointAddr::new(full_addr.id).with_relay_url(relay);
+            BlobTicket::new(relay_addr, hash, format).to_string()
+        });
+    let mut direct_addr = EndpointAddr::new(full_addr.id);
+    for ip in full_addr.ip_addrs().cloned() {
+        direct_addr = direct_addr.with_ip_addr(ip);
+    }
+    let direct_ticket = if direct_addr.ip_addrs().next().is_some() {
+        Some(BlobTicket::new(direct_addr, hash, format).to_string())
+    } else {
+        None
+    };
+    let full_ticket = BlobTicket::new(full_addr.clone(), hash, format).to_string();
+    emit_event(json!({
+        "type": "ticket_variants",
+        "direct": direct_ticket,
+        "relay": relay_ticket,
+        "full": full_ticket
+    }));
+
+    let mode = ticket_mode_from_env();
     let addr = match mode.as_str() {
         "relay_only" => {
             if let Some(relay) = full_addr.relay_urls().next().cloned() {
