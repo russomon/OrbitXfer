@@ -381,18 +381,21 @@ function streamProcess(proc, channel, options = {}) {
   });
 }
 
-ipcMain.handle('start-send', async (event, { cliPath, storeDir, filePath }) => {
+ipcMain.handle('start-send', async (event, { cliPath, storeDir, filePath, sendMode }) => {
   if (sendProcess) throw new Error('Send process already running');
   if (!filePath || !fs.existsSync(filePath)) throw new Error('File path is invalid');
 
   const resolvedCli = resolveCliPath(cliPath);
   mainWindow?.webContents.send('process-log', { channel: 'send', message: `CLI: ${resolvedCli}`, isError: false });
   const env = { ...process.env };
+  const ticketMode = sendMode === 'direct' ? 'direct_only' : 'full';
   const stageMode = (env.ORBITXFER_STAGE_MODE || 'direct').toLowerCase();
   if (resumeMode) {
     env.ORBITXFER_RESUME = '1';
-    env.ORBITXFER_TICKET_MODE = env.ORBITXFER_TICKET_MODE || 'relay_only';
+    env.ORBITXFER_TICKET_MODE = ticketMode;
     env.ORBITXFER_KEY_PATH = env.ORBITXFER_KEY_PATH || path.join(app.getPath('userData'), 'identity.key');
+  } else {
+    env.ORBITXFER_TICKET_MODE = ticketMode;
   }
   let transferRoot = null;
   let stagingRoot = null;

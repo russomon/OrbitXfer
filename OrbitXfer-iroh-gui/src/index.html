@@ -141,6 +141,28 @@
       min-width: 0;
     }
 
+    .choice-group {
+      display: grid;
+      gap: 8px;
+    }
+
+    .choice {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      font-size: 14px;
+      color: var(--ink);
+    }
+
+    .choice input {
+      width: auto;
+    }
+
+    .hint {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
     .btn {
       border: none;
       border-radius: 12px;
@@ -296,6 +318,20 @@
         <div class="row-inline">
           <button id="startSendBtn" class="btn" onclick="startSend()">Start Sharing</button>
           <button id="stopSendBtn" class="btn btn-stop" onclick="stopSend()" disabled>Stop</button>
+        </div>
+        <div class="row">
+          <label>Connection mode</label>
+          <div class="choice-group">
+            <label class="choice">
+              <input type="radio" name="sendMode" value="auto" checked />
+              Direct + relay fallback (recommended)
+            </label>
+            <label class="choice">
+              <input type="radio" name="sendMode" value="direct" />
+              Direct only (no relay)
+            </label>
+          </div>
+          <div class="hint">Transfers are end-to-end encrypted in both modes. Direct-only disables relay fallback.</div>
         </div>
         <div class="row">
           <label>Ticket creation</label>

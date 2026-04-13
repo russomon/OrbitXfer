@@ -23,6 +23,11 @@ const progressState = {
   receiveExportTotal: null
 };
 
+function getSendMode() {
+  const selected = document.querySelector('input[name="sendMode"]:checked');
+  return selected ? selected.value : 'auto';
+}
+
 window.addEventListener('contextmenu', (e) => {
   e.preventDefault();
   ipcRenderer.send('show-context-menu');
@@ -118,6 +123,19 @@ function decodeToken(token) {
   } catch (_) {
     return null;
   }
+}
+
+function buildShareToken() {
+  const size = sendFileSize ?? progressState.sendTicketTotal;
+  const mode = getSendMode();
+  if (mode === 'direct') {
+    return currentTicketDirect ? encodeToken(currentTicketDirect, sendFilename, size) : '';
+  }
+  if (currentTicketDirect && currentTicketRelay) {
+    return encodeTokenV2(currentTicketDirect, currentTicketRelay, sendFilename, size);
+  }
+  const baseTicket = currentTicket || currentTicketDirect || currentTicketRelay;
+  return baseTicket ? encodeToken(baseTicket, sendFilename, size) : '';
 }
 
 function extractBlobTicketFromLog() {
@@ -312,7 +330,8 @@ async function startSend() {
 
   try {
     const cfg = getConfig();
-    await ipcRenderer.invoke('start-send', { ...cfg, filePath });
+    const sendMode = getSendMode();
+    await ipcRenderer.invoke('start-send', { ...cfg, filePath, sendMode });
     sendRunning = true;
     setStatus('sendStatus', 'Sharing started. Waiting for receiver…', 'info');
     toggleSendButtons();
@@ -394,12 +413,7 @@ function copyTicket() {
   if (!token) {
     const rawTicket = currentTicket || document.getElementById('ticketValue').textContent.trim();
     const extracted = extractBlobTicket(rawTicket) || extractBlobTicketFromLog();
-    const size = sendFileSize ?? progressState.sendTicketTotal;
-    if (currentTicketDirect && currentTicketRelay) {
-      token = encodeTokenV2(currentTicketDirect, currentTicketRelay, sendFilename, size);
-    } else if (extracted) {
-      token = encodeToken(extracted, sendFilename, size);
-    }
+    token = buildShareToken();
     currentShareToken = token;
     if (shareEl) shareEl.textContent = token || '—';
     const copyShare = document.getElementById('copyShareBtn');
@@ -514,12 +528,7 @@ function handleEvent(channel, event) {
         if (currentTicket) {
           const size = typeof event.total === 'number' ? event.total : (sendFileSize ?? progressState.sendTicketTotal);
           sendFileSize = size ?? sendFileSize;
-          if (currentTicketDirect && currentTicketRelay) {
-            currentShareToken = encodeTokenV2(currentTicketDirect, currentTicketRelay, sendFilename, size);
-          } else {
-            const baseTicket = currentTicket || currentTicketDirect || currentTicketRelay;
-            currentShareToken = encodeToken(baseTicket, sendFilename, size);
-          }
+          currentShareToken = buildShareToken();
           const shareEl = document.getElementById('shareTokenValue');
           if (shareEl) {
             shareEl.textContent = currentShareToken || '—';
@@ -536,6 +545,9 @@ function handleEvent(channel, event) {
         }
         setStatus('sendTicketStatus', 'Ticket created.', 'success');
         setStatus('sendStatus', 'Waiting for receiver…', 'info');
+        if (getSendMode() === 'direct' && !currentTicketDirect) {
+          setStatus('sendStatus', 'Direct-only unavailable (no IPs). Switch to Direct + Relay.', 'error');
+        }
         break;
       case 'receiver_connected':
         setStatus('sendReceiverStatus', 'Receiver connected.', 'success');
@@ -701,13 +713,7 @@ ipcRenderer.on('process-event', (event, { channel, payload }) => {
     currentTicket = payload.ticket;
     document.getElementById('ticketValue').textContent = currentTicket;
     {
-      const size = sendFileSize ?? progressState.sendTicketTotal;
-      if (currentTicketDirect && currentTicketRelay) {
-        currentShareToken = encodeTokenV2(currentTicketDirect, currentTicketRelay, sendFilename, size);
-      } else {
-        const baseTicket = currentTicket || currentTicketDirect || currentTicketRelay;
-        currentShareToken = encodeToken(baseTicket, sendFilename, size);
-      }
+      currentShareToken = buildShareToken();
     }
     const shareEl = document.getElementById('shareTokenValue');
     if (shareEl) {
@@ -749,6 +755,21 @@ document.getElementById('receiveTicket').addEventListener('input', (e) => {
   if (ticket && ticket !== e.target.value) {
     // Preserve original input; just cache parsed ticket.
   }
+});
+
+document.querySelectorAll('input[name="sendMode"]').forEach((input) => {
+  input.addEventListener('change', () => {
+    if (!currentTicket && !currentTicketDirect && !currentTicketRelay) return;
+    const token = buildShareToken();
+    currentShareToken = token;
+    const shareEl = document.getElementById('shareTokenValue');
+    if (shareEl) shareEl.textContent = token || '—';
+    const copyShare = document.getElementById('copyShareBtn');
+    if (copyShare) copyShare.disabled = !token;
+    if (getSendMode() === 'direct' && !currentTicketDirect) {
+      setStatus('sendStatus', 'Direct-only unavailable (no IPs). Switch to Direct + Relay.', 'error');
+    }
+  });
 });
 
 window.pickFile = pickFile;

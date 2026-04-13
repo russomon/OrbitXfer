@@ -10,6 +10,7 @@ pnpm-debug.log*
 
 # Electron build output
 OrbitXfer-iroh-gui/dist/
+legacy/
 
 # Rust
 OrbitXfer-iroh-cli/target/

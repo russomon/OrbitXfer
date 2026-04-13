@@ -45,6 +45,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libfuse2
 
+      - name: Verify RELEASES.md
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          grep -q "^## ${tag} " RELEASES.md || (echo "RELEASES.md missing entry for ${tag}" && exit 1)
+
       - name: Build CLI (release)
         working-directory: OrbitXfer-iroh-cli
         run: cargo build --release
