@@ -3,6 +3,8 @@ const path = require('path');
 
 let sendRunning = false;
 let receiveRunning = false;
+let sendStopRequested = false;
+let receiveStopRequested = false;
 let sendFilename = '';
 let receiveFilenameHint = '';
 let currentTicket = '';
@@ -410,6 +412,14 @@ async function pickStoreDir() {
   }
 }
 
+async function openNewWindow() {
+  try {
+    await ipcRenderer.invoke('open-new-window');
+  } catch (err) {
+    setStatus('sendStatus', err.message || 'Failed to open a new window.', 'error');
+  }
+}
+
 function getConfig() {
   return {
     cliPath: document.getElementById('cliPath').value.trim(),
@@ -445,6 +455,7 @@ async function startSend() {
   try {
     const cfg = getConfig();
     const sendMode = getSendMode();
+    sendStopRequested = false;
     await ipcRenderer.invoke('start-send', { ...cfg, filePath, sendMode });
     sendRunning = true;
     setStatus('sendStatus', 'Sharing started. Waiting for receiver…', 'info');
@@ -455,10 +466,14 @@ async function startSend() {
 }
 
 async function stopSend() {
-  await ipcRenderer.invoke('stop-send');
-  sendRunning = false;
-  toggleSendButtons();
-  setStatus('sendStatus', 'Sharing stopped.', 'info');
+  sendStopRequested = true;
+  try {
+    await ipcRenderer.invoke('stop-send');
+    setStatus('sendStatus', 'Stopping share…', 'info');
+  } catch (err) {
+    sendStopRequested = false;
+    setStatus('sendStatus', err.message || 'Failed to stop share.', 'error');
+  }
 }
 
 function toggleSendButtons() {
@@ -496,6 +511,7 @@ async function startReceive() {
   try {
     const cfg = getConfig();
     const expectedSize = typeof receiveExpectedSize === 'number' ? receiveExpectedSize : null;
+    receiveStopRequested = false;
     await ipcRenderer.invoke('start-receive', { ...cfg, ticket, fallbackTicket, outputPath, expectedSize });
     receiveRunning = true;
     setStatus('receiveStatus', 'Downloading…', 'info');
@@ -506,10 +522,14 @@ async function startReceive() {
 }
 
 async function stopReceive() {
-  await ipcRenderer.invoke('stop-receive');
-  receiveRunning = false;
-  toggleReceiveButtons();
-  setStatus('receiveStatus', 'Download stopped.', 'info');
+  receiveStopRequested = true;
+  try {
+    await ipcRenderer.invoke('stop-receive');
+    setStatus('receiveStatus', 'Stopping download…', 'info');
+  } catch (err) {
+    receiveStopRequested = false;
+    setStatus('receiveStatus', err.message || 'Failed to stop download.', 'error');
+  }
 }
 
 function toggleReceiveButtons() {
@@ -871,10 +891,20 @@ ipcRenderer.on('process-exit', (event, { channel, code }) => {
   if (channel === 'send') {
     sendRunning = false;
     toggleSendButtons();
+    if (sendStopRequested) {
+      sendStopRequested = false;
+      setStatus('sendStatus', 'Sharing stopped.', 'info');
+      return;
+    }
     setStatus('sendStatus', `Send process exited (${code}).`, code === 0 ? 'success' : 'error');
   } else {
     receiveRunning = false;
     toggleReceiveButtons();
+    if (receiveStopRequested) {
+      receiveStopRequested = false;
+      setStatus('receiveStatus', 'Download stopped.', 'info');
+      return;
+    }
     if (code === 0) {
       setStatus('receiveStatus', 'Download complete.', 'success');
     } else {
@@ -920,6 +950,7 @@ document.querySelectorAll('input[name="sendMode"]').forEach((input) => {
 window.pickFile = pickFile;
 window.pickOutput = pickOutput;
 window.pickStoreDir = pickStoreDir;
+window.openNewWindow = openNewWindow;
 window.startSend = startSend;
 window.stopSend = stopSend;
 window.startReceive = startReceive;

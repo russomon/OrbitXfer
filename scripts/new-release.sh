@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <version> [YYYY-MM-DD]" >&2
-  echo "Example: $0 0.1.50 2026-04-13" >&2
+  echo "Example: $0 0.1.51 2026-04-14" >&2
   exit 1
 fi
 
@@ -12,6 +12,7 @@ date_arg="${2:-}"
 if [[ "$version" != v* ]]; then
   version="v${version}"
 fi
+release_number="${version#v}"
 release_date="${date_arg:-$(date +%Y-%m-%d)}"
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
@@ -26,6 +27,19 @@ if git rev-parse "$version" >/dev/null 2>&1; then
   echo "Error: tag ${version} already exists." >&2
   exit 1
 fi
+
+require_match() {
+  local file="$1"
+  local pattern="$2"
+  if ! grep -q "$pattern" "$file"; then
+    echo "Error: expected ${file} to contain version ${release_number}." >&2
+    exit 1
+  fi
+}
+
+require_match "OrbitXfer-iroh-gui/package.json" "\"version\": \"${release_number}\""
+require_match "OrbitXfer-iroh-gui/package-lock.json" "\"version\": \"${release_number}\""
+require_match "OrbitXfer-iroh-cli/src/main.rs" "const CLI_VERSION: &str = \"${release_number}\";"
 
 if [[ ! -f RELEASES.md ]]; then
   echo "# Releases" > RELEASES.md
@@ -56,8 +70,9 @@ tmp_file="$(mktemp)"
 } > "${tmp_file}"
 mv "${tmp_file}" RELEASES.md
 
-git add RELEASES.md
+git add -A
 git commit -m "Release ${version}"
-git tag "${version}"
+git tag -a "${version}" -m "Release ${version}"
 
-echo "Created release entry, commit, and tag: ${version}"
+echo "Created release commit and annotated tag: ${version}"
+echo "Push it with: git push origin main --follow-tags"

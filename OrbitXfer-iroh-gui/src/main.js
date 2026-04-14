@@ -4,22 +4,11 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 
-let mainWindow;
-let sendProcess = null;
-let receiveProcess = null;
-const streamBuffers = new Map();
+const windowSessions = new Map();
 const stagedFiles = new Set();
 const transferRoots = new Set();
 const tempStores = new Set();
-let currentSendRoot = null;
-let currentSendStore = null;
-let currentReceiveStore = null;
-let receivePoisoned = false;
 const resumeMode = (process.env.ORBITXFER_RESUME_MODE || '1') === '1';
-
-function defaultStoreDir() {
-  return path.join(app.getPath('userData'), 'store');
-}
 
 function debugLogPath() {
   return path.join(app.getPath('userData'), 'orbitxfer-debug.log');
@@ -73,6 +62,26 @@ async function cleanupTransferRoot(root) {
   }
 }
 
+function activeTransferRoots() {
+  const keep = new Set(transferRoots);
+  for (const session of windowSessions.values()) {
+    if (session.sendProcess && session.currentSendRoot) {
+      keep.add(session.currentSendRoot);
+    }
+  }
+  return keep;
+}
+
+function activeTempStores() {
+  const keep = new Set(tempStores);
+  for (const session of windowSessions.values()) {
+    if (session.sendProcess && session.currentSendStore) {
+      keep.add(session.currentSendStore);
+    }
+  }
+  return keep;
+}
+
 async function cleanupStaleTransfers() {
   const base = transfersBaseDir();
   let entries = [];
@@ -81,10 +90,7 @@ async function cleanupStaleTransfers() {
   } catch (_) {
     return;
   }
-  const keep = new Set(transferRoots);
-  if (sendProcess && currentSendRoot) {
-    keep.add(currentSendRoot);
-  }
+  const keep = activeTransferRoots();
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const fullPath = path.join(base, entry.name);
@@ -106,10 +112,7 @@ async function cleanupStaleTempStores() {
   } catch (_) {
     return;
   }
-  const keep = new Set(tempStores);
-  if (sendProcess && currentSendStore) {
-    keep.add(currentSendStore);
-  }
+  const keep = activeTempStores();
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const fullPath = path.join(base, entry.name);
@@ -123,10 +126,73 @@ async function cleanupStaleTempStores() {
   }
 }
 
-function createWindow() {
-  mainWindow = new BrowserWindow({
+function createSession(window) {
+  const session = {
+    id: window.webContents.id,
+    window,
+    sendProcess: null,
+    receiveProcess: null,
+    receiveStopRequested: false,
+    streamBuffers: new Map(),
+    currentSendRoot: null,
+    currentSendStore: null,
+    currentReceiveStore: null,
+    receivePoisoned: false
+  };
+  windowSessions.set(session.id, session);
+  return session;
+}
+
+function getSessionFromSender(sender) {
+  const session = windowSessions.get(sender.id);
+  if (!session) {
+    throw new Error('This OrbitXfer window no longer has an active transfer session.');
+  }
+  return session;
+}
+
+function getWindowFromEvent(event) {
+  return BrowserWindow.fromWebContents(event.sender) || null;
+}
+
+function sendToSession(session, channel, payload) {
+  const target = session?.window;
+  if (!target || target.isDestroyed()) return;
+  target.webContents.send(channel, payload);
+}
+
+function stopChildProcess(proc) {
+  if (!proc || proc.killed) return;
+  try {
+    proc.kill('SIGINT');
+  } catch (_) {
+    // ignore shutdown failures
+  }
+}
+
+function destroySession(session) {
+  if (!session) return;
+  session.receiveStopRequested = true;
+  stopChildProcess(session.sendProcess);
+  stopChildProcess(session.receiveProcess);
+  if (!session.sendProcess && session.currentSendRoot) {
+    const root = session.currentSendRoot;
+    session.currentSendRoot = null;
+    cleanupTransferRoot(root);
+  }
+  if (!session.sendProcess && session.currentSendStore && tempStores.has(session.currentSendStore)) {
+    const store = session.currentSendStore;
+    session.currentSendStore = null;
+    cleanupTempStore(store);
+  }
+  session.window = null;
+}
+
+function createWindow(bounds = {}) {
+  const window = new BrowserWindow({
     width: 1100,
     height: 760,
+    ...bounds,
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false
@@ -135,15 +201,20 @@ function createWindow() {
     show: false
   });
 
-  mainWindow.loadFile(path.join(__dirname, 'index.html'));
+  const session = createSession(window);
 
-  mainWindow.once('ready-to-show', () => {
-    mainWindow.show();
+  window.loadFile(path.join(__dirname, 'index.html'));
+
+  window.once('ready-to-show', () => {
+    window.show();
   });
 
-  mainWindow.on('closed', () => {
-    mainWindow = null;
+  window.on('closed', () => {
+    destroySession(session);
+    windowSessions.delete(session.id);
   });
+
+  return window;
 }
 
 app.whenReady().then(() => {
@@ -153,6 +224,12 @@ app.whenReady().then(() => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+app.on('before-quit', () => {
+  for (const session of windowSessions.values()) {
+    destroySession(session);
+  }
 });
 
 app.on('window-all-closed', () => {
@@ -169,8 +246,18 @@ ipcMain.on('show-context-menu', (event) => {
   menu.popup({ window: BrowserWindow.fromWebContents(event.sender) });
 });
 
-ipcMain.handle('select-file', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
+ipcMain.handle('open-new-window', async (event) => {
+  const sourceWindow = getWindowFromEvent(event);
+  const baseBounds = sourceWindow ? sourceWindow.getBounds() : null;
+  const nextBounds = baseBounds
+    ? { x: baseBounds.x + 36, y: baseBounds.y + 36 }
+    : {};
+  const window = createWindow(nextBounds);
+  return { ok: true, id: window.webContents.id };
+});
+
+ipcMain.handle('select-file', async (event) => {
+  const result = await dialog.showOpenDialog(getWindowFromEvent(event), {
     properties: ['openFile'],
     title: 'Select file to send'
   });
@@ -179,7 +266,7 @@ ipcMain.handle('select-file', async () => {
 });
 
 ipcMain.handle('select-output', async (event, suggestedName) => {
-  const result = await dialog.showSaveDialog(mainWindow, {
+  const result = await dialog.showSaveDialog(getWindowFromEvent(event), {
     defaultPath: suggestedName || 'downloaded-file',
     title: 'Choose where to save the received file'
   });
@@ -187,8 +274,8 @@ ipcMain.handle('select-output', async (event, suggestedName) => {
   return null;
 });
 
-ipcMain.handle('select-directory', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
+ipcMain.handle('select-directory', async (event) => {
+  const result = await dialog.showOpenDialog(getWindowFromEvent(event), {
     properties: ['openDirectory', 'createDirectory'],
     title: 'Choose store directory'
   });
@@ -218,11 +305,11 @@ function resolveCliPath(cliPath) {
   return `orbitxfer-iroh-cli${exeSuffix}`;
 }
 
-async function stageFileForSend(filePath, stagingRoot) {
+async function stageFileForSend(session, filePath, stagingRoot) {
   if (!stagingRoot) {
     const stats = await fs.promises.stat(filePath);
-    appendDebug(`staging_skipped reason=direct source=${filePath}`);
-    mainWindow?.webContents.send('process-event', {
+    appendDebug(`window=${session.id} staging_skipped reason=direct source=${filePath}`);
+    sendToSession(session, 'process-event', {
       channel: 'send',
       payload: { type: 'staging_skipped', total: stats.size, reason: 'direct' }
     });
@@ -237,15 +324,15 @@ async function stageFileForSend(filePath, stagingRoot) {
   const stagedPath = path.join(stagingRoot, `${uniquePrefix}-${fileName}`);
   const stageMode = (process.env.ORBITXFER_STAGE_MODE || 'auto').toLowerCase();
 
-  appendDebug(`staging_start source=${filePath} dest=${stagedPath} size=${stats.size}`);
-  mainWindow?.webContents.send('process-event', {
+  appendDebug(`window=${session.id} staging_start source=${filePath} dest=${stagedPath} size=${stats.size}`);
+  sendToSession(session, 'process-event', {
     channel: 'send',
     payload: { type: 'staging_start', total: stats.size, name: fileName }
   });
 
   const finalizeSkip = (reason) => {
-    appendDebug(`staging_skipped reason=${reason} source=${filePath}`);
-    mainWindow?.webContents.send('process-event', {
+    appendDebug(`window=${session.id} staging_skipped reason=${reason} source=${filePath}`);
+    sendToSession(session, 'process-event', {
       channel: 'send',
       payload: { type: 'staging_skipped', total: stats.size, reason }
     });
@@ -255,8 +342,8 @@ async function stageFileForSend(filePath, stagingRoot) {
   const tryClone = async () => {
     await fs.promises.copyFile(filePath, stagedPath, fs.constants.COPYFILE_FICLONE);
     stagedFiles.add(stagedPath);
-    appendDebug(`staging_clone dest=${stagedPath}`);
-    mainWindow?.webContents.send('process-event', {
+    appendDebug(`window=${session.id} staging_clone dest=${stagedPath}`);
+    sendToSession(session, 'process-event', {
       channel: 'send',
       payload: { type: 'staging_complete', total: stats.size }
     });
@@ -266,8 +353,8 @@ async function stageFileForSend(filePath, stagingRoot) {
   const tryLink = async () => {
     await fs.promises.link(filePath, stagedPath);
     stagedFiles.add(stagedPath);
-    appendDebug(`staging_link dest=${stagedPath}`);
-    mainWindow?.webContents.send('process-event', {
+    appendDebug(`window=${session.id} staging_link dest=${stagedPath}`);
+    sendToSession(session, 'process-event', {
       channel: 'send',
       payload: { type: 'staging_complete', total: stats.size }
     });
@@ -290,12 +377,12 @@ async function stageFileForSend(filePath, stagingRoot) {
     try {
       return await tryClone();
     } catch (err) {
-      appendDebug(`staging_clone_failed ${err.code || err.message || err}`);
+      appendDebug(`window=${session.id} staging_clone_failed ${err.code || err.message || err}`);
     }
     try {
       return await tryLink();
     } catch (err) {
-      appendDebug(`staging_link_failed ${err.code || err.message || err}`);
+      appendDebug(`window=${session.id} staging_link_failed ${err.code || err.message || err}`);
     }
     return finalizeSkip('auto-fallback');
   }
@@ -307,7 +394,7 @@ async function stageFileForSend(filePath, stagingRoot) {
 
     reader.on('data', (chunk) => {
       copied += chunk.length;
-      mainWindow?.webContents.send('process-event', {
+      sendToSession(session, 'process-event', {
         channel: 'send',
         payload: { type: 'staging_progress', bytes: copied, total: stats.size }
       });
@@ -319,8 +406,8 @@ async function stageFileForSend(filePath, stagingRoot) {
   });
 
   stagedFiles.add(stagedPath);
-  appendDebug(`staging_complete dest=${stagedPath}`);
-  mainWindow?.webContents.send('process-event', {
+  appendDebug(`window=${session.id} staging_complete dest=${stagedPath}`);
+  sendToSession(session, 'process-event', {
     channel: 'send',
     payload: { type: 'staging_complete', total: stats.size }
   });
@@ -339,54 +426,55 @@ async function cleanupStagedFile(stagedPath) {
   }
 }
 
-function processStreamData(channel, data, isError) {
+function processStreamData(session, channel, data, isError) {
   const key = `${channel}:${isError ? 'stderr' : 'stdout'}`;
-  const prev = streamBuffers.get(key) || '';
+  const prev = session.streamBuffers.get(key) || '';
   const combined = prev + data.toString();
   const parts = combined.split(/\r?\n/);
-  streamBuffers.set(key, parts.pop() || '');
+  session.streamBuffers.set(key, parts.pop() || '');
 
   for (const raw of parts) {
     const line = raw.trim();
     if (!line) continue;
     if (channel === 'receive' && line.includes('poisoned storage should not be used')) {
-      receivePoisoned = true;
+      session.receivePoisoned = true;
     }
-    appendDebug(`${channel} ${isError ? 'stderr' : 'stdout'} ${line}`);
+    appendDebug(`window=${session.id} ${channel} ${isError ? 'stderr' : 'stdout'} ${line}`);
     const eventIdx = line.indexOf('OX_EVENT ');
     if (eventIdx !== -1) {
       const payload = line.slice(eventIdx + 'OX_EVENT '.length).trim();
       try {
         const parsed = JSON.parse(payload);
-        mainWindow?.webContents.send('process-event', { channel, payload: parsed });
+        sendToSession(session, 'process-event', { channel, payload: parsed });
         continue;
-      } catch (err) {
+      } catch (_) {
         // Fall through to log line if parsing fails.
       }
     }
-    mainWindow?.webContents.send('process-log', { channel, message: line, isError });
+    sendToSession(session, 'process-log', { channel, message: line, isError });
   }
 }
 
-function streamProcess(proc, channel, options = {}) {
-  proc.stdout.on('data', (data) => processStreamData(channel, data, false));
-  proc.stderr.on('data', (data) => processStreamData(channel, data, true));
+function streamProcess(session, proc, channel, options = {}) {
+  proc.stdout.on('data', (data) => processStreamData(session, channel, data, false));
+  proc.stderr.on('data', (data) => processStreamData(session, channel, data, true));
   proc.on('close', (code) => {
     if (typeof options.onExit === 'function') {
       options.onExit(code);
     }
     if (!options.suppressExit) {
-      mainWindow?.webContents.send('process-exit', { channel, code });
+      sendToSession(session, 'process-exit', { channel, code });
     }
   });
 }
 
 ipcMain.handle('start-send', async (event, { cliPath, storeDir, filePath, sendMode }) => {
-  if (sendProcess) throw new Error('Send process already running');
+  const session = getSessionFromSender(event.sender);
+  if (session.sendProcess) throw new Error('Send process already running in this window');
   if (!filePath || !fs.existsSync(filePath)) throw new Error('File path is invalid');
 
   const resolvedCli = resolveCliPath(cliPath);
-  mainWindow?.webContents.send('process-log', { channel: 'send', message: `CLI: ${resolvedCli}`, isError: false });
+  sendToSession(session, 'process-log', { channel: 'send', message: `CLI: ${resolvedCli}`, isError: false });
   const env = { ...process.env };
   const ticketMode = sendMode === 'direct' ? 'direct_only' : 'full';
   const stageMode = (env.ORBITXFER_STAGE_MODE || 'direct').toLowerCase();
@@ -401,90 +489,98 @@ ipcMain.handle('start-send', async (event, { cliPath, storeDir, filePath, sendMo
   let stagingRoot = null;
   if (stageMode !== 'direct' && stageMode !== 'none') {
     transferRoot = createTransferRoot();
-    currentSendRoot = transferRoot;
+    session.currentSendRoot = transferRoot;
     stagingRoot = path.join(transferRoot, 'staging');
   }
   const storeIsTemp = !storeDir;
   const resolvedStore = storeDir || createTempStoreRoot();
-  currentSendStore = resolvedStore;
+  session.currentSendStore = resolvedStore;
   fs.mkdirSync(resolvedStore, { recursive: true });
   env.ORBITXFER_STORE_DIR = resolvedStore;
   env.ORBITXFER_IMPORT_MODE = 'try_reference';
-  appendDebug(`send_start cli=${resolvedCli} store=${resolvedStore} staging=${stagingRoot || 'none'} mode=${stageMode}`);
+  appendDebug(
+    `window=${session.id} send_start cli=${resolvedCli} store=${resolvedStore} staging=${stagingRoot || 'none'} mode=${stageMode}`
+  );
 
   let stagedPath = null;
   try {
-    stagedPath = await stageFileForSend(filePath, stagingRoot);
+    stagedPath = await stageFileForSend(session, filePath, stagingRoot);
   } catch (err) {
-    mainWindow?.webContents.send('process-event', {
+    sendToSession(session, 'process-event', {
       channel: 'send',
       payload: { type: 'staging_error', message: err.message || String(err) }
     });
-    appendDebug(`staging_error ${err.message || err}`);
+    appendDebug(`window=${session.id} staging_error ${err.message || err}`);
     await cleanupTransferRoot(transferRoot);
     if (storeIsTemp) {
       await cleanupTempStore(resolvedStore);
     }
-    if (currentSendStore === resolvedStore) {
-      currentSendStore = null;
+    if (session.currentSendRoot === transferRoot) {
+      session.currentSendRoot = null;
+    }
+    if (session.currentSendStore === resolvedStore) {
+      session.currentSendStore = null;
     }
     throw err;
   }
 
-  sendProcess = spawn(resolvedCli, ['send', stagedPath], { env });
-  streamProcess(sendProcess, 'send');
-  sendProcess.on('close', () => {
-    sendProcess = null;
+  const proc = spawn(resolvedCli, ['send', stagedPath], { env });
+  session.sendProcess = proc;
+  streamProcess(session, proc, 'send');
+  proc.on('close', () => {
+    if (session.sendProcess === proc) {
+      session.sendProcess = null;
+    }
     cleanupStagedFile(stagedPath);
     cleanupTransferRoot(transferRoot);
     if (storeIsTemp) {
       cleanupTempStore(resolvedStore);
     }
-    if (currentSendRoot === transferRoot) {
-      currentSendRoot = null;
+    if (session.currentSendRoot === transferRoot) {
+      session.currentSendRoot = null;
     }
-    if (currentSendStore === resolvedStore) {
-      currentSendStore = null;
+    if (session.currentSendStore === resolvedStore) {
+      session.currentSendStore = null;
     }
   });
 
   return { started: true, cliPath: resolvedCli };
 });
 
-ipcMain.handle('stop-send', async () => {
-  if (!sendProcess) return { stopped: false };
-  sendProcess.kill('SIGINT');
-  if (sendProcess) {
-    sendProcess.once('close', () => {});
-  }
+ipcMain.handle('stop-send', async (event) => {
+  const session = getSessionFromSender(event.sender);
+  if (!session.sendProcess) return { stopped: false };
+  session.sendProcess.kill('SIGINT');
   return { stopped: true };
 });
 
 ipcMain.handle('start-receive', async (event, { cliPath, storeDir, ticket, fallbackTicket, outputPath, expectedSize }) => {
-  if (receiveProcess) throw new Error('Receive process already running');
+  const session = getSessionFromSender(event.sender);
+  if (session.receiveProcess) throw new Error('Receive process already running in this window');
   if (!ticket) throw new Error('Ticket is required');
   if (!outputPath) throw new Error('Output path is required');
 
   const resolvedCli = resolveCliPath(cliPath);
-  mainWindow?.webContents.send('process-log', { channel: 'receive', message: `CLI: ${resolvedCli}`, isError: false });
+  sendToSession(session, 'process-log', { channel: 'receive', message: `CLI: ${resolvedCli}`, isError: false });
   const env = { ...process.env };
-  receivePoisoned = false;
+  session.receiveStopRequested = false;
+  session.receivePoisoned = false;
   if (storeDir) {
     env.ORBITXFER_STORE_DIR = storeDir;
-    currentReceiveStore = storeDir;
+    session.currentReceiveStore = storeDir;
   } else if (resumeMode) {
     const outputDir = path.dirname(outputPath);
     const ticketKey = crypto.createHash('sha256').update(ticket).digest('hex').slice(0, 12);
     const resumeRoot = path.join(outputDir, '.orbitxfer-store');
     const resumeStore = path.join(resumeRoot, ticketKey);
     env.ORBITXFER_STORE_DIR = resumeStore;
-    currentReceiveStore = resumeStore;
+    session.currentReceiveStore = resumeStore;
   } else {
     delete env.ORBITXFER_STORE_DIR;
-    currentReceiveStore = null;
+    session.currentReceiveStore = null;
   }
-  if (currentReceiveStore) {
-    fs.mkdirSync(currentReceiveStore, { recursive: true });
+  if (session.currentReceiveStore) {
+    fs.mkdirSync(session.currentReceiveStore, { recursive: true });
   }
   if (typeof expectedSize === 'number' && Number.isFinite(expectedSize)) {
     env.ORBITXFER_EXPECTED_SIZE = `${Math.floor(expectedSize)}`;
@@ -497,32 +593,40 @@ ipcMain.handle('start-receive', async (event, { cliPath, storeDir, ticket, fallb
   let attemptedFallback = false;
 
   const startAttempt = (ticketValue) => {
-    receiveProcess = spawn(resolvedCli, ['receive', ticketValue, outputPath], { env });
-    streamProcess(receiveProcess, 'receive', {
+    const proc = spawn(resolvedCli, ['receive', ticketValue, outputPath], { env });
+    session.receiveProcess = proc;
+    streamProcess(session, proc, 'receive', {
       suppressExit: true,
       onExit: (code) => {
-        receiveProcess = null;
+        if (session.receiveProcess === proc) {
+          session.receiveProcess = null;
+        }
+        if (session.receiveStopRequested) {
+          session.receiveStopRequested = false;
+          sendToSession(session, 'process-exit', { channel: 'receive', code });
+          return;
+        }
         if (code === 0) {
-          mainWindow?.webContents.send('process-exit', { channel: 'receive', code });
+          sendToSession(session, 'process-exit', { channel: 'receive', code });
           return;
         }
         if (!attemptedFallback && secondaryTicket) {
           attemptedFallback = true;
-          if (receivePoisoned && currentReceiveStore) {
+          if (session.receivePoisoned && session.currentReceiveStore) {
             try {
-              fs.rmSync(currentReceiveStore, { recursive: true, force: true });
-              fs.mkdirSync(currentReceiveStore, { recursive: true });
-              appendDebug(`cleanup_receive_store_poisoned ${currentReceiveStore}`);
+              fs.rmSync(session.currentReceiveStore, { recursive: true, force: true });
+              fs.mkdirSync(session.currentReceiveStore, { recursive: true });
+              appendDebug(`window=${session.id} cleanup_receive_store_poisoned ${session.currentReceiveStore}`);
             } catch (_) {
               // ignore cleanup failures
             }
-            receivePoisoned = false;
+            session.receivePoisoned = false;
           }
-          mainWindow?.webContents.send('process-event', {
+          sendToSession(session, 'process-event', {
             channel: 'receive',
             payload: { type: 'download_retry', message: 'Direct connection failed. Trying relay…' }
           });
-          mainWindow?.webContents.send('process-log', {
+          sendToSession(session, 'process-log', {
             channel: 'receive',
             message: 'Direct connection failed. Retrying via relay ticket.',
             isError: true
@@ -530,15 +634,16 @@ ipcMain.handle('start-receive', async (event, { cliPath, storeDir, ticket, fallb
           startAttempt(secondaryTicket);
           return;
         }
-        if (receivePoisoned && currentReceiveStore) {
+        if (session.receivePoisoned && session.currentReceiveStore) {
+          const poisonedStore = session.currentReceiveStore;
           fs.promises
-            .rm(currentReceiveStore, { recursive: true, force: true })
-            .then(() => appendDebug(`cleanup_receive_store_poisoned ${currentReceiveStore}`))
+            .rm(poisonedStore, { recursive: true, force: true })
+            .then(() => appendDebug(`window=${session.id} cleanup_receive_store_poisoned ${poisonedStore}`))
             .catch(() => {});
-          currentReceiveStore = null;
-          receivePoisoned = false;
+          session.currentReceiveStore = null;
+          session.receivePoisoned = false;
         }
-        mainWindow?.webContents.send('process-exit', { channel: 'receive', code });
+        sendToSession(session, 'process-exit', { channel: 'receive', code });
       }
     });
   };
@@ -548,9 +653,11 @@ ipcMain.handle('start-receive', async (event, { cliPath, storeDir, ticket, fallb
   return { started: true, cliPath: resolvedCli };
 });
 
-ipcMain.handle('stop-receive', async () => {
-  if (!receiveProcess) return { stopped: false };
-  receiveProcess.kill('SIGINT');
+ipcMain.handle('stop-receive', async (event) => {
+  const session = getSessionFromSender(event.sender);
+  if (!session.receiveProcess) return { stopped: false };
+  session.receiveStopRequested = true;
+  session.receiveProcess.kill('SIGINT');
   return { stopped: true };
 });
 
@@ -559,15 +666,19 @@ ipcMain.handle('cleanup-transfers', async () => {
   return { ok: true };
 });
 
-ipcMain.handle('cleanup-receive-store', async () => {
-  if (currentReceiveStore) {
+ipcMain.handle('cleanup-receive-store', async (event) => {
+  const session = getSessionFromSender(event.sender);
+  if (session.currentReceiveStore) {
+    const store = session.currentReceiveStore;
     try {
-      await fs.promises.rm(currentReceiveStore, { recursive: true, force: true });
-      appendDebug(`cleanup_receive_store ${currentReceiveStore}`);
+      await fs.promises.rm(store, { recursive: true, force: true });
+      appendDebug(`window=${session.id} cleanup_receive_store ${store}`);
     } catch (_) {
       // ignore cleanup failures
     }
-    currentReceiveStore = null;
+    if (session.currentReceiveStore === store) {
+      session.currentReceiveStore = null;
+    }
   }
   return { ok: true };
 });
