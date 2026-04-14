@@ -1,5 +1,11 @@
 # Releases
 
+## v0.1.50 - 2026-04-13
+- Added MB/s counters to upload/download progress.
+- Added completion stats (connected time, average speed, total duration).
+- Added collapsible log panels and updated connection mode hint.
+- Renamed Receive "Output path" label to "Choose Destination".
+
 ## v0.1.49 - 2026-04-13
 - Added connection mode toggle: Direct-only or Direct + Relay fallback.
 - Share tokens now respect the selected mode (ox2 for direct+relay, ox1 for direct-only).

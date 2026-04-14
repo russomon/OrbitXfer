@@ -12,6 +12,17 @@ let currentTicketFull = '';
 let currentShareToken = '';
 let sendFileSize = null;
 let receiveExpectedSize = null;
+let sendConnectionStart = null;
+let receiveConnectionStart = null;
+let sendCompleted = false;
+let receiveCompleted = false;
+let sendSpeedBps = null;
+let receiveSpeedBps = null;
+
+const speedSamples = {
+  sendUpload: [],
+  receiveDownload: []
+};
 
 const ticketRegex = /receive\s+(\S+)/;
 const ticketPrefix = /^blob/i;
@@ -22,6 +33,49 @@ const progressState = {
   receiveDownloadTotal: null,
   receiveExportTotal: null
 };
+
+function formatDuration(ms) {
+  if (!ms || ms < 0) return '0s';
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const parts = [];
+  if (hours) parts.push(`${hours}h`);
+  if (minutes || hours) parts.push(`${minutes}m`);
+  parts.push(`${seconds}s`);
+  return parts.join(' ');
+}
+
+function formatSpeed(bytesPerSec) {
+  if (!bytesPerSec || bytesPerSec <= 0) return '0 MB/s';
+  const mbps = bytesPerSec / (1024 * 1024);
+  return `${mbps.toFixed(mbps >= 10 ? 0 : 1)} MB/s`;
+}
+
+function formatRatePerHour(bytesPerSec) {
+  if (!bytesPerSec || bytesPerSec <= 0) return '0 /hour';
+  const bytesPerHour = bytesPerSec * 3600;
+  return `${formatBytes(bytesPerHour)}/hour`;
+}
+
+function updateRollingSpeed(sampleKey, bytes) {
+  const now = performance.now();
+  const samples = speedSamples[sampleKey];
+  if (!samples) return null;
+  samples.push({ t: now, bytes });
+  while (samples.length > 1 && now - samples[0].t > 4000) {
+    samples.shift();
+  }
+  if (samples.length < 2) return null;
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const dt = (last.t - first.t) / 1000;
+  if (dt <= 0) return null;
+  const db = last.bytes - first.bytes;
+  if (db <= 0) return null;
+  return db / dt;
+}
 
 function getSendMode() {
   const selected = document.querySelector('input[name="sendMode"]:checked');
@@ -236,20 +290,31 @@ function updateProgress(barId, textId, bytes, total) {
 
   bar.style.width = percent !== null ? `${percent.toFixed(1)}%` : hasBytes ? '8%' : '0%';
 
+  const speedPrefix =
+    barId === 'sendUploadBar'
+      ? (sendSpeedBps ? `${formatSpeed(sendSpeedBps)} ` : '')
+      : barId === 'receiveDownloadBar'
+        ? (receiveSpeedBps ? `${formatSpeed(receiveSpeedBps)} ` : '')
+        : '';
+
   if (hasBytes && hasTotal) {
-    text.textContent = `${formatBytes(bytes)} / ${formatBytes(total)} (${percent.toFixed(1)}%)`;
+    text.textContent = `${speedPrefix}${formatBytes(bytes)} / ${formatBytes(total)} (${percent.toFixed(1)}%)`;
   } else if (hasBytes) {
-    text.textContent = `${formatBytes(bytes)} / —`;
+    text.textContent = `${speedPrefix}${formatBytes(bytes)} / —`;
   } else if (hasTotal) {
-    text.textContent = `0 / ${formatBytes(total)}`;
+    text.textContent = `${speedPrefix}0 / ${formatBytes(total)}`;
   } else {
-    text.textContent = '—';
+    text.textContent = speedPrefix ? `${speedPrefix}—` : '—';
   }
 }
 
 function resetSendUI() {
   progressState.sendTicketTotal = null;
   progressState.sendUploadTotal = null;
+  sendConnectionStart = null;
+  sendCompleted = false;
+  sendSpeedBps = null;
+  speedSamples.sendUpload = [];
   updateProgress('sendTicketBar', 'sendTicketProgress', null, null);
   updateProgress('sendUploadBar', 'sendUploadProgress', null, null);
   setStatus('sendTicketStatus', 'Idle.', 'info');
@@ -265,14 +330,63 @@ function resetSendUI() {
   const copyRaw = document.getElementById('copyRawBtn');
   if (copyShare) copyShare.disabled = true;
   if (copyRaw) copyRaw.disabled = true;
+  const stats = document.getElementById('sendCompleteStats');
+  if (stats) {
+    stats.classList.add('hidden');
+    stats.setAttribute('hidden', 'hidden');
+    stats.innerHTML = '';
+  }
 }
 
 function resetReceiveUI() {
   progressState.receiveDownloadTotal = null;
   progressState.receiveExportTotal = null;
+  receiveConnectionStart = null;
+  receiveCompleted = false;
+  receiveSpeedBps = null;
+  speedSamples.receiveDownload = [];
   updateProgress('receiveDownloadBar', 'receiveDownloadProgress', null, null);
   updateProgress('receiveExportBar', 'receiveExportProgress', null, null);
   setStatus('receiveConnectStatus', 'Idle.', 'info');
+  const stats = document.getElementById('receiveCompleteStats');
+  if (stats) {
+    stats.classList.add('hidden');
+    stats.setAttribute('hidden', 'hidden');
+    stats.innerHTML = '';
+  }
+}
+
+function toggleLog(side) {
+  const log = document.getElementById(side === 'send' ? 'sendLog' : 'receiveLog');
+  const toggle = document.getElementById(side === 'send' ? 'sendLogToggle' : 'receiveLogToggle');
+  if (!log || !toggle) return;
+  const isOpen = log.classList.contains('log-expanded');
+  if (isOpen) {
+    log.classList.remove('log-expanded');
+    log.classList.add('log-collapsed');
+    toggle.textContent = '▸';
+    toggle.setAttribute('aria-expanded', 'false');
+  } else {
+    log.classList.remove('log-collapsed');
+    log.classList.add('log-expanded');
+    toggle.textContent = '▾';
+    toggle.setAttribute('aria-expanded', 'true');
+  }
+}
+
+function renderCompletionStats(side, totalBytes, startTime, endTime) {
+  if (!startTime || !endTime) return;
+  const durationMs = endTime - startTime;
+  const avgBps = totalBytes && durationMs > 0 ? (totalBytes / (durationMs / 1000)) : 0;
+  const stats = document.getElementById(side === 'send' ? 'sendCompleteStats' : 'receiveCompleteStats');
+  if (!stats) return;
+  stats.innerHTML = [
+    `Connected to peer for ${formatDuration(durationMs)}`,
+    `Average transfer speed ${formatRatePerHour(avgBps)}`,
+    `Total duration ${formatDuration(durationMs)}`
+  ].map((line) => `<div>${line}</div>`).join('');
+  stats.classList.remove('hidden');
+  stats.removeAttribute('hidden');
 }
 
 async function pickFile() {
@@ -552,18 +666,27 @@ function handleEvent(channel, event) {
       case 'receiver_connected':
         setStatus('sendReceiverStatus', 'Receiver connected.', 'success');
         setStatus('sendStatus', 'Uploading…', 'info');
+        if (!sendConnectionStart) {
+          sendConnectionStart = Date.now();
+        }
         break;
       case 'receiver_disconnected':
         setStatus('sendReceiverStatus', 'Receiver disconnected.', 'error');
         break;
       case 'upload_started':
         progressState.sendUploadTotal = event.total ?? progressState.sendUploadTotal;
+        speedSamples.sendUpload = [];
+        sendSpeedBps = null;
         updateProgress('sendUploadBar', 'sendUploadProgress', 0, progressState.sendUploadTotal);
         setStatus('sendStatus', 'Uploading…', 'info');
         break;
       case 'upload_progress':
         if (typeof event.total === 'number') {
           progressState.sendUploadTotal = event.total;
+        }
+        if (typeof event.bytes === 'number') {
+          const speed = updateRollingSpeed('sendUpload', event.bytes);
+          if (speed !== null) sendSpeedBps = speed;
         }
         updateProgress(
           'sendUploadBar',
@@ -581,6 +704,10 @@ function handleEvent(channel, event) {
         );
         setStatus('sendReceiverStatus', 'Transfer complete.', 'success');
         setStatus('sendStatus', 'Upload complete.', 'success');
+        sendCompleted = true;
+        if (sendConnectionStart) {
+          renderCompletionStats('send', progressState.sendUploadTotal ?? 0, sendConnectionStart, Date.now());
+        }
         ipcRenderer.invoke('cleanup-transfers').catch(() => {});
         break;
       case 'upload_aborted':
@@ -599,6 +726,9 @@ function handleEvent(channel, event) {
         break;
       case 'connect_success':
         setStatus('receiveConnectStatus', 'Connected.', 'success');
+        if (!receiveConnectionStart) {
+          receiveConnectionStart = Date.now();
+        }
         break;
       case 'connect_failed':
         setStatus('receiveConnectStatus', 'Connection failed. Retrying…', 'error');
@@ -611,6 +741,8 @@ function handleEvent(channel, event) {
         if (typeof event.total === 'number') {
           progressState.receiveDownloadTotal = event.total;
         }
+        speedSamples.receiveDownload = [];
+        receiveSpeedBps = null;
         updateProgress('receiveDownloadBar', 'receiveDownloadProgress', 0, progressState.receiveDownloadTotal);
         setStatus('receiveStatus', 'Downloading…', 'info');
         break;
@@ -620,6 +752,10 @@ function handleEvent(channel, event) {
       case 'download_progress':
         if (typeof event.total === 'number') {
           progressState.receiveDownloadTotal = event.total;
+        }
+        if (typeof event.bytes === 'number') {
+          const speed = updateRollingSpeed('receiveDownload', event.bytes);
+          if (speed !== null) receiveSpeedBps = speed;
         }
         updateProgress(
           'receiveDownloadBar',
@@ -664,7 +800,12 @@ function handleEvent(channel, event) {
           progressState.receiveExportTotal ?? 0,
           progressState.receiveExportTotal ?? null
         );
-        setStatus('receiveStatus', 'Saved.', 'success');
+        setStatus('receiveStatus', 'Download complete.', 'success');
+        receiveCompleted = true;
+        if (receiveConnectionStart) {
+          const totalBytes = progressState.receiveDownloadTotal ?? 0;
+          renderCompletionStats('receive', totalBytes, receiveConnectionStart, Date.now());
+        }
         ipcRenderer.invoke('cleanup-transfers').catch(() => {});
         ipcRenderer.invoke('cleanup-receive-store').catch(() => {});
         break;
@@ -734,7 +875,11 @@ ipcRenderer.on('process-exit', (event, { channel, code }) => {
   } else {
     receiveRunning = false;
     toggleReceiveButtons();
-    setStatus('receiveStatus', `Receive process exited (${code}).`, code === 0 ? 'success' : 'error');
+    if (code === 0) {
+      setStatus('receiveStatus', 'Download complete.', 'success');
+    } else {
+      setStatus('receiveStatus', `Receive process exited (${code}).`, 'error');
+    }
   }
 });
 

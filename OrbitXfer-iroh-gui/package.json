@@ -1,6 +1,6 @@
 {
   "name": "orbitxfer-iroh-gui",
-  "version": "0.1.49",
+  "version": "0.1.50",
   "description": "GUI wrapper for the OrbitXfer Iroh CLI",
   "main": "src/main.js",
   "scripts": {
