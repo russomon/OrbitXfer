@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <version> [YYYY-MM-DD]" >&2
-  echo "Example: $0 0.1.51 2026-04-14" >&2
+  echo "Example: $0 0.1.56 2026-04-18" >&2
   exit 1
 fi
 
@@ -39,6 +39,7 @@ require_match() {
 
 require_match "OrbitXfer-iroh-gui/package.json" "\"version\": \"${release_number}\""
 require_match "OrbitXfer-iroh-gui/package-lock.json" "\"version\": \"${release_number}\""
+require_match "OrbitXfer-iroh-cli/Cargo.toml" "version = \"${release_number}\""
 require_match "OrbitXfer-iroh-cli/src/main.rs" "const CLI_VERSION: &str = \"${release_number}\";"
 
 if [[ ! -f RELEASES.md ]]; then

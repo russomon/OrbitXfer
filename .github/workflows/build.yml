@@ -70,10 +70,58 @@ jobs:
         working-directory: OrbitXfer-iroh-gui
         run: npm ci
 
+      - name: Prepare macOS signing inputs
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CSC_LINK_SECRET: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD_SECRET: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_SECRET: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID_SECRET: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_SECRET: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          signing_ready=false
+          notarization_ready=false
+
+          if [[ -n "${CSC_LINK_SECRET}" && -n "${CSC_KEY_PASSWORD_SECRET}" ]]; then
+            echo "CSC_LINK=${CSC_LINK_SECRET}" >> "${GITHUB_ENV}"
+            echo "CSC_KEY_PASSWORD=${CSC_KEY_PASSWORD_SECRET}" >> "${GITHUB_ENV}"
+            signing_ready=true
+          else
+            echo "macOS code-signing secrets not configured; build will remain unsigned."
+          fi
+
+          if [[ -n "${APPLE_API_KEY_SECRET}" && -n "${APPLE_API_KEY_ID_SECRET}" && -n "${APPLE_API_ISSUER_SECRET}" ]]; then
+            key_path="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID_SECRET}.p8"
+            printf '%s' "${APPLE_API_KEY_SECRET}" > "${key_path}"
+            chmod 600 "${key_path}"
+            echo "APPLE_API_KEY=${key_path}" >> "${GITHUB_ENV}"
+            echo "APPLE_API_KEY_ID=${APPLE_API_KEY_ID_SECRET}" >> "${GITHUB_ENV}"
+            echo "APPLE_API_ISSUER=${APPLE_API_ISSUER_SECRET}" >> "${GITHUB_ENV}"
+            notarization_ready=true
+          else
+            echo "macOS notarization secrets not configured; build will not be notarized."
+          fi
+
+          echo "ORBITXFER_MAC_SIGNING_READY=${signing_ready}" >> "${GITHUB_ENV}"
+          echo "ORBITXFER_MAC_NOTARIZATION_READY=${notarization_ready}" >> "${GITHUB_ENV}"
+
+      - name: Require macOS signing for tagged releases
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          [[ "${ORBITXFER_MAC_SIGNING_READY}" == "true" ]] || (echo "Tagged macOS releases require CSC_LINK and CSC_KEY_PASSWORD secrets." && exit 1)
+          [[ "${ORBITXFER_MAC_NOTARIZATION_READY}" == "true" ]] || (echo "Tagged macOS releases require APPLE_API_KEY, APPLE_API_KEY_ID, and APPLE_API_ISSUER secrets." && exit 1)
+
       - name: Build GUI (mac)
         if: runner.os == 'macOS'
         working-directory: OrbitXfer-iroh-gui
         run: npm run build:mac
+
+      - name: Verify signed + notarized app (mac)
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        working-directory: OrbitXfer-iroh-gui
+        run: npm run verify:mac:release
 
       - name: Build GUI (win)
         if: runner.os == 'Windows'

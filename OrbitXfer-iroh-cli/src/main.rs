@@ -23,14 +23,14 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.51";
+const CLI_VERSION: &str = "0.1.56";
 
 fn print_usage() {
     eprintln!("Usage:");
@@ -127,11 +127,12 @@ fn store_root_for_receive(output_path: &Path) -> Result<(PathBuf, bool)> {
             .unwrap_or(env::current_dir()?)
     };
     std::fs::create_dir_all(&base_dir)?;
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let store_dir = base_dir.join(".orbitxfer-store").join(format!("rx-{ts}"));
+    let output_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download");
+    let store_dir = base_dir.join(format!("{output_name}.orbitxfer-pieces"));
     Ok((store_dir, true))
 }
 
@@ -617,6 +618,22 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
         }
     }
 
+    if let Ok(local) = store.remote().local(ticket.hash_and_format()).await {
+        let local_bytes = local.local_bytes();
+        if local_bytes > 0 {
+            emit_line(&format!(
+                "Local resume data available: {} ({})",
+                local_bytes,
+                format_bytes(local_bytes)
+            ));
+            emit_event(json!({
+                "type": "download_resume_state",
+                "bytes": local_bytes,
+                "total": total_size
+            }));
+        }
+    }
+
     if let Ok(space) = available_space(&store_dir) {
         free_space = Some(space);
         emit_line(&format!(
@@ -641,7 +658,7 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
         }
     }
 
-    emit_line("Starting download.");
+    emit_line("Downloading into temporary transfer data.");
     emit_event(json!({ "type": "download_started", "total": total_size }));
 
     let max_attempts: u32 = env::var("ORBITXFER_DOWNLOAD_ATTEMPTS")
@@ -690,7 +707,7 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
             }
         }
         if direct_completed {
-            emit_line("Copying to destination.");
+            emit_line("Finalizing into destination file.");
         }
     }
 
@@ -826,7 +843,7 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
     }
 
     if !direct_completed {
-        emit_line("Copying to destination.");
+        emit_line("Finalizing into destination file.");
     }
 
     emit_event(json!({ "type": "export_started", "total": total_size }));
@@ -864,7 +881,7 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
         }
     }
 
-    emit_line("Finished copying.");
+    emit_line("Finished finalizing destination file.");
     emit_line("Shutting down.");
     endpoint.close().await;
     store.shutdown().await?;

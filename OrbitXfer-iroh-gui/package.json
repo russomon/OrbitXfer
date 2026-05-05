@@ -1,12 +1,13 @@
 {
   "name": "orbitxfer-iroh-gui",
-  "version": "0.1.51",
+  "version": "0.1.56",
   "description": "GUI wrapper for the OrbitXfer Iroh CLI",
   "main": "src/main.js",
   "scripts": {
     "sync:cli": "node ./scripts/sync-cli.js",
     "start": "electron .",
     "build:mac": "npm run sync:cli && electron-builder --mac",
+    "verify:mac:release": "bash ./scripts/verify-macos-release.sh",
     "build:win": "npm run sync:cli && electron-builder --win",
     "build:linux": "npm run sync:cli && electron-builder --linux"
   },
@@ -14,6 +15,15 @@
     "appId": "com.orbitolive.orbitxfer.iroh.gui",
     "productName": "OrbitXfer",
     "mac": {
+      "category": "public.app-category.productivity",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+      "binaries": [
+        "Contents/Resources/orbitxfer-iroh-cli"
+      ],
+      "notarize": true,
       "icon": "assets/icon.icns",
       "extraResources": [
         {

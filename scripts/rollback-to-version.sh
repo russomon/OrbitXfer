@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   echo "Usage: $0 <version> [branch-name]" >&2
-  echo "Example: $0 0.1.51 rollback/0.1.51" >&2
+  echo "Example: $0 0.1.56 rollback/0.1.56" >&2
   exit 1
 fi
 

@@ -22,7 +22,7 @@ cargo run -- receive <TICKET> ./output/file
 
 ## Storage
 
-This prototype uses `FsStore` (disk-backed) instead of `MemStore`, so large files do not need to live in memory. The store lives in `./.orbitxfer-store` by default and can be overridden with:
+This prototype uses `FsStore` (disk-backed) instead of `MemStore`, so large files do not need to live in memory. OrbitXfer receives now default to a visible temporary transfer-data folder next to the chosen destination file: `<filename>.orbitxfer-pieces`. You can still override the store location with:
 
 ```bash
 ORBITXFER_STORE_DIR=/path/to/store cargo run -- send ./path/to/file

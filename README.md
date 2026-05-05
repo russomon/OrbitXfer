@@ -31,8 +31,12 @@ The GitHub Actions workflow handles this automatically for releases.
 ## Versioning & Rollback
 - Every releasable change should bump the app version and append an entry to `RELEASES.md`.
 - `scripts/new-release.sh <version>` now validates the version files, stages the release, commits it, and creates an annotated `vX.Y.Z` tag.
-- `scripts/rollback-to-version.sh <version>` restores any tagged release onto a safe rollback branch such as `rollback/0.1.51`.
+- `scripts/rollback-to-version.sh <version>` restores any tagged release onto a safe rollback branch such as `rollback/0.1.56`.
 - Push releases with tags using `git push origin main --follow-tags` so GitHub always has the rollback points.
+
+## macOS Release Signing
+- OrbitXfer macOS releases are configured for Developer ID signing, hardened runtime, and notarization.
+- See `docs/macos-signing-notarization.md` for the Apple certificate setup, GitHub secrets, local release flow, and verification steps.
 
 ## Releases
 Build artifacts are published via GitHub Actions (macOS DMG, Windows NSIS, Linux AppImage + .deb).

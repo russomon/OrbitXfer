@@ -5,6 +5,7 @@ let sendRunning = false;
 let receiveRunning = false;
 let sendStopRequested = false;
 let receiveStopRequested = false;
+let transferMode = 'send';
 let sendFilename = '';
 let receiveFilenameHint = '';
 let currentTicket = '';
@@ -20,6 +21,8 @@ let sendCompleted = false;
 let receiveCompleted = false;
 let sendSpeedBps = null;
 let receiveSpeedBps = null;
+let availableResumeState = { send: null, receive: null };
+let resumePromptDismissed = false;
 
 const speedSamples = {
   sendUpload: [],
@@ -30,9 +33,13 @@ const ticketRegex = /receive\s+(\S+)/;
 const ticketPrefix = /^blob/i;
 const tokenPrefix = /^ox[12]:/i;
 const progressState = {
+  sendTicketBytes: null,
   sendTicketTotal: null,
+  sendUploadBytes: null,
   sendUploadTotal: null,
+  receiveDownloadBytes: null,
   receiveDownloadTotal: null,
+  receiveExportBytes: null,
   receiveExportTotal: null
 };
 
@@ -125,6 +132,52 @@ function extractBlobTicket(value) {
   return match ? match[0] : '';
 }
 
+function stripInvisibleCharacters(value) {
+  return typeof value === 'string' ? value.replace(/[\u200B-\u200D\uFEFF]/g, '') : '';
+}
+
+function findDecodedShareToken(rawValue) {
+  const normalized = stripInvisibleCharacters(rawValue || '');
+  const trimmed = normalized.trim();
+  if (!trimmed) return null;
+
+  if (tokenPrefix.test(trimmed)) {
+    const decoded = decodeToken(trimmed);
+    if (decoded) {
+      return {
+        token: trimmed,
+        decoded,
+        source: 'share-token',
+        normalizedWhitespace: false
+      };
+    }
+  }
+
+  const compact = normalized.replace(/\s+/g, '');
+  const prefixRegex = /ox[12]:/gi;
+  let match;
+  while ((match = prefixRegex.exec(compact)) !== null) {
+    const remainder = compact.slice(match.index);
+    const candidateMatch = remainder.match(/^ox[12]:[A-Za-z0-9_-]+/i);
+    if (!candidateMatch) continue;
+    const candidate = candidateMatch[0];
+    for (let end = candidate.length; end > 4; end -= 1) {
+      const token = candidate.slice(0, end);
+      const decoded = decodeToken(token);
+      if (decoded) {
+        return {
+          token,
+          decoded,
+          source: match.index === 0 && token === trimmed ? 'share-token' : 'embedded-share-token',
+          normalizedWhitespace: compact !== trimmed
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
 function encodeToken(ticket, filename, size) {
   if (!ticketPrefix.test(ticket)) return '';
   const payload = { ticket };
@@ -204,18 +257,35 @@ function extractBlobTicketFromLog() {
 }
 
 function parseTicketInput(rawValue) {
-  const raw = (rawValue || '').trim();
-  if (!raw) return { ticket: '', fallbackTicket: '', filename: '', size: null };
+  const raw = stripInvisibleCharacters(rawValue || '').trim();
+  const result = {
+    ticket: '',
+    fallbackTicket: '',
+    filename: '',
+    size: null,
+    source: 'empty',
+    shareToken: '',
+    issues: []
+  };
+  if (!raw) return result;
+
+  const decodedShare = findDecodedShareToken(raw);
+  if (decodedShare) {
+    return {
+      ...decodedShare.decoded,
+      source: decodedShare.source,
+      shareToken: decodedShare.token,
+      issues: decodedShare.normalizedWhitespace ? ['normalized-whitespace'] : []
+    };
+  }
+  if (/ox[12]:/i.test(raw)) {
+    result.issues.push('share-token-decode-failed');
+  }
 
   let ticket = raw;
   let fallbackTicket = '';
   let filename = '';
   let size = null;
-
-  if (tokenPrefix.test(raw)) {
-    const decoded = decodeToken(raw);
-    if (decoded) return decoded;
-  }
 
   if (raw.startsWith('orbitxfer://')) {
     try {
@@ -234,10 +304,24 @@ function parseTicketInput(rawValue) {
       if (!ticket) {
         ticket = extractBlobTicket(raw);
       }
-      return { ticket, fallbackTicket, filename, size };
+      return {
+        ticket,
+        fallbackTicket,
+        filename,
+        size,
+        source: 'orbitxfer-link',
+        shareToken: '',
+        issues: result.issues
+      };
     } catch (_) {
       // Fall through to plain parsing.
     }
+  }
+
+  const receiveCommandMatch = raw.match(ticketRegex);
+  if (receiveCommandMatch && receiveCommandMatch[1]) {
+    ticket = receiveCommandMatch[1].trim();
+    result.source = 'receive-command';
   }
 
   const pipeIdx = raw.indexOf('|');
@@ -247,15 +331,88 @@ function parseTicketInput(rawValue) {
     if (meta.startsWith('name=')) {
       filename = decodeURIComponent(meta.slice(5));
     }
-    return { ticket, fallbackTicket, filename, size };
-  }
-
-  if (tokenPrefix.test(ticket)) {
-    const decoded = decodeToken(ticket);
-    if (decoded) return decoded;
+    return {
+      ticket,
+      fallbackTicket,
+      filename,
+      size,
+      source: result.source === 'receive-command' ? result.source : 'piped-ticket',
+      shareToken: '',
+      issues: result.issues
+    };
   }
   ticket = extractBlobTicket(ticket);
-  return { ticket, fallbackTicket, filename, size };
+  return {
+    ticket,
+    fallbackTicket,
+    filename,
+    size,
+    source: ticket ? (result.source === 'receive-command' ? result.source : 'blob-ticket') : 'unknown',
+    shareToken: '',
+    issues: result.issues
+  };
+}
+
+function appendReceiveAppLog(message, isError = false) {
+  appendLog('receiveLog', `[OrbitXfer] ${message}`, isError);
+}
+
+function summarizeValue(value, { lead = 18, tail = 10 } = {}) {
+  if (!value) return '—';
+  if (value.length <= lead + tail + 3) return value;
+  return `${value.slice(0, lead)}...${value.slice(-tail)}`;
+}
+
+function describeReceiveInputSource(source) {
+  switch (source) {
+    case 'share-token':
+      return 'share token';
+    case 'embedded-share-token':
+      return 'share token recovered from surrounding text';
+    case 'orbitxfer-link':
+      return 'OrbitXfer share link';
+    case 'receive-command':
+      return 'receive command text';
+    case 'piped-ticket':
+      return 'ticket with metadata suffix';
+    case 'blob-ticket':
+      return 'raw blob ticket';
+    case 'empty':
+      return 'empty input';
+    default:
+      return 'unrecognized input';
+  }
+}
+
+function logReceiveParseAttempt(inputValue, outputPath, parsed) {
+  appendReceiveAppLog('Receive validation started.');
+  appendReceiveAppLog(
+    `Input source: ${describeReceiveInputSource(parsed.source)} (${inputValue.length} chars).`
+  );
+  if (parsed.shareToken) {
+    appendReceiveAppLog(
+      `Recovered share token ${summarizeValue(parsed.shareToken)} (${parsed.shareToken.length} chars).`
+    );
+  }
+  if (parsed.ticket) {
+    appendReceiveAppLog(`Using ticket ${summarizeValue(parsed.ticket)}.`);
+  }
+  if (parsed.filename) {
+    appendReceiveAppLog(`Filename hint: ${parsed.filename}`);
+  }
+  if (typeof parsed.size === 'number') {
+    appendReceiveAppLog(`Expected size hint: ${formatBytes(parsed.size)}.`);
+  }
+  if (parsed.issues.includes('normalized-whitespace')) {
+    appendReceiveAppLog('Normalized wrapped or spaced token input before decoding.');
+  }
+  if (parsed.issues.includes('share-token-decode-failed')) {
+    appendReceiveAppLog(
+      'Detected a share-token marker, but the pasted token could not be decoded as-is.',
+      true
+    );
+  }
+  appendReceiveAppLog(`Destination: ${outputPath || '(not selected)'}`);
 }
 
 function buildShareLink(token, filename) {
@@ -278,6 +435,261 @@ function buildShareLink(token, filename) {
     return url.toString();
   } catch (_) {
     return token;
+  }
+}
+
+function normalizePathValue(value) {
+  if (!value || typeof value !== 'string') return '';
+  return path.resolve(value);
+}
+
+function normalizeTicketValue(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function buildShareTokenFromResumeState(state) {
+  if (!state) return '';
+  const size = typeof state.fileSize === 'number' ? state.fileSize : state.ticketTotal;
+  if (state.sendMode === 'direct') {
+    return state.directTicket ? encodeToken(state.directTicket, state.fileName, size) : '';
+  }
+  if (state.directTicket && state.relayTicket) {
+    return encodeTokenV2(state.directTicket, state.relayTicket, state.fileName, size);
+  }
+  const baseTicket = state.ticket || state.fullTicket || state.directTicket || state.relayTicket;
+  return baseTicket ? encodeToken(baseTicket, state.fileName, size) : '';
+}
+
+function setHidden(el, hidden) {
+  if (!el) return;
+  el.classList.toggle('hidden', hidden);
+  el.toggleAttribute('hidden', hidden);
+}
+
+function describeSendResume(state) {
+  if (!state) return 'No interrupted send is available.';
+  const name = state.fileName || path.basename(state.filePath || 'file');
+  const uploaded = typeof state.uploadBytes === 'number' ? formatBytes(state.uploadBytes) : '0 B';
+  const total = typeof state.uploadTotal === 'number'
+    ? formatBytes(state.uploadTotal)
+    : typeof state.fileSize === 'number'
+      ? formatBytes(state.fileSize)
+      : '—';
+  return `${name} • ${uploaded} of ${total} ready to resume`;
+}
+
+function describeReceiveResume(state) {
+  if (!state) return 'No interrupted receive is available.';
+  const name = state.outputPath ? path.basename(state.outputPath) : 'download';
+  const downloaded = typeof state.downloadBytes === 'number' ? formatBytes(state.downloadBytes) : '0 B';
+  const total = typeof state.downloadTotal === 'number'
+    ? formatBytes(state.downloadTotal)
+    : typeof state.expectedSize === 'number'
+      ? formatBytes(state.expectedSize)
+      : '—';
+  return `${name} • ${downloaded} of ${total} already downloaded`;
+}
+
+function renderResumeUI() {
+  const sendState = availableResumeState.send;
+  const receiveState = availableResumeState.receive;
+
+  const sendBtn = document.getElementById('resumeSendBtn');
+  const receiveBtn = document.getElementById('resumeReceiveBtn');
+  const sendSummary = document.getElementById('sendResumeSummary');
+  const receiveSummary = document.getElementById('receiveResumeSummary');
+
+  if (sendBtn) sendBtn.disabled = !sendState || sendRunning;
+  if (receiveBtn) receiveBtn.disabled = !receiveState || receiveRunning;
+  if (sendSummary) sendSummary.textContent = describeSendResume(sendState);
+  if (receiveSummary) receiveSummary.textContent = describeReceiveResume(receiveState);
+
+  const prompt = document.getElementById('resumePrompt');
+  const promptDetails = document.getElementById('resumePromptDetails');
+  const promptSend = document.getElementById('resumePromptSendBtn');
+  const promptReceive = document.getElementById('resumePromptReceiveBtn');
+  const shouldShowPrompt =
+    !resumePromptDismissed &&
+    Boolean(sendState || receiveState) &&
+    !sendRunning &&
+    !receiveRunning;
+
+  setHidden(prompt, !shouldShowPrompt);
+  setHidden(promptSend, !sendState);
+  setHidden(promptReceive, !receiveState);
+
+  if (promptDetails) {
+    const details = [];
+    if (sendState) details.push(describeSendResume(sendState));
+    if (receiveState) details.push(describeReceiveResume(receiveState));
+    promptDetails.textContent = details.join('  |  ');
+  }
+}
+
+function setAvailableResumeState(state, options = {}) {
+  availableResumeState = {
+    send: state?.send || null,
+    receive: state?.receive || null
+  };
+  if (options.resetPrompt) {
+    resumePromptDismissed = false;
+  }
+  renderResumeUI();
+}
+
+function dismissResumePrompt() {
+  resumePromptDismissed = true;
+  renderResumeUI();
+}
+
+function primeSendResumeState(state, options = {}) {
+  if (!state) return;
+  setTransferMode('send');
+  const preserveFile = Boolean(options.preserveFile);
+  if (!preserveFile) {
+    document.getElementById('sendFile').value = state.filePath || '';
+  }
+
+  sendFilename = state.fileName || (state.filePath ? path.basename(state.filePath) : '');
+  sendFileSize = typeof state.fileSize === 'number' ? state.fileSize : sendFileSize;
+  currentTicket = state.ticket || state.fullTicket || state.directTicket || '';
+  currentTicketDirect = state.directTicket || '';
+  currentTicketRelay = state.relayTicket || '';
+  currentTicketFull = state.fullTicket || '';
+  currentShareToken = state.shareToken || buildShareTokenFromResumeState(state) || '';
+
+  progressState.sendTicketTotal = typeof state.ticketTotal === 'number'
+    ? state.ticketTotal
+    : typeof state.fileSize === 'number'
+      ? state.fileSize
+      : progressState.sendTicketTotal;
+  progressState.sendTicketBytes = typeof state.ticketBytes === 'number'
+    ? state.ticketBytes
+    : currentShareToken
+      ? progressState.sendTicketTotal
+      : progressState.sendTicketBytes;
+  progressState.sendUploadTotal = typeof state.uploadTotal === 'number'
+    ? state.uploadTotal
+    : typeof state.fileSize === 'number'
+      ? state.fileSize
+      : progressState.sendUploadTotal;
+  progressState.sendUploadBytes = typeof state.uploadBytes === 'number'
+    ? state.uploadBytes
+    : progressState.sendUploadBytes;
+
+  document.getElementById('ticketValue').textContent = currentTicket || '—';
+  const shareEl = document.getElementById('shareTokenValue');
+  if (shareEl) shareEl.textContent = currentShareToken || '—';
+
+  const copyShare = document.getElementById('copyShareBtn');
+  const copyRaw = document.getElementById('copyRawBtn');
+  if (copyShare) copyShare.disabled = !currentShareToken;
+  if (copyRaw) copyRaw.disabled = !currentTicket;
+
+  updateProgress(
+    'sendTicketBar',
+    'sendTicketProgress',
+    progressState.sendTicketBytes,
+    progressState.sendTicketTotal
+  );
+  updateProgress(
+    'sendUploadBar',
+    'sendUploadProgress',
+    progressState.sendUploadBytes,
+    progressState.sendUploadTotal
+  );
+
+  setStatus('sendTicketStatus', currentShareToken ? 'Ticket ready.' : 'Ready to resume.', currentShareToken ? 'success' : 'info');
+  setStatus('sendReceiverStatus', 'Ready to resume interrupted transfer.', 'info');
+  setStatus('sendStatus', 'Resume available. Start sharing to continue seeding.', 'info');
+}
+
+function primeReceiveResumeState(state, options = {}) {
+  if (!state) return;
+  setTransferMode('receive');
+  const preserveTicketInput = Boolean(options.preserveTicketInput);
+  const preserveOutput = Boolean(options.preserveOutput);
+
+  if (!preserveTicketInput) {
+    document.getElementById('receiveTicket').value = state.tokenInput || state.ticket || '';
+  }
+  if (!preserveOutput) {
+    document.getElementById('receiveOutput').value = state.outputPath || '';
+  }
+
+  receiveFilenameHint = state.outputPath ? path.basename(state.outputPath) : receiveFilenameHint;
+  receiveExpectedSize = typeof state.expectedSize === 'number'
+    ? state.expectedSize
+    : typeof state.downloadTotal === 'number'
+      ? state.downloadTotal
+      : receiveExpectedSize;
+
+  progressState.receiveDownloadTotal = typeof state.downloadTotal === 'number'
+    ? state.downloadTotal
+    : typeof state.expectedSize === 'number'
+      ? state.expectedSize
+      : progressState.receiveDownloadTotal;
+  progressState.receiveDownloadBytes = typeof state.downloadBytes === 'number'
+    ? state.downloadBytes
+    : progressState.receiveDownloadBytes;
+  progressState.receiveExportTotal = typeof state.exportTotal === 'number'
+    ? state.exportTotal
+    : progressState.receiveDownloadTotal;
+  progressState.receiveExportBytes = typeof state.exportBytes === 'number'
+    ? state.exportBytes
+    : progressState.receiveExportBytes;
+
+  updateProgress(
+    'receiveDownloadBar',
+    'receiveDownloadProgress',
+    progressState.receiveDownloadBytes,
+    progressState.receiveDownloadTotal
+  );
+  updateProgress(
+    'receiveExportBar',
+    'receiveExportProgress',
+    progressState.receiveExportBytes,
+    progressState.receiveExportTotal
+  );
+
+  setStatus('receiveConnectStatus', 'Ready to resume.', 'info');
+  setStatus('receiveStatus', 'Resume available. Start download to continue.', 'info');
+}
+
+function matchingReceiveResume(parsed, outputPath) {
+  const saved = availableResumeState.receive;
+  if (!saved) return null;
+  if (!parsed?.ticket || !outputPath) return null;
+  if (normalizeTicketValue(saved.ticket) !== normalizeTicketValue(parsed.ticket)) return null;
+  if (normalizePathValue(saved.outputPath) !== normalizePathValue(outputPath)) return null;
+  return saved;
+}
+
+async function resumeLastSend(options = {}) {
+  const state = availableResumeState.send;
+  if (!state) {
+    setStatus('sendStatus', 'No interrupted send is available.', 'error');
+    return;
+  }
+  resumePromptDismissed = true;
+  primeSendResumeState(state);
+  renderResumeUI();
+  if (options.autoStart !== false) {
+    await startSend({ resumeLast: true, resumeState: state });
+  }
+}
+
+async function resumeLastReceive(options = {}) {
+  const state = availableResumeState.receive;
+  if (!state) {
+    setStatus('receiveStatus', 'No interrupted receive is available.', 'error');
+    return;
+  }
+  resumePromptDismissed = true;
+  primeReceiveResumeState(state);
+  renderResumeUI();
+  if (options.autoStart !== false) {
+    await startReceive({ resumeLast: true, resumeState: state });
   }
 }
 
@@ -311,7 +723,9 @@ function updateProgress(barId, textId, bytes, total) {
 }
 
 function resetSendUI() {
+  progressState.sendTicketBytes = null;
   progressState.sendTicketTotal = null;
+  progressState.sendUploadBytes = null;
   progressState.sendUploadTotal = null;
   sendConnectionStart = null;
   sendCompleted = false;
@@ -341,7 +755,9 @@ function resetSendUI() {
 }
 
 function resetReceiveUI() {
+  progressState.receiveDownloadBytes = null;
   progressState.receiveDownloadTotal = null;
+  progressState.receiveExportBytes = null;
   progressState.receiveExportTotal = null;
   receiveConnectionStart = null;
   receiveCompleted = false;
@@ -412,12 +828,36 @@ async function pickStoreDir() {
   }
 }
 
-async function openNewWindow() {
-  try {
-    await ipcRenderer.invoke('open-new-window');
-  } catch (err) {
-    setStatus('sendStatus', err.message || 'Failed to open a new window.', 'error');
+function setTransferMode(mode) {
+  if (mode !== 'send' && mode !== 'receive') return;
+
+  transferMode = mode;
+
+  const showingSend = mode === 'send';
+  const sendPanel = document.getElementById('sendPanel');
+  const receivePanel = document.getElementById('receivePanel');
+  const sendBtn = document.getElementById('modeSendBtn');
+  const receiveBtn = document.getElementById('modeReceiveBtn');
+
+  if (sendPanel) {
+    sendPanel.classList.toggle('hidden-panel', !showingSend);
+    sendPanel.toggleAttribute('hidden', !showingSend);
   }
+  if (receivePanel) {
+    receivePanel.classList.toggle('hidden-panel', showingSend);
+    receivePanel.toggleAttribute('hidden', showingSend);
+  }
+
+  if (sendBtn) {
+    sendBtn.classList.toggle('mode-btn-active', showingSend);
+    sendBtn.setAttribute('aria-pressed', showingSend ? 'true' : 'false');
+  }
+  if (receiveBtn) {
+    receiveBtn.classList.toggle('mode-btn-active', !showingSend);
+    receiveBtn.setAttribute('aria-pressed', showingSend ? 'false' : 'true');
+  }
+
+  document.title = showingSend ? 'OrbitXfer - Send' : 'OrbitXfer - Receive';
 }
 
 function getConfig() {
@@ -427,39 +867,50 @@ function getConfig() {
   };
 }
 
-async function startSend() {
+async function startSend(options = {}) {
   if (sendRunning) return;
-  const filePath = document.getElementById('sendFile').value.trim();
+  const resumeState = options.resumeState || null;
+  const filePath = (resumeState?.filePath || document.getElementById('sendFile').value).trim();
   if (!filePath) {
     setStatus('sendStatus', 'Select a file to share.', 'error');
     return;
   }
 
-  setStatus('sendTicketStatus', 'Preparing file…', 'info');
-  updateProgress('sendTicketBar', 'sendTicketProgress', 0, progressState.sendTicketTotal);
-
   sendFilename = path.basename(filePath);
-  currentTicket = '';
-  currentShareToken = '';
   document.getElementById('sendLog').innerHTML = '';
-  document.getElementById('ticketValue').textContent = '—';
-  const shareEl = document.getElementById('shareTokenValue');
-  if (shareEl) shareEl.textContent = '—';
-  const copyShare = document.getElementById('copyShareBtn');
-  const copyRaw = document.getElementById('copyRawBtn');
-  if (copyShare) copyShare.disabled = true;
-  if (copyRaw) copyRaw.disabled = true;
   resetSendUI();
-  setStatus('sendTicketStatus', 'Creating ticket…', 'info');
+
+  if (resumeState) {
+    primeSendResumeState(resumeState, { preserveFile: true });
+    setStatus('sendTicketStatus', 'Resuming ticket…', 'info');
+    setStatus('sendStatus', 'Resuming previous share…', 'info');
+  } else {
+    currentTicket = '';
+    currentShareToken = '';
+    document.getElementById('ticketValue').textContent = '—';
+    const shareEl = document.getElementById('shareTokenValue');
+    if (shareEl) shareEl.textContent = '—';
+    const copyShare = document.getElementById('copyShareBtn');
+    const copyRaw = document.getElementById('copyRawBtn');
+    if (copyShare) copyShare.disabled = true;
+    if (copyRaw) copyRaw.disabled = true;
+    setStatus('sendTicketStatus', 'Creating ticket…', 'info');
+    updateProgress('sendTicketBar', 'sendTicketProgress', 0, progressState.sendTicketTotal);
+  }
 
   try {
     const cfg = getConfig();
     const sendMode = getSendMode();
     sendStopRequested = false;
-    await ipcRenderer.invoke('start-send', { ...cfg, filePath, sendMode });
+    await ipcRenderer.invoke('start-send', { ...cfg, filePath, sendMode, resumeLast: Boolean(resumeState) });
     sendRunning = true;
-    setStatus('sendStatus', 'Sharing started. Waiting for receiver…', 'info');
+    setStatus(
+      'sendStatus',
+      resumeState ? 'Sharing resumed. Waiting for receiver…' : 'Sharing started. Waiting for receiver…',
+      'info'
+    );
     toggleSendButtons();
+    renderResumeUI();
   } catch (err) {
     setStatus('sendStatus', err.message || 'Failed to start send.', 'error');
   }
@@ -479,14 +930,18 @@ async function stopSend() {
 function toggleSendButtons() {
   document.getElementById('startSendBtn').disabled = sendRunning;
   document.getElementById('stopSendBtn').disabled = !sendRunning;
+  renderResumeUI();
 }
 
-async function startReceive() {
+async function startReceive(options = {}) {
   if (receiveRunning) return;
-  const inputValue = document.getElementById('receiveTicket').value.trim();
+  const resumeState = options.resumeState || null;
+  const inputValue = (resumeState?.tokenInput || document.getElementById('receiveTicket').value).trim();
   const parsed = parseTicketInput(inputValue);
   const ticket = parsed.ticket;
   const fallbackTicket = parsed.fallbackTicket || '';
+  const outputPath = (resumeState?.outputPath || document.getElementById('receiveOutput').value).trim();
+  const matchedResume = resumeState || matchingReceiveResume(parsed, outputPath);
   if (parsed.filename) {
     receiveFilenameHint = parsed.filename;
   }
@@ -494,29 +949,69 @@ async function startReceive() {
     receiveExpectedSize = parsed.size;
     progressState.receiveDownloadTotal = parsed.size;
   }
-  const outputPath = document.getElementById('receiveOutput').value.trim();
 
-  if (!ticket || !outputPath) {
-    setStatus('receiveStatus', 'Ticket and output path are required.', 'error');
+  document.getElementById('receiveLog').innerHTML = '';
+  logReceiveParseAttempt(inputValue, outputPath, parsed);
+
+  if (!ticket && !outputPath) {
+    appendReceiveAppLog(
+      'Validation failed: no decodable share token/blob ticket was found and no destination was selected.',
+      true
+    );
+    setStatus('receiveStatus', 'Paste a share token and choose where to save the received file.', 'error');
+    return;
+  }
+  if (!ticket) {
+    appendReceiveAppLog(
+      'Validation failed: no decodable share token or blob ticket was found in the pasted input.',
+      true
+    );
+    setStatus('receiveStatus', 'Share token could not be decoded. Paste the token exactly as sent.', 'error');
+    return;
+  }
+  if (!outputPath) {
+    appendReceiveAppLog('Validation failed: destination path is empty.', true);
+    setStatus('receiveStatus', 'Choose where to save the received file.', 'error');
     return;
   }
   if (!ticketPrefix.test(ticket)) {
+    appendReceiveAppLog('Validation failed: the parsed ticket does not start with the expected blob prefix.', true);
     setStatus('receiveStatus', 'Invalid ticket format. Copy the ticket from the sender.', 'error');
     return;
   }
-
-  document.getElementById('receiveLog').innerHTML = '';
   resetReceiveUI();
+
+  if (matchedResume) {
+    primeReceiveResumeState(matchedResume, { preserveTicketInput: true, preserveOutput: true });
+    appendReceiveAppLog('Matched an interrupted receive for this same token and destination.');
+    setStatus('receiveStatus', 'Resuming previous download…', 'info');
+  }
 
   try {
     const cfg = getConfig();
-    const expectedSize = typeof receiveExpectedSize === 'number' ? receiveExpectedSize : null;
+    const expectedSize =
+      typeof receiveExpectedSize === 'number'
+        ? receiveExpectedSize
+        : typeof matchedResume?.expectedSize === 'number'
+          ? matchedResume.expectedSize
+          : null;
     receiveStopRequested = false;
-    await ipcRenderer.invoke('start-receive', { ...cfg, ticket, fallbackTicket, outputPath, expectedSize });
+    await ipcRenderer.invoke('start-receive', {
+      ...cfg,
+      ticket,
+      fallbackTicket,
+      outputPath,
+      expectedSize,
+      ticketInput: inputValue,
+      resumeLast: Boolean(matchedResume)
+    });
+    appendReceiveAppLog('Receive request accepted. Waiting for the CLI to connect.');
     receiveRunning = true;
-    setStatus('receiveStatus', 'Downloading…', 'info');
+    setStatus('receiveStatus', 'Downloading into temporary transfer data…', 'info');
     toggleReceiveButtons();
+    renderResumeUI();
   } catch (err) {
+    appendReceiveAppLog(`Receive start failed before download began: ${err.message || String(err)}`, true);
     setStatus('receiveStatus', err.message || 'Failed to start download.', 'error');
   }
 }
@@ -535,6 +1030,7 @@ async function stopReceive() {
 function toggleReceiveButtons() {
   document.getElementById('startReceiveBtn').disabled = receiveRunning;
   document.getElementById('stopReceiveBtn').disabled = !receiveRunning;
+  renderResumeUI();
 }
 
 function copyTicket() {
@@ -588,39 +1084,44 @@ function handleEvent(channel, event) {
     switch (event.type) {
       case 'ticket_hashing_start':
         setStatus('sendTicketStatus', 'Creating ticket…', 'info');
-        updateProgress('sendTicketBar', 'sendTicketProgress', 0, progressState.sendTicketTotal);
+        progressState.sendTicketBytes = 0;
+        updateProgress('sendTicketBar', 'sendTicketProgress', progressState.sendTicketBytes, progressState.sendTicketTotal);
         break;
       case 'staging_start':
         setStatus('sendTicketStatus', 'Preparing file…', 'info');
+        progressState.sendTicketBytes = 0;
         progressState.sendTicketTotal = typeof event.total === 'number' ? event.total : null;
-        updateProgress('sendTicketBar', 'sendTicketProgress', 0, progressState.sendTicketTotal);
+        updateProgress('sendTicketBar', 'sendTicketProgress', progressState.sendTicketBytes, progressState.sendTicketTotal);
         break;
       case 'staging_progress':
         if (typeof event.total === 'number') {
           progressState.sendTicketTotal = event.total;
         }
+        progressState.sendTicketBytes = typeof event.bytes === 'number' ? event.bytes : 0;
         updateProgress(
           'sendTicketBar',
           'sendTicketProgress',
-          event.bytes ?? 0,
+          progressState.sendTicketBytes,
           progressState.sendTicketTotal
         );
         break;
       case 'staging_complete':
+        progressState.sendTicketBytes = progressState.sendTicketTotal ?? 0;
         updateProgress(
           'sendTicketBar',
           'sendTicketProgress',
-          progressState.sendTicketTotal ?? 0,
+          progressState.sendTicketBytes,
           progressState.sendTicketTotal
         );
         setStatus('sendTicketStatus', 'File prepared. Hashing…', 'info');
         break;
       case 'staging_skipped':
         progressState.sendTicketTotal = event.total ?? progressState.sendTicketTotal;
+        progressState.sendTicketBytes = progressState.sendTicketTotal ?? 0;
         updateProgress(
           'sendTicketBar',
           'sendTicketProgress',
-          progressState.sendTicketTotal ?? 0,
+          progressState.sendTicketBytes,
           progressState.sendTicketTotal
         );
         setStatus('sendTicketStatus', 'Preparing file…', 'info');
@@ -633,16 +1134,18 @@ function handleEvent(channel, event) {
         if (typeof event.total === 'number') {
           sendFileSize = event.total;
         }
-        updateProgress('sendTicketBar', 'sendTicketProgress', 0, progressState.sendTicketTotal);
+        progressState.sendTicketBytes = 0;
+        updateProgress('sendTicketBar', 'sendTicketProgress', progressState.sendTicketBytes, progressState.sendTicketTotal);
         break;
       case 'ticket_hashing_progress':
         if (typeof event.total === 'number') {
           progressState.sendTicketTotal = event.total;
         }
+        progressState.sendTicketBytes = typeof event.bytes === 'number' ? event.bytes : 0;
         updateProgress(
           'sendTicketBar',
           'sendTicketProgress',
-          event.bytes ?? 0,
+          progressState.sendTicketBytes,
           progressState.sendTicketTotal
         );
         break;
@@ -675,7 +1178,8 @@ function handleEvent(channel, event) {
         if (typeof event.total === 'number') {
           progressState.sendTicketTotal = event.total;
           sendFileSize = event.total;
-          updateProgress('sendTicketBar', 'sendTicketProgress', event.total, event.total);
+          progressState.sendTicketBytes = event.total;
+          updateProgress('sendTicketBar', 'sendTicketProgress', progressState.sendTicketBytes, event.total);
         }
         setStatus('sendTicketStatus', 'Ticket created.', 'success');
         setStatus('sendStatus', 'Waiting for receiver…', 'info');
@@ -697,7 +1201,10 @@ function handleEvent(channel, event) {
         progressState.sendUploadTotal = event.total ?? progressState.sendUploadTotal;
         speedSamples.sendUpload = [];
         sendSpeedBps = null;
-        updateProgress('sendUploadBar', 'sendUploadProgress', 0, progressState.sendUploadTotal);
+        if (typeof progressState.sendUploadBytes !== 'number') {
+          progressState.sendUploadBytes = 0;
+        }
+        updateProgress('sendUploadBar', 'sendUploadProgress', progressState.sendUploadBytes, progressState.sendUploadTotal);
         setStatus('sendStatus', 'Uploading…', 'info');
         break;
       case 'upload_progress':
@@ -705,21 +1212,23 @@ function handleEvent(channel, event) {
           progressState.sendUploadTotal = event.total;
         }
         if (typeof event.bytes === 'number') {
-          const speed = updateRollingSpeed('sendUpload', event.bytes);
+          progressState.sendUploadBytes = event.bytes;
+          const speed = updateRollingSpeed('sendUpload', progressState.sendUploadBytes);
           if (speed !== null) sendSpeedBps = speed;
         }
         updateProgress(
           'sendUploadBar',
           'sendUploadProgress',
-          event.bytes ?? 0,
+          progressState.sendUploadBytes ?? 0,
           progressState.sendUploadTotal
         );
         break;
       case 'upload_complete':
+        progressState.sendUploadBytes = progressState.sendUploadTotal ?? 0;
         updateProgress(
           'sendUploadBar',
           'sendUploadProgress',
-          progressState.sendUploadTotal ?? 0,
+          progressState.sendUploadBytes,
           progressState.sendUploadTotal ?? null
         );
         setStatus('sendReceiverStatus', 'Transfer complete.', 'success');
@@ -755,7 +1264,17 @@ function handleEvent(channel, event) {
         break;
       case 'download_size':
         progressState.receiveDownloadTotal = event.total ?? progressState.receiveDownloadTotal;
-        updateProgress('receiveDownloadBar', 'receiveDownloadProgress', 0, progressState.receiveDownloadTotal);
+        if (typeof progressState.receiveDownloadBytes !== 'number') {
+          progressState.receiveDownloadBytes = 0;
+        }
+        updateProgress('receiveDownloadBar', 'receiveDownloadProgress', progressState.receiveDownloadBytes, progressState.receiveDownloadTotal);
+        break;
+      case 'download_resume_state':
+        if (typeof event.total === 'number') {
+          progressState.receiveDownloadTotal = event.total;
+        }
+        progressState.receiveDownloadBytes = typeof event.bytes === 'number' ? event.bytes : progressState.receiveDownloadBytes;
+        updateProgress('receiveDownloadBar', 'receiveDownloadProgress', progressState.receiveDownloadBytes, progressState.receiveDownloadTotal);
         break;
       case 'download_started':
         if (typeof event.total === 'number') {
@@ -763,8 +1282,11 @@ function handleEvent(channel, event) {
         }
         speedSamples.receiveDownload = [];
         receiveSpeedBps = null;
-        updateProgress('receiveDownloadBar', 'receiveDownloadProgress', 0, progressState.receiveDownloadTotal);
-        setStatus('receiveStatus', 'Downloading…', 'info');
+        if (typeof progressState.receiveDownloadBytes !== 'number') {
+          progressState.receiveDownloadBytes = 0;
+        }
+        updateProgress('receiveDownloadBar', 'receiveDownloadProgress', progressState.receiveDownloadBytes, progressState.receiveDownloadTotal);
+        setStatus('receiveStatus', 'Downloading into temporary transfer data…', 'info');
         break;
       case 'download_retry':
         setStatus('receiveStatus', event.message || 'Retrying download…', 'info');
@@ -774,50 +1296,57 @@ function handleEvent(channel, event) {
           progressState.receiveDownloadTotal = event.total;
         }
         if (typeof event.bytes === 'number') {
-          const speed = updateRollingSpeed('receiveDownload', event.bytes);
+          progressState.receiveDownloadBytes = event.bytes;
+          const speed = updateRollingSpeed('receiveDownload', progressState.receiveDownloadBytes);
           if (speed !== null) receiveSpeedBps = speed;
         }
         updateProgress(
           'receiveDownloadBar',
           'receiveDownloadProgress',
-          event.bytes ?? 0,
+          progressState.receiveDownloadBytes ?? 0,
           progressState.receiveDownloadTotal
         );
         break;
       case 'download_complete':
+        progressState.receiveDownloadBytes = progressState.receiveDownloadTotal ?? 0;
         updateProgress(
           'receiveDownloadBar',
           'receiveDownloadProgress',
-          progressState.receiveDownloadTotal ?? 0,
+          progressState.receiveDownloadBytes,
           progressState.receiveDownloadTotal ?? null
         );
-        setStatus('receiveStatus', 'Download complete. Exporting…', 'info');
+        setStatus('receiveStatus', 'Finalizing into destination file…', 'info');
         break;
       case 'export_started':
         progressState.receiveExportTotal = event.total ?? progressState.receiveExportTotal;
-        updateProgress('receiveExportBar', 'receiveExportProgress', 0, progressState.receiveExportTotal);
-        setStatus('receiveStatus', 'Exporting…', 'info');
+        if (typeof progressState.receiveExportBytes !== 'number') {
+          progressState.receiveExportBytes = 0;
+        }
+        updateProgress('receiveExportBar', 'receiveExportProgress', progressState.receiveExportBytes, progressState.receiveExportTotal);
+        setStatus('receiveStatus', 'Finalizing into destination file…', 'info');
         break;
       case 'export_size':
         progressState.receiveExportTotal = event.total ?? progressState.receiveExportTotal;
-        updateProgress('receiveExportBar', 'receiveExportProgress', 0, progressState.receiveExportTotal);
+        updateProgress('receiveExportBar', 'receiveExportProgress', progressState.receiveExportBytes, progressState.receiveExportTotal);
         break;
       case 'export_progress':
         if (typeof event.total === 'number') {
           progressState.receiveExportTotal = event.total;
         }
+        progressState.receiveExportBytes = typeof event.bytes === 'number' ? event.bytes : progressState.receiveExportBytes;
         updateProgress(
           'receiveExportBar',
           'receiveExportProgress',
-          event.bytes ?? 0,
+          progressState.receiveExportBytes ?? 0,
           progressState.receiveExportTotal
         );
         break;
       case 'export_complete':
+        progressState.receiveExportBytes = progressState.receiveExportTotal ?? 0;
         updateProgress(
           'receiveExportBar',
           'receiveExportProgress',
-          progressState.receiveExportTotal ?? 0,
+          progressState.receiveExportBytes,
           progressState.receiveExportTotal ?? null
         );
         setStatus('receiveStatus', 'Download complete.', 'success');
@@ -848,6 +1377,9 @@ ipcRenderer.on('process-log', (event, { channel, message, isError }) => {
     if (match && match[1]) {
       currentTicket = match[1];
       document.getElementById('ticketValue').textContent = currentTicket;
+      if (typeof progressState.sendTicketTotal === 'number') {
+        progressState.sendTicketBytes = progressState.sendTicketTotal;
+      }
       if (!currentShareToken) {
         {
           const size = sendFileSize ?? progressState.sendTicketTotal;
@@ -884,6 +1416,19 @@ ipcRenderer.on('process-event', (event, { channel, payload }) => {
     const copyRaw = document.getElementById('copyRawBtn');
     if (copyShare) copyShare.disabled = !currentShareToken;
     if (copyRaw) copyRaw.disabled = !currentTicket;
+  }
+});
+
+ipcRenderer.on('resume-state', (event, state) => {
+  setAvailableResumeState(state);
+});
+
+ipcRenderer.on('menu-action', async (event, payload) => {
+  const action = payload?.action;
+  if (action === 'resume-last-send') {
+    await resumeLastSend();
+  } else if (action === 'resume-last-receive') {
+    await resumeLastReceive();
   }
 });
 
@@ -925,7 +1470,10 @@ document.getElementById('receiveTicket').addEventListener('input', (e) => {
   if (typeof size === 'number') {
     receiveExpectedSize = size;
     progressState.receiveDownloadTotal = size;
-    updateProgress('receiveDownloadBar', 'receiveDownloadProgress', 0, size);
+    if (typeof progressState.receiveDownloadBytes !== 'number') {
+      progressState.receiveDownloadBytes = 0;
+    }
+    updateProgress('receiveDownloadBar', 'receiveDownloadProgress', progressState.receiveDownloadBytes, size);
   }
   if (ticket && ticket !== e.target.value) {
     // Preserve original input; just cache parsed ticket.
@@ -950,10 +1498,21 @@ document.querySelectorAll('input[name="sendMode"]').forEach((input) => {
 window.pickFile = pickFile;
 window.pickOutput = pickOutput;
 window.pickStoreDir = pickStoreDir;
-window.openNewWindow = openNewWindow;
+window.setTransferMode = setTransferMode;
 window.startSend = startSend;
 window.stopSend = stopSend;
 window.startReceive = startReceive;
 window.stopReceive = stopReceive;
 window.copyTicket = copyTicket;
 window.copyRawTicket = copyRawTicket;
+window.resumeLastSend = resumeLastSend;
+window.resumeLastReceive = resumeLastReceive;
+window.dismissResumePrompt = dismissResumePrompt;
+
+setTransferMode(transferMode);
+renderResumeUI();
+ipcRenderer.invoke('get-resume-state')
+  .then((state) => setAvailableResumeState(state, { resetPrompt: true }))
+  .catch(() => {
+    renderResumeUI();
+  });

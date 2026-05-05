@@ -56,14 +56,6 @@
       gap: 16px;
     }
 
-    .header-actions {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-    }
-
     h1 {
       font-family: "Space Grotesk", sans-serif;
       font-size: 34px;
@@ -105,11 +97,9 @@
       font-size: 14px;
     }
 
-    .grid {
+    .panel-stack {
       display: grid;
       gap: 20px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      align-items: stretch;
     }
 
     .card {
@@ -124,15 +114,57 @@
       width: 100%;
     }
 
-        .send-card {
+    .send-card {
       contain: layout;
       min-width: 0;
       max-width: 100%;
     }
 
-.card h2 {
+    .card h2 {
       font-family: "Space Grotesk", sans-serif;
       font-size: 20px;
+    }
+
+    .mode-switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: var(--soft);
+      width: fit-content;
+      max-width: 100%;
+      flex-wrap: wrap;
+    }
+
+    .mode-btn {
+      border: none;
+      border-radius: 12px;
+      padding: 10px 18px;
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .mode-btn:hover {
+      background: #e2e8f0;
+      color: var(--ink);
+    }
+
+    .mode-btn-active {
+      color: #fff;
+      background: linear-gradient(90deg, var(--primary), var(--accent));
+      box-shadow: 0 10px 24px rgba(14, 165, 233, 0.18);
+    }
+
+    .mode-btn-active:hover {
+      color: #fff;
+      filter: brightness(0.98);
     }
 
     .row {
@@ -147,6 +179,35 @@
       grid-template-columns: 1fr auto;
       align-items: center;
       min-width: 0;
+    }
+
+    .button-row,
+    .resume-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .resume-surface {
+      display: grid;
+      gap: 10px;
+      padding: 16px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: linear-gradient(135deg, rgba(14, 165, 233, 0.08), rgba(249, 115, 22, 0.08));
+    }
+
+    .resume-title {
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--ink);
+    }
+
+    .resume-summary {
+      font-size: 12px;
+      color: var(--muted);
     }
 
     .choice-group {
@@ -287,6 +348,10 @@
       display: none !important;
     }
 
+    .hidden-panel {
+      display: none !important;
+    }
+
     .log {
       background: #0b1220;
       color: #e2e8f0;
@@ -346,22 +411,26 @@
       gap: 4px;
     }
 
-    @media (max-width: 900px) {
-      .grid { grid-template-columns: 1fr; }
-    }
-
     @media (max-width: 720px) {
       header {
         flex-direction: column;
         align-items: flex-start;
       }
 
-      .header-actions {
+      .mode-switch {
         width: 100%;
-        justify-content: flex-start;
+      }
+
+      .mode-btn {
+        flex: 1 1 0;
       }
 
       .shell { padding: 24px; }
+
+      .button-row > .btn,
+      .resume-actions > .btn {
+        width: 100%;
+      }
     }
   </style>
 </head>
@@ -371,9 +440,6 @@
       <div>
         <h1>OrbitXfer</h1>
         <p class="subtitle">Iroh-powered transfers with BLAKE3 verification.</p>
-      </div>
-      <div class="header-actions">
-        <button class="btn btn-outline" onclick="openNewWindow()">New Window</button>
       </div>
     </header>
 
@@ -385,14 +451,29 @@
       <div>
         <label>Store Directory</label>
         <div class="row-inline">
-          <input id="storeDir" placeholder="Defaults to .orbitxfer-store" />
+          <input id="storeDir" placeholder="Defaults to filename.orbitxfer-pieces" />
           <button class="btn btn-outline" onclick="pickStoreDir()">Browse</button>
         </div>
       </div>
     </section>
 
-    <section class="grid">
-      <div class="card send-card">
+    <section class="mode-switch" aria-label="Transfer mode">
+      <button id="modeSendBtn" class="mode-btn mode-btn-active" type="button" onclick="setTransferMode('send')" aria-pressed="true">Send</button>
+      <button id="modeReceiveBtn" class="mode-btn" type="button" onclick="setTransferMode('receive')" aria-pressed="false">Receive</button>
+    </section>
+
+    <section id="resumePrompt" class="resume-surface hidden" hidden>
+      <div class="resume-title">Resume last transfer?</div>
+      <div id="resumePromptDetails" class="resume-summary">OrbitXfer found an interrupted transfer.</div>
+      <div class="resume-actions">
+        <button id="resumePromptSendBtn" class="btn" type="button" onclick="resumeLastSend()">Resume Send</button>
+        <button id="resumePromptReceiveBtn" class="btn" type="button" onclick="resumeLastReceive()">Resume Receive</button>
+        <button class="btn btn-outline" type="button" onclick="dismissResumePrompt()">Not Now</button>
+      </div>
+    </section>
+
+    <section class="panel-stack">
+      <div id="sendPanel" class="card send-card">
         <h2>Send</h2>
         <div class="row">
           <label>File to send</label>
@@ -401,10 +482,12 @@
             <button class="btn btn-outline" onclick="pickFile()">Choose</button>
           </div>
         </div>
-        <div class="row-inline">
+        <div class="button-row">
           <button id="startSendBtn" class="btn" onclick="startSend()">Start Sharing</button>
           <button id="stopSendBtn" class="btn btn-stop" onclick="stopSend()" disabled>Stop</button>
+          <button id="resumeSendBtn" class="btn btn-outline" type="button" onclick="resumeLastSend()" disabled>Resume Last Transfer</button>
         </div>
+        <div id="sendResumeSummary" class="resume-summary">No interrupted send is available.</div>
         <div class="row">
           <label>Connection mode</label>
           <div class="choice-group">
@@ -417,7 +500,7 @@
               Direct only (no relay)
             </label>
           </div>
-          <div class="hint">Transfers are end-to-end encrypted in both modes. Direct-only disables relay fallback, and is true peer-to-peer with no relay used.</div>
+          <div class="hint">Transfers are end-to-end encrypted in both modes. Direct-only disables relay fallback, and is true peer-to-peer with no relay server used.</div>
         </div>
         <div class="row">
           <label>Ticket creation</label>
@@ -467,7 +550,7 @@
         </div>
       </div>
 
-      <div class="card">
+      <div id="receivePanel" class="card hidden-panel" hidden>
         <h2>Receive</h2>
         <div class="row">
           <label>Ticket</label>
@@ -480,10 +563,12 @@
             <button class="btn btn-outline" onclick="pickOutput()">Choose</button>
           </div>
         </div>
-        <div class="row-inline">
+        <div class="button-row">
           <button id="startReceiveBtn" class="btn" onclick="startReceive()">Start Download</button>
           <button id="stopReceiveBtn" class="btn btn-stop" onclick="stopReceive()" disabled>Stop</button>
+          <button id="resumeReceiveBtn" class="btn btn-outline" type="button" onclick="resumeLastReceive()" disabled>Resume Last Transfer</button>
         </div>
+        <div id="receiveResumeSummary" class="resume-summary">No interrupted receive is available.</div>
         <div class="row">
           <label>Connection</label>
           <div id="receiveConnectStatus" class="status status-info">Idle.</div>
