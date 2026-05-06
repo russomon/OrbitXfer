@@ -158,21 +158,101 @@ button:disabled {
 }
 
 .logs {
-  margin-top: 24px;
+  margin-top: 16px;
   font-size: 0.85rem;
 }
 
 .logs pre {
-  max-height: 300px;
+  max-height: 240px;
   overflow: auto;
   background: rgba(0, 0, 0, 0.04);
   padding: 12px;
   border-radius: 8px;
   font-size: 0.75rem;
+  margin: 8px 0 0;
 }
 
 @media (prefers-color-scheme: dark) {
   .logs pre {
     background: rgba(255, 255, 255, 0.03);
+  }
+}
+
+.panel + .panel {
+  margin-top: 20px;
+}
+
+.field {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.field > span {
+  display: block;
+  font-size: 0.85rem;
+  color: #4b5563;
+  margin-bottom: 4px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .field > span {
+    color: #9ca3af;
+  }
+}
+
+.field textarea {
+  width: 100%;
+  padding: 8px 10px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.8rem;
+  border-radius: 6px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  resize: vertical;
+  background: #fafbfc;
+  box-sizing: border-box;
+}
+
+.field textarea:disabled {
+  opacity: 0.6;
+}
+
+@media (prefers-color-scheme: dark) {
+  .field textarea {
+    background: #15181f;
+    border-color: rgba(255, 255, 255, 0.1);
+    color: inherit;
+  }
+}
+
+.progress-box {
+  margin-top: 12px;
+}
+
+.progress-box progress {
+  width: 100%;
+  height: 10px;
+}
+
+.progress-label {
+  margin: 6px 0 0;
+  font-size: 0.85rem;
+  color: #4b5563;
+}
+
+.progress-phase {
+  color: #4b5563;
+  font-weight: 500;
+}
+
+.progress-pct {
+  color: #6b7280;
+}
+
+@media (prefers-color-scheme: dark) {
+  .progress-label {
+    color: #c0c5cc;
+  }
+  .progress-pct {
+    color: #9ca3af;
   }
 }
