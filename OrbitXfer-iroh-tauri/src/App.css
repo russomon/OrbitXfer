@@ -244,6 +244,29 @@ button:disabled {
   font-weight: 500;
 }
 
+.diagnostic {
+  margin: 6px 0 0;
+  font-size: 0.8rem;
+}
+
+.diagnostic-ok {
+  color: #15803d;
+  font-weight: 500;
+}
+
+.diagnostic-warn {
+  color: #a16207;
+}
+
+@media (prefers-color-scheme: dark) {
+  .diagnostic-ok {
+    color: #4ade80;
+  }
+  .diagnostic-warn {
+    color: #fbbf24;
+  }
+}
+
 .progress-pct {
   color: #6b7280;
 }

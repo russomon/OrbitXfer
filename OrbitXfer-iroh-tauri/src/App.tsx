@@ -37,6 +37,19 @@ function parseOxEvent(line: string): any | null {
   }
 }
 
+// Extract a blob ticket from arbitrary input. Tickets are long base32-style
+// strings starting with "blob". Users often paste surrounding text — the
+// "Fetch this file by running: orbitxfer-iroh-cli receive blob... /path"
+// line the CLI prints, an email quote with extra whitespace, etc. — so we
+// scan for the ticket inside whatever was pasted instead of requiring a
+// pre-trimmed token.
+function extractTicket(input: string): string | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  const match = trimmed.match(/blob[a-z0-9]{60,}/i);
+  return match ? match[0] : null;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const units = ["KB", "MB", "GB", "TB"];
@@ -260,8 +273,21 @@ function App() {
   }
 
   async function startReceive() {
-    const ticket = ticketInput.trim();
-    if (!ticket || !outputPath) return;
+    const ticket = extractTicket(ticketInput);
+    if (!ticket) {
+      setRecvError(
+        "No valid ticket found in the input. Tickets start with 'blob' and are around 250 characters of letters and digits. Paste the ticket (or the full 'orbitxfer-iroh-cli receive …' line) and try again."
+      );
+      setRecvStatus("error");
+      return;
+    }
+    if (!outputPath) {
+      setRecvError(
+        "Pick a destination file first — click 'Pick destination…' and choose where to save the incoming file."
+      );
+      setRecvStatus("error");
+      return;
+    }
     setRecvStatus("connecting");
     setRecvProgress(null);
     setRecvError(null);
@@ -284,6 +310,8 @@ function App() {
   }
 
   // ---------- Render ----------
+
+  const parsedTicket = extractTicket(ticketInput);
 
   const recvPercent =
     recvProgress && recvProgress.total && recvProgress.total > 0
@@ -369,10 +397,24 @@ function App() {
           <textarea
             value={ticketInput}
             onChange={(e) => setTicketInput(e.target.value)}
-            placeholder="Paste the share ticket here…"
+            placeholder="Paste the share ticket here — surrounding text is okay, we'll extract it."
             disabled={recvBusy}
             rows={3}
           />
+          {ticketInput.trim() && (
+            <p className="diagnostic">
+              {parsedTicket ? (
+                <>
+                  <span className="diagnostic-ok">✓ Ticket detected</span>{" "}
+                  ({parsedTicket.length} chars)
+                </>
+              ) : (
+                <span className="diagnostic-warn">
+                  No ticket detected yet — looking for a "blob…" string.
+                </span>
+              )}
+            </p>
+          )}
         </label>
 
         <div className="actions">
@@ -381,7 +423,7 @@ function App() {
           </button>
           <button
             onClick={startReceive}
-            disabled={!ticketInput.trim() || !outputPath || recvBusy}
+            disabled={!parsedTicket || !outputPath || recvBusy}
           >
             Start Receive
           </button>
