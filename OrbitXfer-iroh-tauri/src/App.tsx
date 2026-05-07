@@ -1,9 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { downloadDir } from "@tauri-apps/api/path";
 import "./App.css";
 
+type Mode = "send" | "receive";
 type SendStatus = "idle" | "sending" | "ticket_ready" | "complete" | "error";
 type RecvStatus =
   | "idle"
@@ -37,17 +41,46 @@ function parseOxEvent(line: string): any | null {
   }
 }
 
-// Extract a blob ticket from arbitrary input. Tickets are long base32-style
-// strings starting with "blob". Users often paste surrounding text — the
-// "Fetch this file by running: orbitxfer-iroh-cli receive blob... /path"
-// line the CLI prints, an email quote with extra whitespace, etc. — so we
-// scan for the ticket inside whatever was pasted instead of requiring a
-// pre-trimmed token.
-function extractTicket(input: string): string | null {
+function basename(path: string): string {
+  const parts = path.split(/[/\\]/);
+  return parts[parts.length - 1] ?? "";
+}
+
+interface ParsedReceiveInput {
+  ticket: string;
+  suggestedName: string | null;
+}
+
+// Extract a blob ticket — and, if present, a suggested filename — from
+// arbitrary input. The ticket itself is just a hash + node ID + relay info;
+// the filename does NOT travel inside it. We rely on the CLI's existing
+// "orbitxfer-iroh-cli receive <ticket> <path>" share format to carry the
+// filename alongside the ticket. Anything after the ticket that looks
+// path-like (has a separator) or filename-like (has an extension) becomes
+// the suggested name.
+function parseReceiveInput(input: string): ParsedReceiveInput | null {
   const trimmed = input.trim();
   if (!trimmed) return null;
   const match = trimmed.match(/blob[a-z0-9]{60,}/i);
-  return match ? match[0] : null;
+  if (!match) return null;
+  const ticket = match[0];
+
+  const after = trimmed
+    .slice(match.index! + ticket.length)
+    .trim()
+    .replace(/^['"]|['"]$/g, "");
+
+  let suggestedName: string | null = null;
+  if (after) {
+    const last = basename(after);
+    const hasSeparator = /[/\\]/.test(after);
+    const hasExtension = /\.[\w]{1,10}$/.test(last);
+    if ((hasSeparator || hasExtension) && last && last.length <= 255) {
+      suggestedName = last;
+    }
+  }
+
+  return { ticket, suggestedName };
 }
 
 function formatBytes(bytes: number): string {
@@ -62,7 +95,35 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[i]}`;
 }
 
+async function openNewTransferWindow() {
+  // Each window needs a unique label so per-window state in Rust stays
+  // isolated. Capabilities use the "window-*" pattern, so labels must
+  // start with "window-".
+  const label = `window-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+  const win = new WebviewWindow(label, {
+    url: "index.html",
+    title: "OrbitXfer",
+    width: 900,
+    height: 700,
+  });
+  // Surface creation errors so they don't disappear silently.
+  win.once("tauri://error", (e) => {
+    console.error("New window failed to open:", e);
+  });
+}
+
 function App() {
+  // Per-window mode. Each window picks Send or Receive; the other panel is
+  // hidden so a single window stays focused on one task. Open another window
+  // for the other direction.
+  const [mode, setMode] = useState<Mode>("send");
+
+  // Tracks whether the user has explicitly picked a destination via the save
+  // dialog. We auto-fill the destination from the parsed ticket's filename,
+  // but only if the user hasn't already chosen one — we don't want to clobber
+  // a manual selection just because they edited the ticket textarea.
+  const userPickedDest = useRef(false);
+
   // Send state
   const [filePath, setFilePath] = useState<string | null>(null);
   const [sendStatus, setSendStatus] = useState<SendStatus>("idle");
@@ -78,11 +139,53 @@ function App() {
   const [recvError, setRecvError] = useState<string | null>(null);
   const [recvLogs, setRecvLogs] = useState<string[]>([]);
 
+  const win = useMemo(() => getCurrentWindow(), []);
+
+  // Update the OS window title when mode changes so the user can tell
+  // multiple windows apart in Mission Control / app switcher.
+  useEffect(() => {
+    win.setTitle(`OrbitXfer — ${mode === "send" ? "Send" : "Receive"}`).catch(
+      (err) => console.error("setTitle failed:", err)
+    );
+  }, [mode, win]);
+
+  // When a ticket with a filename is pasted and the user hasn't already
+  // picked a destination, auto-fill ~/Downloads/<filename>. This means the
+  // received file keeps its original name and extension without the user
+  // having to click Pick destination at all. They can still override.
+  useEffect(() => {
+    if (userPickedDest.current) return;
+    const parsed = parseReceiveInput(ticketInput);
+    if (!parsed?.suggestedName) {
+      // Ticket without filename info; clear any previously auto-filled path.
+      if (outputPath !== null) setOutputPath(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const dir = await downloadDir();
+        const sep = dir.endsWith("/") ? "" : "/";
+        if (!cancelled) setOutputPath(`${dir}${sep}${parsed.suggestedName}`);
+      } catch {
+        if (!cancelled) setOutputPath(parsed.suggestedName);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ticketInput]);
+
+  // All event listeners use the *current window's* listen() so events
+  // emitted via app.emit_to(window_label, ...) only reach the window that
+  // initiated the corresponding command. Without this, two open windows
+  // would both react to a single window's CLI events.
   useEffect(() => {
     const unlisteners: Promise<UnlistenFn>[] = [];
 
     unlisteners.push(
-      listen<string>("send:stdout", (e) => {
+      win.listen<string>("send:stdout", (e) => {
         const line = e.payload;
         setSendLogs((prev) => [...prev, line]);
 
@@ -106,19 +209,30 @@ function App() {
     );
 
     unlisteners.push(
-      listen<string>("send:stderr", (e) => {
+      win.listen<string>("send:stderr", (e) => {
         setSendLogs((prev) => [...prev, "[stderr] " + e.payload]);
       })
     );
 
     unlisteners.push(
-      listen<number | null>("send:exit", (e) => {
+      win.listen<number | null>("send:exit", (e) => {
         setSendLogs((prev) => [...prev, `[exit] code=${e.payload}`]);
+        // If the sidecar exited before producing a ticket, surface it as an
+        // error so the UI doesn't sit stuck on "sending".
+        setSendStatus((curr) =>
+          curr === "sending" ? "error" : curr
+        );
+        setSendError((prev) =>
+          prev ??
+          (e.payload !== 0
+            ? `Send process exited with code ${e.payload} before producing a ticket.`
+            : null)
+        );
       })
     );
 
     unlisteners.push(
-      listen<string>("recv:stdout", (e) => {
+      win.listen<string>("recv:stdout", (e) => {
         const line = e.payload;
         setRecvLogs((prev) => [...prev, line]);
 
@@ -206,21 +320,34 @@ function App() {
     );
 
     unlisteners.push(
-      listen<string>("recv:stderr", (e) => {
+      win.listen<string>("recv:stderr", (e) => {
         setRecvLogs((prev) => [...prev, "[stderr] " + e.payload]);
       })
     );
 
     unlisteners.push(
-      listen<number | null>("recv:exit", (e) => {
+      win.listen<number | null>("recv:exit", (e) => {
         setRecvLogs((prev) => [...prev, `[exit] code=${e.payload}`]);
+        // If the receive sidecar exited mid-flight, mark it as an error
+        // instead of leaving the UI stuck on "connecting"/"downloading".
+        setRecvStatus((curr) =>
+          curr === "connecting" || curr === "downloading" || curr === "exporting"
+            ? "error"
+            : curr
+        );
+        setRecvError((prev) =>
+          prev ??
+          (e.payload !== 0
+            ? `Receive process exited with code ${e.payload}.`
+            : null)
+        );
       })
     );
 
     return () => {
       unlisteners.forEach((p) => p.then((fn) => fn()));
     };
-  }, []);
+  }, [win]);
 
   // ---------- Send actions ----------
 
@@ -259,12 +386,30 @@ function App() {
 
   // ---------- Receive actions ----------
 
+  async function suggestedAbsolutePath(name: string): Promise<string> {
+    // Tauri's save dialog wants an absolute path for defaultPath; a bare
+    // filename quietly falls back to "Untitled" on macOS. Anchor at
+    // ~/Downloads (which is what the user expects for received files anyway).
+    try {
+      const dir = await downloadDir();
+      const sep = dir.endsWith("/") ? "" : "/";
+      return `${dir}${sep}${name}`;
+    } catch {
+      return name;
+    }
+  }
+
   async function pickDestination() {
+    const parsed = parseReceiveInput(ticketInput);
+    const defaultPath = parsed?.suggestedName
+      ? await suggestedAbsolutePath(parsed.suggestedName)
+      : undefined;
     const result = await save({
       title: "Save received file as…",
-      defaultPath: undefined,
+      defaultPath,
     });
     if (typeof result === "string") {
+      userPickedDest.current = true;
       setOutputPath(result);
       setRecvError(null);
       setRecvProgress(null);
@@ -273,7 +418,8 @@ function App() {
   }
 
   async function startReceive() {
-    const ticket = extractTicket(ticketInput);
+    const parsed = parseReceiveInput(ticketInput);
+    const ticket = parsed?.ticket ?? null;
     if (!ticket) {
       setRecvError(
         "No valid ticket found in the input. Tickets start with 'blob' and are around 250 characters of letters and digits. Paste the ticket (or the full 'orbitxfer-iroh-cli receive …' line) and try again."
@@ -311,7 +457,9 @@ function App() {
 
   // ---------- Render ----------
 
-  const parsedTicket = extractTicket(ticketInput);
+  const parsedReceive = parseReceiveInput(ticketInput);
+  const parsedTicket = parsedReceive?.ticket ?? null;
+  const suggestedName = parsedReceive?.suggestedName ?? null;
 
   const recvPercent =
     recvProgress && recvProgress.total && recvProgress.total > 0
@@ -323,159 +471,213 @@ function App() {
     recvStatus === "downloading" ||
     recvStatus === "exporting";
 
+  const sendBusy = sendStatus === "sending";
+
   return (
     <main className="container">
-      <header>
-        <h1>OrbitXfer</h1>
-        <p className="subtitle">Tauri migration — Phase 2</p>
+      <header className="app-header">
+        <div>
+          <h1>OrbitXfer</h1>
+          <p className="subtitle">Tauri migration — Phase 3b</p>
+        </div>
+        <button className="ghost-button" onClick={openNewTransferWindow}>
+          + New Window
+        </button>
       </header>
 
-      <section className="panel">
-        <h2>Send a file</h2>
-        <div className="actions">
-          <button onClick={pickFile} disabled={sendStatus === "sending"}>
-            Pick file…
-          </button>
-          <button
-            onClick={startSend}
-            disabled={!filePath || sendStatus === "sending"}
-          >
-            Start Send
-          </button>
-          <button
-            onClick={stopSend}
-            disabled={
-              sendStatus !== "sending" && sendStatus !== "ticket_ready"
-            }
-          >
-            Stop
-          </button>
-        </div>
+      <div className="mode-switch" role="tablist" aria-label="Window mode">
+        <button
+          role="tab"
+          aria-selected={mode === "send"}
+          className={mode === "send" ? "active" : ""}
+          onClick={() => setMode("send")}
+          disabled={sendBusy || recvBusy}
+        >
+          Send
+        </button>
+        <button
+          role="tab"
+          aria-selected={mode === "receive"}
+          className={mode === "receive" ? "active" : ""}
+          onClick={() => setMode("receive")}
+          disabled={sendBusy || recvBusy}
+        >
+          Receive
+        </button>
+      </div>
 
-        {filePath && <p className="filepath">{filePath}</p>}
-
-        <p className="status">
-          Status: <code>{sendStatus}</code>
-        </p>
-
-        {sendError && <p className="error">{sendError}</p>}
-
-        {tickets && (
-          <div className="ticket-box">
-            <h3>Share this ticket</h3>
-            <textarea
-              readOnly
-              value={tickets.full}
-              onClick={(e) => (e.target as HTMLTextAreaElement).select()}
-            />
-            {tickets.direct && (
-              <details>
-                <summary>direct ticket</summary>
-                <textarea readOnly value={tickets.direct} />
-              </details>
-            )}
-            {tickets.relay && (
-              <details>
-                <summary>relay ticket</summary>
-                <textarea readOnly value={tickets.relay} />
-              </details>
-            )}
+      {mode === "send" && (
+        <section className="panel">
+          <h2>Send a file</h2>
+          <div className="actions">
+            <button onClick={pickFile} disabled={sendBusy}>
+              Pick file…
+            </button>
+            <button
+              onClick={startSend}
+              disabled={!filePath || sendBusy}
+            >
+              Start Send
+            </button>
+            <button
+              onClick={stopSend}
+              disabled={
+                sendStatus !== "sending" && sendStatus !== "ticket_ready"
+              }
+            >
+              Stop
+            </button>
           </div>
-        )}
 
-        <details className="logs">
-          <summary>Send logs ({sendLogs.length})</summary>
-          <pre>{sendLogs.join("\n")}</pre>
-        </details>
-      </section>
+          {filePath && <p className="filepath">{filePath}</p>}
 
-      <section className="panel">
-        <h2>Receive a file</h2>
+          <p className="status">
+            Status: <code>{sendStatus}</code>
+          </p>
 
-        <label className="field">
-          <span>Ticket</span>
-          <textarea
-            value={ticketInput}
-            onChange={(e) => setTicketInput(e.target.value)}
-            placeholder="Paste the share ticket here — surrounding text is okay, we'll extract it."
-            disabled={recvBusy}
-            rows={3}
-          />
-          {ticketInput.trim() && (
-            <p className="diagnostic">
-              {parsedTicket ? (
-                <>
-                  <span className="diagnostic-ok">✓ Ticket detected</span>{" "}
-                  ({parsedTicket.length} chars)
-                </>
-              ) : (
-                <span className="diagnostic-warn">
-                  No ticket detected yet — looking for a "blob…" string.
-                </span>
-              )}
-            </p>
-          )}
-        </label>
+          {sendError && <p className="error">{sendError}</p>}
 
-        <div className="actions">
-          <button onClick={pickDestination} disabled={recvBusy}>
-            Pick destination…
-          </button>
-          <button
-            onClick={startReceive}
-            disabled={!parsedTicket || !outputPath || recvBusy}
-          >
-            Start Receive
-          </button>
-          <button onClick={stopReceive} disabled={!recvBusy}>
-            Stop
-          </button>
-        </div>
-
-        {outputPath && <p className="filepath">{outputPath}</p>}
-
-        <p className="status">
-          Status: <code>{recvStatus}</code>
-        </p>
-
-        {recvError && <p className="error">{recvError}</p>}
-
-        {recvProgress && (
-          <div className="progress-box">
-            {recvProgress.total ? (
-              <progress
-                value={recvProgress.bytes}
-                max={recvProgress.total}
+          {tickets && (
+            <div className="ticket-box">
+              <h3>Share this with the recipient</h3>
+              <p className="hint">
+                The line below carries the ticket and the filename, so the
+                receiving side can suggest a save name. If the recipient pastes
+                it into OrbitXfer's Receive panel, the filename comes through.
+              </p>
+              <textarea
+                readOnly
+                value={
+                  filePath
+                    ? `orbitxfer-iroh-cli receive ${tickets.full} ${basename(filePath)}`
+                    : tickets.full
+                }
+                onClick={(e) => (e.target as HTMLTextAreaElement).select()}
+                rows={3}
               />
-            ) : (
-              // Indeterminate: total unknown until export_size arrives.
-              <progress />
-            )}
-            <p className="progress-label">
-              <span className="progress-phase">
-                {recvProgress.phase === "export"
-                  ? "Writing to disk: "
-                  : "Downloading: "}
-              </span>
-              {formatBytes(recvProgress.bytes)}
-              {recvProgress.total !== null && (
-                <> / {formatBytes(recvProgress.total)}</>
+              <details>
+                <summary>just the bare ticket (no filename)</summary>
+                <textarea readOnly value={tickets.full} rows={3} />
+              </details>
+              {tickets.direct && (
+                <details>
+                  <summary>direct ticket</summary>
+                  <textarea readOnly value={tickets.direct} />
+                </details>
               )}
-              {recvPercent !== null && (
-                <span className="progress-pct">
-                  {" "}
-                  ({recvPercent.toFixed(1)}%)
-                </span>
+              {tickets.relay && (
+                <details>
+                  <summary>relay ticket</summary>
+                  <textarea readOnly value={tickets.relay} />
+                </details>
               )}
-            </p>
-          </div>
-        )}
+            </div>
+          )}
 
-        <details className="logs">
-          <summary>Receive logs ({recvLogs.length})</summary>
-          <pre>{recvLogs.join("\n")}</pre>
-        </details>
-      </section>
+          <details className="logs">
+            <summary>Send logs ({sendLogs.length})</summary>
+            <pre>{sendLogs.join("\n")}</pre>
+          </details>
+        </section>
+      )}
+
+      {mode === "receive" && (
+        <section className="panel">
+          <h2>Receive a file</h2>
+
+          <label className="field">
+            <span>Ticket</span>
+            <textarea
+              value={ticketInput}
+              onChange={(e) => setTicketInput(e.target.value)}
+              placeholder="Paste the share ticket here — surrounding text is okay, we'll extract it."
+              disabled={recvBusy}
+              rows={3}
+            />
+            {ticketInput.trim() && (
+              <p className="diagnostic">
+                {parsedTicket ? (
+                  <>
+                    <span className="diagnostic-ok">✓ Ticket detected</span>{" "}
+                    ({parsedTicket.length} chars)
+                    {suggestedName && (
+                      <>
+                        {" · "}
+                        <span className="diagnostic-name">
+                          suggested filename: {suggestedName}
+                        </span>
+                      </>
+                    )}
+                  </>
+                ) : (
+                  <span className="diagnostic-warn">
+                    No ticket detected yet — looking for a "blob…" string.
+                  </span>
+                )}
+              </p>
+            )}
+          </label>
+
+          <div className="actions">
+            <button onClick={pickDestination} disabled={recvBusy}>
+              Pick destination…
+            </button>
+            <button
+              onClick={startReceive}
+              disabled={!parsedTicket || !outputPath || recvBusy}
+            >
+              Start Receive
+            </button>
+            <button onClick={stopReceive} disabled={!recvBusy}>
+              Stop
+            </button>
+          </div>
+
+          {outputPath && <p className="filepath">{outputPath}</p>}
+
+          <p className="status">
+            Status: <code>{recvStatus}</code>
+          </p>
+
+          {recvError && <p className="error">{recvError}</p>}
+
+          {recvProgress && (
+            <div className="progress-box">
+              {recvProgress.total ? (
+                <progress
+                  value={recvProgress.bytes}
+                  max={recvProgress.total}
+                />
+              ) : (
+                // Indeterminate: total unknown until export_size arrives.
+                <progress />
+              )}
+              <p className="progress-label">
+                <span className="progress-phase">
+                  {recvProgress.phase === "export"
+                    ? "Writing to disk: "
+                    : "Downloading: "}
+                </span>
+                {formatBytes(recvProgress.bytes)}
+                {recvProgress.total !== null && (
+                  <> / {formatBytes(recvProgress.total)}</>
+                )}
+                {recvPercent !== null && (
+                  <span className="progress-pct">
+                    {" "}
+                    ({recvPercent.toFixed(1)}%)
+                  </span>
+                )}
+              </p>
+            </div>
+          )}
+
+          <details className="logs">
+            <summary>Receive logs ({recvLogs.length})</summary>
+            <pre>{recvLogs.join("\n")}</pre>
+          </details>
+        </section>
+      )}
     </main>
   );
 }
