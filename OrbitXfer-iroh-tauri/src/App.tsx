@@ -46,6 +46,40 @@ function basename(path: string): string {
   return parts[parts.length - 1] ?? "";
 }
 
+// localStorage-based persistence of the most recent send / receive. Shared
+// across all windows in the app (same origin), so opening a new window
+// surfaces the same Resume buttons.
+const LS_LAST_SEND = "orbitxfer.lastSend.v1";
+const LS_LAST_RECV = "orbitxfer.lastReceive.v1";
+
+interface LastSend {
+  filePath: string;
+  savedAt: number;
+}
+
+interface LastReceive {
+  ticketInput: string;
+  outputPath: string;
+  savedAt: number;
+}
+
+function loadJson<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveJson<T>(key: string, value: T) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (e) {
+    console.error(`save ${key} failed:`, e);
+  }
+}
+
 interface ParsedReceiveInput {
   ticket: string;
   suggestedName: string | null;
@@ -124,6 +158,16 @@ function App() {
   // a manual selection just because they edited the ticket textarea.
   const userPickedDest = useRef(false);
 
+  // Persisted "last send" / "last receive" so the user can resume an
+  // interrupted transfer (or just redo their last one) after a window close,
+  // app quit, or crash.
+  const [lastSend, setLastSend] = useState<LastSend | null>(() =>
+    loadJson<LastSend>(LS_LAST_SEND)
+  );
+  const [lastRecv, setLastRecv] = useState<LastReceive | null>(() =>
+    loadJson<LastReceive>(LS_LAST_RECV)
+  );
+
   // Send state
   const [filePath, setFilePath] = useState<string | null>(null);
   const [sendStatus, setSendStatus] = useState<SendStatus>("idle");
@@ -148,6 +192,18 @@ function App() {
       (err) => console.error("setTitle failed:", err)
     );
   }, [mode, win]);
+
+  // Cross-window sync: when ANOTHER window persists a new last send / last
+  // receive, this window's Resume buttons should reflect it without a reload.
+  useEffect(() => {
+    function onStorage(e: StorageEvent) {
+      if (e.key === LS_LAST_SEND) setLastSend(loadJson<LastSend>(LS_LAST_SEND));
+      else if (e.key === LS_LAST_RECV)
+        setLastRecv(loadJson<LastReceive>(LS_LAST_RECV));
+    }
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   // When a ticket with a filename is pasted and the user hasn't already
   // picked a destination, auto-fill ~/Downloads/<filename>. This means the
@@ -361,18 +417,33 @@ function App() {
     }
   }
 
-  async function startSend() {
-    if (!filePath) return;
+  async function startSendWith(targetPath: string) {
     setSendStatus("sending");
     setTickets(null);
     setSendError(null);
     setSendLogs([]);
     try {
-      await invoke("start_send", { filePath });
+      await invoke("start_send", { filePath: targetPath });
+      // Persist the path on successful spawn — even if the transfer is later
+      // interrupted, the user can resume with one click.
+      const entry: LastSend = { filePath: targetPath, savedAt: Date.now() };
+      saveJson(LS_LAST_SEND, entry);
+      setLastSend(entry);
     } catch (err) {
       setSendError(String(err));
       setSendStatus("error");
     }
+  }
+
+  async function startSend() {
+    if (!filePath) return;
+    await startSendWith(filePath);
+  }
+
+  async function resumeLastSend() {
+    if (!lastSend) return;
+    setFilePath(lastSend.filePath);
+    await startSendWith(lastSend.filePath);
   }
 
   async function stopSend() {
@@ -417,8 +488,8 @@ function App() {
     }
   }
 
-  async function startReceive() {
-    const parsed = parseReceiveInput(ticketInput);
+  async function startReceiveWith(rawInput: string, dest: string) {
+    const parsed = parseReceiveInput(rawInput);
     const ticket = parsed?.ticket ?? null;
     if (!ticket) {
       setRecvError(
@@ -427,7 +498,7 @@ function App() {
       setRecvStatus("error");
       return;
     }
-    if (!outputPath) {
+    if (!dest) {
       setRecvError(
         "Pick a destination file first — click 'Pick destination…' and choose where to save the incoming file."
       );
@@ -439,11 +510,31 @@ function App() {
     setRecvError(null);
     setRecvLogs([]);
     try {
-      await invoke("start_receive", { ticket, outputPath });
+      await invoke("start_receive", { ticket, outputPath: dest });
+      const entry: LastReceive = {
+        ticketInput: rawInput,
+        outputPath: dest,
+        savedAt: Date.now(),
+      };
+      saveJson(LS_LAST_RECV, entry);
+      setLastRecv(entry);
     } catch (err) {
       setRecvError(String(err));
       setRecvStatus("error");
     }
+  }
+
+  async function startReceive() {
+    await startReceiveWith(ticketInput, outputPath ?? "");
+  }
+
+  async function resumeLastReceive() {
+    if (!lastRecv) return;
+    setTicketInput(lastRecv.ticketInput);
+    setOutputPath(lastRecv.outputPath);
+    // Suppress the auto-fill effect from clobbering the resumed destination.
+    userPickedDest.current = true;
+    await startReceiveWith(lastRecv.ticketInput, lastRecv.outputPath);
   }
 
   async function stopReceive() {
@@ -478,7 +569,7 @@ function App() {
       <header className="app-header">
         <div>
           <h1>OrbitXfer</h1>
-          <p className="subtitle">Tauri migration — Phase 3b</p>
+          <p className="subtitle">Tauri migration — Phase 3c</p>
         </div>
         <button className="ghost-button" onClick={openNewTransferWindow}>
           + New Window
@@ -509,6 +600,16 @@ function App() {
       {mode === "send" && (
         <section className="panel">
           <h2>Send a file</h2>
+          {lastSend && !sendBusy && (
+            <button
+              className="resume-button"
+              onClick={resumeLastSend}
+              title={lastSend.filePath}
+            >
+              ↻ Resume last send:{" "}
+              <code>{basename(lastSend.filePath)}</code>
+            </button>
+          )}
           <div className="actions">
             <button onClick={pickFile} disabled={sendBusy}>
               Pick file…
@@ -584,6 +685,16 @@ function App() {
       {mode === "receive" && (
         <section className="panel">
           <h2>Receive a file</h2>
+          {lastRecv && !recvBusy && (
+            <button
+              className="resume-button"
+              onClick={resumeLastReceive}
+              title={`${lastRecv.outputPath}`}
+            >
+              ↻ Resume last receive:{" "}
+              <code>{basename(lastRecv.outputPath)}</code>
+            </button>
+          )}
 
           <label className="field">
             <span>Ticket</span>
