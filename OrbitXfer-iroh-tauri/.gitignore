@@ -13,6 +13,9 @@ dist-ssr
 .vite
 *.local
 
+# Local signing/notarization secrets — only the .example template is tracked.
+tauri.env
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -12,7 +12,9 @@
     "sync:cli": "node ./scripts/sync-cli.js",
     "build:cli:release": "cd ../OrbitXfer-iroh-cli && cargo build --release",
     "build:cli:debug": "cd ../OrbitXfer-iroh-cli && cargo build",
-    "prepare:bundle": "npm run build:cli:release && npm run sync:cli && npm run build"
+    "prepare:bundle": "npm run build:cli:release && npm run sync:cli && npm run build",
+    "build:mac:signed": "bash ./scripts/build-mac-signed.sh",
+    "verify:mac:release": "bash ./scripts/verify-macos-release.sh"
   },
   "dependencies": {
     "react": "^19.1.0",

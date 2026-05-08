@@ -6,42 +6,57 @@ The Electron version remains the shipping app on `main`. This Tauri version is b
 
 ## Setup
 
-The Tauri app spawns the Rust CLI as a Tauri sidecar. Before running, place the CLI binary at:
-
-```
-src-tauri/binaries/orbitxfer-iroh-cli-<host-target-triple>
-```
-
-Find your host triple with `rustc -vV | grep host` (e.g. `aarch64-apple-darwin`).
-
-Quickest setup on macOS (uses the binary already shipped with the Electron app):
+The Tauri app spawns the Rust CLI as a Tauri sidecar. Build the CLI first, then sync it into the bundler's expected slot:
 
 ```sh
-cp ../OrbitXfer-iroh-gui/bin/orbitxfer-iroh-cli \
-   src-tauri/binaries/orbitxfer-iroh-cli-$(rustc -vV | awk '/host:/ {print $2}')
-chmod +x src-tauri/binaries/orbitxfer-iroh-cli-*
+npm install
+npm run build:cli:release   # cargo build --release in ../OrbitXfer-iroh-cli
+npm run sync:cli             # copies into src-tauri/binaries/orbitxfer-iroh-cli-<triple>
 ```
 
-A proper sync script (matching `OrbitXfer-iroh-gui/scripts/sync-cli.js`) is planned for Phase 4 of the migration.
+`npm run prepare:bundle` does all three plus the frontend build in one shot.
 
 ## Run in dev
 
 ```sh
-npm install
 npm run tauri dev
 ```
 
-## Build
+`beforeDevCommand` automatically runs `sync:cli` first, so as long as the CLI release binary exists, the sidecar is in place when the dev binary launches.
+
+## Build (unsigned)
 
 ```sh
 npm run tauri build
 ```
 
-Bundler config, signing, and CI integration land in Phase 4.
+Produces `src-tauri/target/release/bundle/macos/OrbitXfer.app` and `bundle/dmg/OrbitXfer_<version>_<arch>.dmg`. Without signing env vars set, the bundle is ad-hoc-signed only — fine for local testing, will trigger Gatekeeper warnings on other machines.
+
+## Build (signed + notarized macOS)
+
+One-time setup:
+
+```sh
+cp tauri.env.example tauri.env
+# fill in tauri.env with your real Developer ID identity, App Store
+# Connect API key path/ID/issuer. tauri.env is gitignored.
+```
+
+Then for each build:
+
+```sh
+npm run build:mac:signed       # sources tauri.env, runs tauri build
+npm run verify:mac:release     # codesign + spctl + stapler checks
+```
+
+`tauri.env` uses the same `APPLE_API_*` env var names as electron-builder, so existing CI secrets carry over with no rename. See `tauri.env.example` for the full list.
 
 ## Migration phase status
 
 - [x] **Phase 1** — Scaffold, sidecar wiring, send flow (file picker → ticket).
-- [ ] Phase 2 — Receive flow with progress events.
-- [ ] Phase 3 — Multi-window, per-window mode switch, resumable transfers, lenient parser, quit warnings.
-- [ ] Phase 4 — Bundler config, macOS signing/notarization, CI workflow, retire Electron app.
+- [x] **Phase 2** — Receive flow with progress + export tracking.
+- [x] **Phase 3a/b/c** — Lenient parser, multi-window, per-window mode switch, resumable transfers, quit warnings, per-window store isolation.
+- [x] **Phase 4a** — Bundler config + sidecar sync script + verified unsigned macOS build.
+- [x] **Phase 4b** — macOS Developer ID signing + notarization config (entitlements, tauri.env, verify script).
+- [ ] Phase 4c — CI workflow port.
+- [ ] Phase 4d — Retire Electron app.
