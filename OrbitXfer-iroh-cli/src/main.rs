@@ -21,7 +21,7 @@ use serde_json::json;
 use getrandom::getrandom;
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::sync::{
@@ -30,7 +30,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.56";
+const CLI_VERSION: &str = "0.1.57";
 
 fn print_usage() {
     eprintln!("Usage:");
@@ -203,8 +203,55 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Watch stdin for EOF (or read error) on a background thread and exit
+/// the process if it arrives.
+///
+/// Why: when this CLI is spawned as a child by Electron, Tauri, or any
+/// other parent that pipes stdin, the parent dying breaks the pipe. Our
+/// send/receive commands don't read stdin themselves, so we never notice
+/// — the process keeps running, holds an exclusive flock on
+/// FsStore::blobs.db, and every subsequent CLI run hangs at
+/// ticket_hashing_start until the orphan is killed manually.
+///
+/// Watching stdin is the cleanest cross-platform parent-death signal:
+/// - Pipe parents (Electron/Tauri): pipe closes on parent exit → read 0.
+/// - Terminal parents: closing the terminal severs the controlling tty
+///   → read returns error or 0.
+/// - Interactive use: read blocks waiting for input, never triggers exit
+///   unless user explicitly closes stdin (Ctrl+D or terminal close).
+fn watch_parent_via_stdin() {
+    std::thread::spawn(|| {
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        let mut buf = [0u8; 1024];
+        loop {
+            match handle.read(&mut buf) {
+                Ok(0) => {
+                    eprintln!(
+                        "[orbitxfer-iroh-cli] stdin closed (parent or terminal gone); exiting."
+                    );
+                    std::process::exit(0);
+                }
+                Ok(_) => {
+                    // CLI doesn't use stdin for input — discard and keep
+                    // watching for the eventual close.
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[orbitxfer-iroh-cli] stdin read failed; exiting."
+                    );
+                    std::process::exit(0);
+                }
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    watch_parent_via_stdin();
+
     let mut args = env::args().skip(1);
     let cmd = args.next().unwrap_or_default();
 
