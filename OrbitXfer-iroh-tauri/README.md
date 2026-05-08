@@ -1,20 +1,15 @@
-# OrbitXfer — Tauri GUI (in-progress migration)
+# OrbitXfer GUI
 
-This is the Tauri 2 + React + TypeScript replacement for the Electron GUI in `../OrbitXfer-iroh-gui/`.
-
-The Electron version remains the shipping app on `main`. This Tauri version is being built up phase-by-phase on the `tauri-migration` branch. See `RELEASES.md` (repo root) for status.
+Tauri 2 + React + TypeScript desktop app. Spawns the Rust CLI (`../OrbitXfer-iroh-cli/`) as a Tauri sidecar.
 
 ## Setup
 
-The Tauri app spawns the Rust CLI as a Tauri sidecar. Build the CLI first, then sync it into the bundler's expected slot:
-
 ```sh
 npm install
-npm run build:cli:release   # cargo build --release in ../OrbitXfer-iroh-cli
-npm run sync:cli             # copies into src-tauri/binaries/orbitxfer-iroh-cli-<triple>
+npm run prepare:bundle   # build CLI release + sync sidecar + frontend build
 ```
 
-`npm run prepare:bundle` does all three plus the frontend build in one shot.
+`prepare:bundle` is a one-shot for fresh clones. After that, the `beforeDevCommand` and `beforeBuildCommand` chains will keep the sidecar slot in sync automatically — you only need to re-run `npm run build:cli:release` if the CLI source changed.
 
 ## Run in dev
 
@@ -22,41 +17,42 @@ npm run sync:cli             # copies into src-tauri/binaries/orbitxfer-iroh-cli
 npm run tauri dev
 ```
 
-`beforeDevCommand` automatically runs `sync:cli` first, so as long as the CLI release binary exists, the sidecar is in place when the dev binary launches.
-
 ## Build (unsigned)
 
 ```sh
 npm run tauri build
 ```
 
-Produces `src-tauri/target/release/bundle/macos/OrbitXfer.app` and `bundle/dmg/OrbitXfer_<version>_<arch>.dmg`. Without signing env vars set, the bundle is ad-hoc-signed only — fine for local testing, will trigger Gatekeeper warnings on other machines.
+Outputs:
+
+- `src-tauri/target/release/bundle/macos/OrbitXfer.app`
+- `src-tauri/target/release/bundle/dmg/OrbitXfer_<version>_<arch>.dmg`
+- (or NSIS `.exe` / AppImage / `.deb` depending on the host)
+
+Without signing env vars set, the macOS bundle is ad-hoc-signed only. That works for local testing but Gatekeeper will block it on other Macs.
 
 ## Build (signed + notarized macOS)
 
-One-time setup:
+One-time:
 
 ```sh
 cp tauri.env.example tauri.env
-# fill in tauri.env with your real Developer ID identity, App Store
-# Connect API key path/ID/issuer. tauri.env is gitignored.
+# fill in tauri.env with your Developer ID identity, App Store Connect API key
+# path/ID/issuer. tauri.env is gitignored.
 ```
 
-Then for each build:
+Per build:
 
 ```sh
 npm run build:mac:signed       # sources tauri.env, runs tauri build
 npm run verify:mac:release     # codesign + spctl + stapler checks
 ```
 
-`tauri.env` uses the same `APPLE_API_*` env var names as electron-builder, so existing CI secrets carry over with no rename. See `tauri.env.example` for the full list.
+`tauri.env` uses the same `APPLE_API_*` env var names as electron-builder, so existing CI secrets carry over with no rename. CI maps `CSC_LINK / CSC_KEY_PASSWORD` to Tauri's `APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD` automatically.
 
-## Migration phase status
+## Architecture quick reference
 
-- [x] **Phase 1** — Scaffold, sidecar wiring, send flow (file picker → ticket).
-- [x] **Phase 2** — Receive flow with progress + export tracking.
-- [x] **Phase 3a/b/c** — Lenient parser, multi-window, per-window mode switch, resumable transfers, quit warnings, per-window store isolation.
-- [x] **Phase 4a** — Bundler config + sidecar sync script + verified unsigned macOS build.
-- [x] **Phase 4b** — macOS Developer ID signing + notarization config (entitlements, tauri.env, verify script).
-- [ ] Phase 4c — CI workflow port.
-- [ ] Phase 4d — Retire Electron app.
+- **Sidecar isolation**: each window's CLI process gets its own `<app-data>/store-<window-label>/` so concurrent transfers don't fight over `~/.orbitxfer-store`. Stale store dirs from previous app sessions are wiped at startup.
+- **Quit warnings**: Cmd-W handled via `WindowEvent::CloseRequested`; Cmd-Q handled via a custom Quit menu item (default Tauri Cmd-Q bypasses cancellable events on macOS, so we own the menu).
+- **Filename preservation**: tickets carry hash + node ID + relay info but NOT the original filename. Senders display a `orbitxfer-iroh-cli receive <ticket> <basename>` share line that the receiver's lenient parser extracts the filename from. The receive panel auto-fills `~/Downloads/<filename>` so Start Receive Just Works without picking a destination.
+- **Resumable transfers**: most-recent send (filePath) and receive (ticketInput, outputPath) persist to `localStorage`, surfaced as "↻ Resume last X" buttons that pre-fill state and auto-start.
