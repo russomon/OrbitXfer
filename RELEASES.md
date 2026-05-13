@@ -2,6 +2,8 @@
 
 ## v0.1.59 - 2026-05-13
 - CI macOS notarization fix: `.github/workflows/build.yml` was setting `APPLE_API_KEY` to the .p8 file path (electron-builder convention), but Tauri's bundler uses that env var for the 10-char Key ID and expects the path in `APPLE_API_KEY_PATH`. The workflow now maps the existing repo secrets to Tauri's expected names. Signing already worked in CI; notarization was silently skipping, which made `verify:mac:release` fail at the stapler check.
+- CI Windows fix: the "Verify RELEASES.md" step lacked `shell: bash`, so Windows runners (which default to PowerShell) died on bash variable assignment syntax. Now explicitly bash on that step.
+- CI macOS signing prep is gated on tag pushes only (`startsWith(github.ref, 'refs/tags/v')`). Regular pushes and PRs skip the Apple notary round-trip and produce ad-hoc-signed builds in ~2 minutes; only tagged releases pay the notarization wait.
 - No app or CLI behavior changes vs v0.1.58. First fully CI-built signed + notarized release of the Tauri version.
 
 ## v0.1.58 - 2026-05-13
