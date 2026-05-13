@@ -60,6 +60,7 @@ jobs:
 
       - name: Verify RELEASES.md
         if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
         run: |
           tag="${GITHUB_REF_NAME}"
           grep -q "^## ${tag} " RELEASES.md || (echo "RELEASES.md missing entry for ${tag}" && exit 1)
@@ -77,7 +78,10 @@ jobs:
         run: npm run sync:cli
 
       - name: Prepare macOS signing inputs
-        if: runner.os == 'macOS'
+        # Only on tag pushes: signed+notarized builds are for releases.
+        # Regular pushes/PRs use ad-hoc signing — no Apple notary round
+        # trip, CI stays fast.
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
           CSC_LINK_SECRET: ${{ secrets.CSC_LINK }}
