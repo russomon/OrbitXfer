@@ -372,6 +372,37 @@ button:disabled {
   padding: 0;
 }
 
+.reset-banner {
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  background: rgba(234, 88, 12, 0.1);
+  border: 1px solid rgba(234, 88, 12, 0.3);
+  color: #9a3412;
+  border-radius: 8px;
+  animation: reset-banner-in 200ms ease-out;
+}
+
+@keyframes reset-banner-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .reset-banner {
+    background: rgba(251, 146, 60, 0.15);
+    border-color: rgba(251, 146, 60, 0.35);
+    color: #fdba74;
+  }
+}
+
 @media (prefers-color-scheme: dark) {
   .resume-button {
     background: rgba(96, 165, 250, 0.12);

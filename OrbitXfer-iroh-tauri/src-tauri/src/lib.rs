@@ -12,6 +12,7 @@ use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 
 const MENU_ID_QUIT: &str = "ox-quit";
+const MENU_ID_RESET_IDENTITY: &str = "ox-reset-identity";
 
 /// Each transfer window has its own isolated send/receive process slot.
 /// Without this, a second window starting a send would clobber the first.
@@ -132,6 +133,85 @@ fn handle_app_quit(app: &AppHandle) {
         });
 }
 
+/// Confirm the user really wants to rotate their iroh identity, then do
+/// it. Triggered by the "Reset Identity…" menu item.
+fn confirm_and_reset_identity(app: &AppHandle) {
+    let app_clone = app.clone();
+    app.dialog()
+        .message(
+            "Reset your OrbitXfer identity?\n\n\
+             This will:\n\
+             • Stop every in-progress transfer in every window\n\
+             • Invalidate every share ticket you've ever sent\n\
+             • Generate a fresh identity for new transfers\n\n\
+             Recipients holding old tickets will no longer be able to \
+             reach your Mac, and they won't be able to probe whether \
+             your Mac is on iroh.\n\n\
+             This cannot be undone.",
+        )
+        .title("OrbitXfer")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Reset".to_string(),
+            "Cancel".to_string(),
+        ))
+        .show(move |confirmed| {
+            if confirmed {
+                reset_app_identity(&app_clone);
+            }
+        });
+}
+
+/// App-wide persistent identity key location. Lives OUTSIDE the per-window
+/// `store-*` directories so `cleanup_old_stores()` doesn't accidentally
+/// wipe it on app startup. The CLI's `load_or_create_secret_key()` reads
+/// this file via the `ORBITXFER_KEY_PATH` env var (we set it on every
+/// sidecar spawn) and creates it on first use.
+///
+/// With this in place, the same file sent twice produces the same ticket —
+/// share once, reuse for life. Security caveat: anyone with an old ticket
+/// can probe whether this identity is online on the iroh network. Mitigated
+/// by `cleanup_old_stores()` wiping the FsStore between sessions (old
+/// recipients can connect but get "blob not found" for anything you're not
+/// actively serving), and by the user-initiated `reset_app_identity()`
+/// flow which deletes the key and invalidates every old ticket.
+fn identity_key_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("app_local_data_dir lookup failed: {e}"))?;
+    std::fs::create_dir_all(&base)
+        .map_err(|e| format!("create app data dir {}: {e}", base.display()))?;
+    Ok(base.join("identity.key"))
+}
+
+/// Kill every active sidecar, delete the persistent identity key, and
+/// wipe every per-window FsStore. Effectively rotates the iroh Node ID:
+/// every ticket we've ever issued becomes inert, and old recipients can
+/// no longer probe the (now-deleted) old Node ID.
+fn reset_app_identity(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut map) = state.windows.lock() {
+            for ws in map.values_mut() {
+                if let Some(c) = ws.sender.take() {
+                    let _ = c.kill();
+                }
+                if let Some(c) = ws.receiver.take() {
+                    let _ = c.kill();
+                }
+            }
+        }
+    }
+
+    if let Ok(path) = identity_key_path(app) {
+        let _ = std::fs::remove_file(&path);
+    }
+
+    cleanup_old_stores(app);
+
+    let _ = app.emit("identity:reset", ());
+}
+
 /// Run once at app startup: remove every leftover `store-*` directory in
 /// the app's data folder. Those dirs are from previous sessions; if an
 /// orphan CLI from a prior session still holds an exclusive lock on
@@ -178,11 +258,13 @@ fn run_sidecar(
     slot: Slot,
 ) -> Result<(), String> {
     let store_dir = store_dir_for(app, &label)?;
+    let key_path = identity_key_path(app)?;
     let sidecar = app
         .shell()
         .sidecar("orbitxfer-iroh-cli")
         .map_err(|e| format!("sidecar lookup failed: {e}"))?
         .env("ORBITXFER_STORE_DIR", store_dir.to_string_lossy().as_ref())
+        .env("ORBITXFER_KEY_PATH", key_path.to_string_lossy().as_ref())
         .args(args);
 
     let (mut rx, child) = sidecar
@@ -307,6 +389,13 @@ pub fn run() {
                 .accelerator("CmdOrCtrl+Q")
                 .build(app)?;
 
+            // No keyboard shortcut — destructive action, intentional speed
+            // bump. The ellipsis follows the macOS convention indicating the
+            // item opens a confirmation dialog before doing anything.
+            let reset_identity = MenuItemBuilder::new("Reset Identity…")
+                .id(MENU_ID_RESET_IDENTITY)
+                .build(app)?;
+
             let app_submenu = SubmenuBuilder::new(app, "OrbitXfer")
                 .item(&PredefinedMenuItem::about(
                     app,
@@ -317,6 +406,8 @@ pub fn run() {
                 .item(&PredefinedMenuItem::hide(app, Some("Hide OrbitXfer"))?)
                 .item(&PredefinedMenuItem::hide_others(app, None)?)
                 .item(&PredefinedMenuItem::show_all(app, None)?)
+                .separator()
+                .item(&reset_identity)
                 .separator()
                 .item(&custom_quit)
                 .build()?;
@@ -341,8 +432,10 @@ pub fn run() {
             app.set_menu(menu)?;
 
             app.on_menu_event(|app, event| {
-                if event.id().as_ref() == MENU_ID_QUIT {
-                    handle_app_quit(app);
+                match event.id().as_ref() {
+                    MENU_ID_QUIT => handle_app_quit(app),
+                    MENU_ID_RESET_IDENTITY => confirm_and_reset_identity(app),
+                    _ => {}
                 }
             });
 

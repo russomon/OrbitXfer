@@ -52,6 +52,8 @@ npm run verify:mac:release     # codesign + spctl + stapler checks
 
 ## Architecture quick reference
 
+- **Persistent identity**: a single iroh identity key lives at `<app-data>/identity.key` and is reused across every send. Same file always produces the same share ticket — you can re-share an old ticket as long as you're actively sending that file in the current session. The blob store is still wiped between sessions, so old tickets are only useful if you re-pick the same file.
+- **Reset Identity… menu item**: under the OrbitXfer app menu. Confirms via dialog, then deletes the identity key, kills every active sidecar, and wipes every per-window store. After a reset, every ticket you've previously sent is dead — old recipients can no longer probe whether your Mac is online on iroh, and any attempt to dial the old Node ID fails at the QUIC handshake (private key is gone).
 - **Sidecar isolation**: each window's CLI process gets its own `<app-data>/store-<window-label>/` so concurrent transfers don't fight over `~/.orbitxfer-store`. Stale store dirs from previous app sessions are wiped at startup.
 - **Quit warnings**: Cmd-W handled via `WindowEvent::CloseRequested`; Cmd-Q handled via a custom Quit menu item (default Tauri Cmd-Q bypasses cancellable events on macOS, so we own the menu).
 - **Filename preservation**: tickets carry hash + node ID + relay info but NOT the original filename. Senders display a `orbitxfer-iroh-cli receive <ticket> <basename>` share line that the receiver's lenient parser extracts the filename from. The receive panel auto-fills `~/Downloads/<filename>` so Start Receive Just Works without picking a destination.

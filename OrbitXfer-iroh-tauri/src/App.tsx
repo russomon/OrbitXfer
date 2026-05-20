@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { UnlistenFn } from "@tauri-apps/api/event";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -204,6 +204,33 @@ function App() {
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
   }, []);
+
+  // Identity-reset listener. Fires globally (not window-scoped) when the
+  // user picks OrbitXfer → Reset Identity… from the menu. Every window in
+  // the app should clear its active-transfer UI and surface a brief banner
+  // so the user knows what just happened.
+  const [identityResetAt, setIdentityResetAt] = useState<number | null>(null);
+  useEffect(() => {
+    const unlisten = listen<null>("identity:reset", () => {
+      setSendStatus("idle");
+      setTickets(null);
+      setSendError(null);
+      setRecvStatus("idle");
+      setRecvProgress(null);
+      setRecvError(null);
+      setIdentityResetAt(Date.now());
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // Auto-clear the banner a few seconds after a reset.
+  useEffect(() => {
+    if (identityResetAt === null) return;
+    const t = setTimeout(() => setIdentityResetAt(null), 6000);
+    return () => clearTimeout(t);
+  }, [identityResetAt]);
 
   // When a ticket with a filename is pasted and the user hasn't already
   // picked a destination, auto-fill ~/Downloads/<filename>. This means the
@@ -569,12 +596,19 @@ function App() {
       <header className="app-header">
         <div>
           <h1>OrbitXfer</h1>
-          <p className="subtitle">Tauri migration — Phase 3c</p>
+          <p className="subtitle">Peer-to-peer file transfer over Iroh</p>
         </div>
         <button className="ghost-button" onClick={openNewTransferWindow}>
           + New Window
         </button>
       </header>
+
+      {identityResetAt !== null && (
+        <div className="reset-banner" role="status">
+          Identity reset. Every share ticket you've previously sent is now
+          invalid — old recipients can no longer reach this Mac via iroh.
+        </div>
+      )}
 
       <div className="mode-switch" role="tablist" aria-label="Window mode">
         <button

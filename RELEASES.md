@@ -1,5 +1,14 @@
 # Releases
 
+## v0.1.60 - 2026-05-19
+- Persistent OrbitXfer identity. The iroh identity key is now stored at `<app-data>/identity.key` and reused across every send. Same file → same share ticket. Old tickets stay live as long as you're actively serving that file in the current session; the FsStore is still wiped between sessions, so old tickets can only fetch blobs you re-pick this session.
+- New **OrbitXfer → Reset Identity…** menu item. Confirms via dialog, then: kills every in-flight transfer in every window, deletes `identity.key`, and wipes every per-window store. The next launch generates a fresh Node ID. After a reset:
+  - Iroh discovery for the OLD Node ID returns "not found" (after a brief TTL).
+  - Any QUIC dial against the OLD Node ID fails at the handshake — the matching private key has been deleted.
+  - Recipients holding old tickets can neither probe whether your Mac is on iroh nor reach your endpoint.
+- Each window now shows a one-time orange banner after a reset confirming the wipe completed.
+- Internal: Tauri sidecar spawns set `ORBITXFER_KEY_PATH=<app-data>/identity.key` so the CLI loads the persistent key instead of generating an ephemeral one each run.
+
 ## v0.1.59 - 2026-05-13
 - CI macOS notarization fix: `.github/workflows/build.yml` was setting `APPLE_API_KEY` to the .p8 file path (electron-builder convention), but Tauri's bundler uses that env var for the 10-char Key ID and expects the path in `APPLE_API_KEY_PATH`. The workflow now maps the existing repo secrets to Tauri's expected names. Signing already worked in CI; notarization was silently skipping, which made `verify:mac:release` fail at the stapler check.
 - CI Windows fix: the "Verify RELEASES.md" step lacked `shell: bash`, so Windows runners (which default to PowerShell) died on bash variable assignment syntax. Now explicitly bash on that step.
