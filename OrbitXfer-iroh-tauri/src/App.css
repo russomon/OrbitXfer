@@ -37,6 +37,35 @@ header h1 {
   margin-bottom: 24px;
 }
 
+.app-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.keep-awake-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  background: rgba(180, 83, 9, 0.1);
+  border: 1px solid rgba(180, 83, 9, 0.25);
+  color: #92400e;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+@media (prefers-color-scheme: dark) {
+  .keep-awake-badge {
+    background: rgba(251, 191, 36, 0.12);
+    border-color: rgba(251, 191, 36, 0.3);
+    color: #fcd34d;
+  }
+}
+
 .app-header > div {
   flex: 1;
   min-width: 0;

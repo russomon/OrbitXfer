@@ -21,7 +21,13 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-os = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
+# Cross-platform sleep inhibitor. macOS uses IOKit's
+# kIOPMAssertionTypeNoIdleSleep, Windows uses SetThreadExecutionState,
+# Linux uses systemd-logind's Inhibit("sleep:idle"). One handle, three
+# OSes — released when dropped.
+keepawake = "0.5"
 

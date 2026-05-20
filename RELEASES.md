@@ -1,5 +1,11 @@
 # Releases
 
+## v0.1.63 - 2026-05-20
+- **Sleep inhibitor while transferring.** OrbitXfer now holds a cross-platform wake lock for as long as any window in the app has an active send or receive in flight. macOS: `IOKit IOPMAssertionCreateWithName` with `kIOPMAssertionTypeNoIdleSleep` (equivalent to `caffeinate -i`). Windows: `SetThreadExecutionState(ES_SYSTEM_REQUIRED | ES_CONTINUOUS)`. Linux: systemd-logind `Inhibit("sleep:idle", …)`. Display sleep is NOT prevented — your screen can still dim — only system idle-sleep is held off, which is the kind that breaks the network.
+- A small ☕ badge appears in the header while the lock is held. Text is platform-aware: "Keeping Mac awake" on macOS, "Keeping PC awake" on Windows, "Keeping computer awake" on Linux/other.
+- Refcounted: multiple concurrent transfers across multiple windows share one wake lock; the lock is released the moment the count drops back to zero.
+- Internal: new `acquire_keep_awake()` / `release_keep_awake()` helpers in `lib.rs`; new `transfer:active` / `transfer:idle` events broadcast to every window so the badge stays consistent across windows. New deps: `keepawake = "0.5"` (Rust), `tauri-plugin-os = "2"` (Rust + JS).
+
 ## v0.1.62 - 2026-05-19
 - **Full menu bar.** Adds File, View, and Window menus to the OrbitXfer / Edit pair we already had.
   - **File**: New Transfer Window (⌘N), Resume Last Send Transfer, Close Window (⌘W).

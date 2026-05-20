@@ -1,7 +1,7 @@
 {
   "name": "orbitxfer-iroh-tauri",
   "private": true,
-  "version": "0.1.62",
+  "version": "0.1.63",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -21,7 +21,8 @@
     "react-dom": "^19.1.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-shell": "^2",
-    "@tauri-apps/plugin-dialog": "^2"
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-os": "^2"
   },
   "devDependencies": {
     "@types/react": "^19.1.8",

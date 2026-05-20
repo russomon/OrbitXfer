@@ -5,6 +5,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { downloadDir } from "@tauri-apps/api/path";
+import { platform } from "@tauri-apps/plugin-os";
 import "./App.css";
 
 type Mode = "send" | "receive";
@@ -324,6 +325,40 @@ function App() {
     const t = setTimeout(() => setMenuMessage(null), 4500);
     return () => clearTimeout(t);
   }, [menuMessage]);
+
+  // Sleep-inhibitor badge: shown across every window while any window has
+  // an active transfer. Rust holds the actual platform-specific wake lock
+  // (IOKit on macOS, SetThreadExecutionState on Windows, systemd-logind
+  // Inhibit on Linux) and broadcasts transfer:active / transfer:idle to
+  // tell every window's UI when to show or hide the ☕ indicator.
+  const [keepAwakeActive, setKeepAwakeActive] = useState(false);
+  useEffect(() => {
+    const unsubs: Promise<UnlistenFn>[] = [];
+    unsubs.push(
+      listen("transfer:active", () => setKeepAwakeActive(true))
+    );
+    unsubs.push(
+      listen("transfer:idle", () => setKeepAwakeActive(false))
+    );
+    return () => {
+      unsubs.forEach((p) => p.then((fn) => fn()));
+    };
+  }, []);
+
+  // Platform label for the wake-lock badge — "Mac" / "PC" / "computer".
+  // Detected once at mount. Default "computer" so the badge has reasonable
+  // text even if the platform call fails or hasn't resolved yet.
+  const [platformLabel, setPlatformLabel] = useState("computer");
+  useEffect(() => {
+    try {
+      const p = platform();
+      if (p === "macos") setPlatformLabel("Mac");
+      else if (p === "windows") setPlatformLabel("PC");
+      else setPlatformLabel("computer");
+    } catch (e) {
+      console.error("platform() failed:", e);
+    }
+  }, []);
 
   // Webview zoom level, controlled by the View menu's zoom items. Stored
   // per-window in state; the actual zoom is applied via Tauri's webview
@@ -847,9 +882,19 @@ function App() {
           <h1>OrbitXfer</h1>
           <p className="subtitle">Peer-to-peer file transfer over Iroh</p>
         </div>
-        <button className="ghost-button" onClick={openNewTransferWindow}>
-          + New Window
-        </button>
+        <div className="app-header-right">
+          {keepAwakeActive && (
+            <span
+              className="keep-awake-badge"
+              title={`OrbitXfer is preventing your ${platformLabel} from sleeping while a transfer is in progress.`}
+            >
+              <span aria-hidden="true">☕</span> Keeping {platformLabel} awake
+            </span>
+          )}
+          <button className="ghost-button" onClick={openNewTransferWindow}>
+            + New Window
+          </button>
+        </div>
       </header>
 
       {identityResetAt !== null && (

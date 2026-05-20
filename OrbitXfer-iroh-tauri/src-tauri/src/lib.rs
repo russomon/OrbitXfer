@@ -34,6 +34,18 @@ struct WindowState {
 #[derive(Default)]
 struct AppState {
     windows: Mutex<HashMap<String, WindowState>>,
+    /// Reference count of currently-active transfers across every window.
+    /// Goes 0 → 1 when the first transfer begins (we acquire the wake
+    /// lock then) and N → 0 when the last one ends (we drop the lock).
+    active_transfer_count: Mutex<u32>,
+    /// Cross-platform sleep inhibitor handle. Held while
+    /// `active_transfer_count > 0`. macOS uses IOKit's
+    /// `kIOPMAssertionTypeNoIdleSleep` (system stays awake, display
+    /// can still sleep — like `caffeinate -i`). Windows uses
+    /// `SetThreadExecutionState(ES_SYSTEM_REQUIRED | ES_CONTINUOUS)`.
+    /// Linux uses systemd-logind's `Inhibit("sleep:idle", …)`. Dropping
+    /// the handle releases the lock in every case.
+    keep_awake: Mutex<Option<keepawake::KeepAwake>>,
 }
 
 #[derive(Clone, Copy)]
@@ -436,6 +448,64 @@ fn store_dir_for(app: &AppHandle, label: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Increment the active-transfer counter and, on the 0 → 1 transition,
+/// acquire a cross-platform sleep inhibitor and broadcast a
+/// `transfer:active` event so the UI can show the ☕ indicator.
+fn acquire_keep_awake(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let Ok(mut count) = state.active_transfer_count.lock() else {
+        return;
+    };
+    *count += 1;
+    if *count == 1 {
+        if let Ok(mut handle) = state.keep_awake.lock() {
+            if handle.is_none() {
+                match keepawake::Builder::default()
+                    .display(false)
+                    .idle(true)
+                    .reason("OrbitXfer transfer in progress")
+                    .app_name("OrbitXfer")
+                    .app_reverse_domain("com.orbitolive.orbitxfer.tauri")
+                    .create()
+                {
+                    Ok(h) => {
+                        *handle = Some(h);
+                        let _ = app.emit("transfer:active", ());
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[orbitxfer] failed to acquire wake lock: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Decrement the active-transfer counter and, on the N → 0 transition,
+/// drop the sleep inhibitor and broadcast `transfer:idle`. Safe to call
+/// when the counter is already 0 (no-op).
+fn release_keep_awake(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let Ok(mut count) = state.active_transfer_count.lock() else {
+        return;
+    };
+    if *count > 0 {
+        *count -= 1;
+        if *count == 0 {
+            if let Ok(mut handle) = state.keep_awake.lock() {
+                *handle = None; // Drop releases the system-level lock.
+            }
+            let _ = app.emit("transfer:idle", ());
+        }
+    }
+}
+
 fn run_sidecar(
     app: &AppHandle,
     label: String,
@@ -479,6 +549,11 @@ fn run_sidecar(
         replace_in_slot(&state, &label, slot, Some(child));
     }
 
+    // Bump the active-transfer counter; if this is the first transfer in
+    // flight across the app, acquire the cross-platform sleep inhibitor.
+    // The matching release runs when this sidecar's event stream ends.
+    acquire_keep_awake(app);
+
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
@@ -507,6 +582,9 @@ fn run_sidecar(
             }
         }
         clear_slot(&app_clone, &label, slot);
+        // Matching release for the acquire above. Runs on the natural
+        // termination path AND on kill-from-outside (which closes rx).
+        release_keep_awake(&app_clone);
     });
 
     Ok(())
@@ -596,6 +674,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_os::init())
         .manage(AppState::default())
         .setup(|app| {
             // Wipe any stale per-window store dirs from previous sessions
