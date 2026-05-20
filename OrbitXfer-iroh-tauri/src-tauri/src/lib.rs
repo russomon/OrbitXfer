@@ -133,20 +133,21 @@ fn handle_app_quit(app: &AppHandle) {
         });
 }
 
-/// Confirm the user really wants to rotate their iroh identity, then do
+/// Confirm the user really wants to rotate their iroh identities, then do
 /// it. Triggered by the "Reset Identity…" menu item.
 fn confirm_and_reset_identity(app: &AppHandle) {
     let app_clone = app.clone();
     app.dialog()
         .message(
-            "Reset your OrbitXfer identity?\n\n\
+            "Reset your OrbitXfer file identities?\n\n\
              This will:\n\
              • Stop every in-progress transfer in every window\n\
-             • Invalidate every share ticket you've ever sent\n\
-             • Generate a fresh identity for new transfers\n\n\
-             Recipients holding old tickets will no longer be able to \
-             reach your Mac, and they won't be able to probe whether \
-             your Mac is on iroh.\n\n\
+             • Erase every saved per-file identity\n\
+             • Invalidate every share ticket you've ever sent\n\n\
+             The next time you send any file, OrbitXfer will create a \
+             fresh identity for it. Recipients holding old tickets will \
+             no longer be able to reach your Mac, and they won't be able \
+             to probe whether your Mac is on iroh.\n\n\
              This cannot be undone.",
         )
         .title("OrbitXfer")
@@ -162,33 +163,42 @@ fn confirm_and_reset_identity(app: &AppHandle) {
         });
 }
 
-/// App-wide persistent identity key location. Lives OUTSIDE the per-window
-/// `store-*` directories so `cleanup_old_stores()` doesn't accidentally
-/// wipe it on app startup. The CLI's `load_or_create_secret_key()` reads
-/// this file via the `ORBITXFER_KEY_PATH` env var (we set it on every
-/// sidecar spawn) and creates it on first use.
+/// Per-file identity-key directory. The CLI's send flow keys identities
+/// by the file's BLAKE3 content hash: `<dir>/<hash>.key`. Same file →
+/// same identity → same share ticket. Different file → different
+/// identity, no cross-linking. This is the v0.1.61+ default; v0.1.60's
+/// single global `identity.key` is gone.
 ///
-/// With this in place, the same file sent twice produces the same ticket —
-/// share once, reuse for life. Security caveat: anyone with an old ticket
-/// can probe whether this identity is online on the iroh network. Mitigated
-/// by `cleanup_old_stores()` wiping the FsStore between sessions (old
-/// recipients can connect but get "blob not found" for anything you're not
-/// actively serving), and by the user-initiated `reset_app_identity()`
-/// flow which deletes the key and invalidates every old ticket.
-fn identity_key_path(app: &AppHandle) -> Result<PathBuf, String> {
+/// Lives OUTSIDE the per-window `store-*` directories so
+/// `cleanup_old_stores()` doesn't accidentally wipe it on app startup —
+/// only `reset_app_identity()` should ever delete it.
+fn per_file_identity_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .path()
         .app_local_data_dir()
         .map_err(|e| format!("app_local_data_dir lookup failed: {e}"))?;
-    std::fs::create_dir_all(&base)
-        .map_err(|e| format!("create app data dir {}: {e}", base.display()))?;
-    Ok(base.join("identity.key"))
+    let dir = base.join("file-identities");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("create per-file identity dir {}: {e}", dir.display()))?;
+    Ok(dir)
 }
 
-/// Kill every active sidecar, delete the persistent identity key, and
-/// wipe every per-window FsStore. Effectively rotates the iroh Node ID:
-/// every ticket we've ever issued becomes inert, and old recipients can
-/// no longer probe the (now-deleted) old Node ID.
+/// One-time cleanup of the v0.1.60 global identity file. Harmless if
+/// it's already gone. Called from `setup` so a user upgrading from
+/// v0.1.60 doesn't keep a stale identity sitting on disk.
+fn cleanup_legacy_identity_key(app: &AppHandle) {
+    let Ok(base) = app.path().app_local_data_dir() else {
+        return;
+    };
+    let legacy = base.join("identity.key");
+    let _ = std::fs::remove_file(&legacy);
+}
+
+/// Kill every active sidecar, wipe every per-file identity, wipe every
+/// per-window FsStore, and remove the legacy v0.1.60 identity file if
+/// any. Effectively rotates every iroh Node ID this Mac has ever used
+/// via OrbitXfer: every ticket previously issued becomes inert, and old
+/// recipients can no longer probe any of the (now-deleted) Node IDs.
 fn reset_app_identity(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(mut map) = state.windows.lock() {
@@ -203,10 +213,10 @@ fn reset_app_identity(app: &AppHandle) {
         }
     }
 
-    if let Ok(path) = identity_key_path(app) {
-        let _ = std::fs::remove_file(&path);
+    if let Ok(dir) = per_file_identity_dir(app) {
+        let _ = std::fs::remove_dir_all(&dir);
     }
-
+    cleanup_legacy_identity_key(app);
     cleanup_old_stores(app);
 
     let _ = app.emit("identity:reset", ());
@@ -258,14 +268,23 @@ fn run_sidecar(
     slot: Slot,
 ) -> Result<(), String> {
     let store_dir = store_dir_for(app, &label)?;
-    let key_path = identity_key_path(app)?;
-    let sidecar = app
+    let mut sidecar = app
         .shell()
         .sidecar("orbitxfer-iroh-cli")
         .map_err(|e| format!("sidecar lookup failed: {e}"))?
-        .env("ORBITXFER_STORE_DIR", store_dir.to_string_lossy().as_ref())
-        .env("ORBITXFER_KEY_PATH", key_path.to_string_lossy().as_ref())
-        .args(args);
+        .env("ORBITXFER_STORE_DIR", store_dir.to_string_lossy().as_ref());
+
+    // Per-file persistent identity is only meaningful for sends — receives
+    // are clients that benefit from a fresh ephemeral identity each time.
+    if matches!(slot, Slot::Send) {
+        let dir = per_file_identity_dir(app)?;
+        sidecar = sidecar.env(
+            "ORBITXFER_PER_FILE_IDENTITY_DIR",
+            dir.to_string_lossy().as_ref(),
+        );
+    }
+
+    let sidecar = sidecar.args(args);
 
     let (mut rx, child) = sidecar
         .spawn()
@@ -379,6 +398,11 @@ pub fn run() {
             // hold an exclusive flock on blobs.db) don't hang our new
             // sends at ticket_hashing_start.
             cleanup_old_stores(&app.handle());
+
+            // One-time cleanup of v0.1.60's single global identity.key.
+            // From v0.1.61 onward we use per-file identities instead;
+            // the old file would just sit there unused otherwise.
+            cleanup_legacy_identity_key(&app.handle());
 
             // Build a minimal menu that overrides the default macOS Quit
             // item. Without this, Cmd-Q bypasses every cancellable event

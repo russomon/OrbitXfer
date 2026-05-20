@@ -30,7 +30,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.60";
+const CLI_VERSION: &str = "0.1.61";
 
 fn print_usage() {
     eprintln!("Usage:");
@@ -57,6 +57,24 @@ fn store_root() -> Result<PathBuf> {
         return Ok(PathBuf::from(profile).join(".orbitxfer-store"));
     }
     Ok(env::current_dir()?.join(".orbitxfer-store"))
+}
+
+/// Resolve a per-file identity key path. When `ORBITXFER_PER_FILE_IDENTITY_DIR`
+/// is set, every file (keyed by its BLAKE3 content hash) gets its own
+/// identity key at `<dir>/<hash>.key`. Same file content → same identity
+/// → same share ticket on every send. Different file content → different
+/// identity, no cross-linking.
+///
+/// Returns None when the env var isn't set, in which case the caller
+/// should fall back to `resolve_identity_key_path()` (legacy single-key
+/// flow) or finally to an ephemeral identity.
+fn per_file_identity_key_path(hash_str: &str) -> Option<PathBuf> {
+    if let Ok(dir) = env::var("ORBITXFER_PER_FILE_IDENTITY_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir).join(format!("{hash_str}.key")));
+        }
+    }
+    None
 }
 
 fn resolve_identity_key_path() -> Option<PathBuf> {
@@ -387,9 +405,20 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
     }));
 
     emit_line("Binding endpoint...");
-    let endpoint = if let Some(path) = resolve_identity_key_path() {
+    // Identity resolution priority:
+    //   1. Per-file identity (ORBITXFER_PER_FILE_IDENTITY_DIR + hash.key) —
+    //      same file = same identity = same ticket. Different file =
+    //      different identity, no cross-linking. This is the Tauri app's
+    //      default in v0.1.61+.
+    //   2. Legacy single-key persistent identity (ORBITXFER_KEY_PATH or
+    //      ORBITXFER_RESUME) — preserved for backward compatibility.
+    //   3. Fully ephemeral — fresh identity every invocation (original
+    //      standalone-CLI default).
+    let identity_path =
+        per_file_identity_key_path(&hash.to_string()).or_else(resolve_identity_key_path);
+    let endpoint = if let Some(path) = identity_path {
         let key = load_or_create_secret_key(&path)?;
-        emit_line(&format!("Using persistent identity key: {}", path.display()));
+        emit_line(&format!("Using identity key: {}", path.display()));
         let bind = timeout(Duration::from_secs(15), Endpoint::builder().secret_key(key).bind())
             .await
             .context("endpoint bind timed out")??;

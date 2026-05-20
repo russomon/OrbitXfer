@@ -1,5 +1,12 @@
 # Releases
 
+## v0.1.61 - 2026-05-19
+- **Per-file persistent identity** replaces v0.1.60's single global identity. Every file you send now gets its own iroh identity key, stored under `<app-data>/file-identities/<content-hash>.key`. Same file → same identity → same share ticket (re-send the same file weeks later, get the identical ticket). Different file → *different* identity, so two recipients of different files cannot cross-link to each other through your Node ID.
+- Receives stay fully ephemeral as before — receivers don't need a stable identity, and not having one means no fingerprint exposure on the receiving side.
+- Reset Identity… dialog text updated to reflect the new behavior — bullets now describe wiping every per-file identity rather than rotating a single global identity. The action itself wipes `<app-data>/file-identities/` entirely.
+- One-time cleanup of v0.1.60's `<app-data>/identity.key` on app startup. Existing v0.1.60 users won't have a stale file sitting around after upgrading.
+- CLI: new `ORBITXFER_PER_FILE_IDENTITY_DIR` env var. When set, the send flow uses the file's BLAKE3 hash to derive `<dir>/<hash>.key` as the identity location, falling back to legacy `ORBITXFER_KEY_PATH` / ephemeral if not set. Standalone terminal CLI usage without this env var is unchanged (still fully ephemeral by default).
+
 ## v0.1.60 - 2026-05-19
 - Persistent OrbitXfer identity. The iroh identity key is now stored at `<app-data>/identity.key` and reused across every send. Same file → same share ticket. Old tickets stay live as long as you're actively serving that file in the current session; the FsStore is still wiped between sessions, so old tickets can only fetch blobs you re-pick this session.
 - New **OrbitXfer → Reset Identity…** menu item. Confirms via dialog, then: kills every in-flight transfer in every window, deletes `identity.key`, and wipes every per-window store. The next launch generates a fresh Node ID. After a reset:
