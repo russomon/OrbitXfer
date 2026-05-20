@@ -3,16 +3,25 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use tauri::menu::{
-    AboutMetadata, MenuBuilder, MenuItemBuilder, PredefinedMenuItem,
+    AboutMetadata, Menu, MenuBuilder, MenuItemBuilder, PredefinedMenuItem,
     SubmenuBuilder,
 };
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow, WindowEvent};
+use tauri::{
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent, Wry,
+};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 
 const MENU_ID_QUIT: &str = "ox-quit";
 const MENU_ID_RESET_IDENTITY: &str = "ox-reset-identity";
+const MENU_ID_NEW_WINDOW: &str = "ox-new-window";
+const MENU_ID_RESUME_LAST_SEND: &str = "ox-resume-last-send";
+const MENU_ID_VIEW_ZOOM_IN: &str = "ox-view-zoom-in";
+const MENU_ID_VIEW_ZOOM_OUT: &str = "ox-view-zoom-out";
+const MENU_ID_VIEW_ACTUAL_SIZE: &str = "ox-view-actual-size";
+const MENU_ID_WINDOW_PREFIX: &str = "ox-window-";
 
 /// Each transfer window has its own isolated send/receive process slot.
 /// Without this, a second window starting a send would clobber the first.
@@ -131,6 +140,173 @@ fn handle_app_quit(app: &AppHandle) {
             }
             app_clone.exit(0);
         });
+}
+
+/// Return the currently-focused webview window, if any. Used by menu
+/// handlers that need to dispatch an event ("zoom in", "resume last send",
+/// etc.) to the window the user is actually looking at.
+fn focused_window(app: &AppHandle) -> Option<WebviewWindow> {
+    for (_label, window) in app.webview_windows() {
+        if window.is_focused().unwrap_or(false) {
+            return Some(window);
+        }
+    }
+    None
+}
+
+/// Create a new transfer window with a unique label. Called from the File
+/// menu and from the `open_new_window` Tauri command (which the frontend
+/// "+ New Window" button invokes). After creation, the menu is rebuilt so
+/// the new window appears in the Window submenu's list.
+fn create_transfer_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
+    // Same labeling scheme the frontend used previously: `window-<ts>-<rand>`.
+    // Each label is unique so the per-window AppState slot doesn't collide.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut rand_bytes = [0u8; 2];
+    let _ = getrandom_simple(&mut rand_bytes);
+    let suffix = ((rand_bytes[0] as u16) << 8) | (rand_bytes[1] as u16);
+    let label = format!("window-{nanos}-{suffix}");
+
+    let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+        .title("OrbitXfer")
+        .inner_size(900.0, 700.0)
+        .build()?;
+
+    // Rebuild menu so the new window appears in the Window submenu's list.
+    if let Ok(menu) = build_menu(app) {
+        let _ = app.set_menu(menu);
+    }
+
+    Ok(window)
+}
+
+/// Build the entire OrbitXfer menu, including the Window submenu's dynamic
+/// list of currently-open windows. Called at startup and again whenever a
+/// window opens or closes.
+fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
+    // ---- OrbitXfer (app) menu ----
+    let custom_quit = MenuItemBuilder::new("Quit OrbitXfer")
+        .id(MENU_ID_QUIT)
+        .accelerator("CmdOrCtrl+Q")
+        .build(app)?;
+    let reset_identity = MenuItemBuilder::new("Reset Identity…")
+        .id(MENU_ID_RESET_IDENTITY)
+        .build(app)?;
+
+    let app_submenu = SubmenuBuilder::new(app, "OrbitXfer")
+        .item(&PredefinedMenuItem::about(
+            app,
+            Some("About OrbitXfer"),
+            Some(AboutMetadata::default()),
+        )?)
+        .separator()
+        .item(&PredefinedMenuItem::hide(app, Some("Hide OrbitXfer"))?)
+        .item(&PredefinedMenuItem::hide_others(app, None)?)
+        .item(&PredefinedMenuItem::show_all(app, None)?)
+        .separator()
+        .item(&reset_identity)
+        .separator()
+        .item(&custom_quit)
+        .build()?;
+
+    // ---- File menu ----
+    let new_window = MenuItemBuilder::new("New Transfer Window")
+        .id(MENU_ID_NEW_WINDOW)
+        .accelerator("CmdOrCtrl+N")
+        .build(app)?;
+    let resume_last_send = MenuItemBuilder::new("Resume Last Send Transfer")
+        .id(MENU_ID_RESUME_LAST_SEND)
+        .build(app)?;
+    let file_submenu = SubmenuBuilder::new(app, "File")
+        .item(&new_window)
+        .item(&resume_last_send)
+        .separator()
+        .item(&PredefinedMenuItem::close_window(app, None)?)
+        .build()?;
+
+    // ---- Edit menu ----
+    let edit_submenu = SubmenuBuilder::new(app, "Edit")
+        .item(&PredefinedMenuItem::undo(app, None)?)
+        .item(&PredefinedMenuItem::redo(app, None)?)
+        .separator()
+        .item(&PredefinedMenuItem::cut(app, None)?)
+        .item(&PredefinedMenuItem::copy(app, None)?)
+        .item(&PredefinedMenuItem::paste(app, None)?)
+        .item(&PredefinedMenuItem::select_all(app, None)?)
+        .build()?;
+
+    // ---- View menu ----
+    // Zoom items emit events to the focused window — the frontend listens
+    // and adjusts the webview's zoom factor in response.
+    let zoom_in = MenuItemBuilder::new("Zoom In")
+        .id(MENU_ID_VIEW_ZOOM_IN)
+        .accelerator("CmdOrCtrl+=")
+        .build(app)?;
+    let zoom_out = MenuItemBuilder::new("Zoom Out")
+        .id(MENU_ID_VIEW_ZOOM_OUT)
+        .accelerator("CmdOrCtrl+-")
+        .build(app)?;
+    let actual_size = MenuItemBuilder::new("Actual Size")
+        .id(MENU_ID_VIEW_ACTUAL_SIZE)
+        .accelerator("CmdOrCtrl+0")
+        .build(app)?;
+    let view_submenu = SubmenuBuilder::new(app, "View")
+        .item(&PredefinedMenuItem::fullscreen(app, None)?)
+        .separator()
+        .item(&actual_size)
+        .item(&zoom_in)
+        .item(&zoom_out)
+        .build()?;
+
+    // ---- Window menu ----
+    let mut window_builder = SubmenuBuilder::new(app, "Window")
+        .item(&PredefinedMenuItem::minimize(app, None)?)
+        .item(&PredefinedMenuItem::maximize(app, None)?)
+        .separator();
+
+    // Dynamic list of currently-open windows. We sort by label so the
+    // numbering is stable across menu rebuilds (HashMap iteration order
+    // isn't). Per the user's preference (option (i)), every entry gets a
+    // disambiguating counter even when titles are unique, so the user can
+    // always tell which entry is which.
+    let mut windows: Vec<(String, WebviewWindow)> = app
+        .webview_windows()
+        .into_iter()
+        .collect();
+    windows.sort_by(|a, b| a.0.cmp(&b.0));
+    for (i, (label, window)) in windows.iter().enumerate() {
+        let title = window.title().unwrap_or_else(|_| label.clone());
+        let display = format!("{title} ({})", i + 1);
+        let item = MenuItemBuilder::new(&display)
+            .id(format!("{MENU_ID_WINDOW_PREFIX}{label}"))
+            .build(app)?;
+        window_builder = window_builder.item(&item);
+    }
+
+    let window_submenu = window_builder.build()?;
+
+    // ---- Top-level menu bar ----
+    MenuBuilder::new(app)
+        .item(&app_submenu)
+        .item(&file_submenu)
+        .item(&edit_submenu)
+        .item(&view_submenu)
+        .item(&window_submenu)
+        .build()
+}
+
+/// A minimal getrandom wrapper so we don't pull in a heavy dep just to
+/// suffix window labels. Uses the host OS's CSPRNG. If it fails (vanishingly
+/// rare), we accept a deterministic fallback — the nanos-since-epoch part
+/// of the label is enough to avoid collisions in practice.
+fn getrandom_simple(buf: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut f = std::fs::File::open("/dev/urandom")?;
+    f.read_exact(buf)?;
+    Ok(())
 }
 
 /// Confirm the user really wants to rotate their iroh identities, then do
@@ -266,6 +442,7 @@ fn run_sidecar(
     args: &[&str],
     event_prefix: &'static str,
     slot: Slot,
+    ticket_mode: Option<&str>,
 ) -> Result<(), String> {
     let store_dir = store_dir_for(app, &label)?;
     let mut sidecar = app
@@ -282,6 +459,14 @@ fn run_sidecar(
             "ORBITXFER_PER_FILE_IDENTITY_DIR",
             dir.to_string_lossy().as_ref(),
         );
+
+        // Connection mode chosen by the user in the Send panel. CLI accepts
+        // "full" (relay + direct IPs), "direct_only" (no relay), or
+        // "relay_only" (no direct IPs). Unset = "full" by default in the
+        // CLI, so we only forward an explicit value.
+        if let Some(mode) = ticket_mode {
+            sidecar = sidecar.env("ORBITXFER_TICKET_MODE", mode);
+        }
     }
 
     let sidecar = sidecar.args(args);
@@ -332,8 +517,17 @@ async fn start_send(
     app: AppHandle,
     window: WebviewWindow,
     file_path: String,
+    connection_mode: Option<String>,
 ) -> Result<(), String> {
-    run_sidecar(&app, window.label().to_string(), &["send", &file_path], "send", Slot::Send)
+    let mode_ref = connection_mode.as_deref();
+    run_sidecar(
+        &app,
+        window.label().to_string(),
+        &["send", &file_path],
+        "send",
+        Slot::Send,
+        mode_ref,
+    )
 }
 
 #[tauri::command]
@@ -366,6 +560,7 @@ async fn start_receive(
         &["receive", &ticket, &output_path],
         "recv",
         Slot::Recv,
+        None,
     )
 }
 
@@ -386,6 +581,16 @@ async fn stop_receive(
     Ok(())
 }
 
+/// Open a new transfer window. The frontend's "+ New Window" button
+/// invokes this so window creation happens in Rust (where we can also
+/// rebuild the menu to include the new window in the Window submenu).
+#[tauri::command]
+async fn open_new_window(app: AppHandle) -> Result<(), String> {
+    create_transfer_window(&app)
+        .map(|_| ())
+        .map_err(|e| format!("new window failed: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -404,61 +609,51 @@ pub fn run() {
             // the old file would just sit there unused otherwise.
             cleanup_legacy_identity_key(&app.handle());
 
-            // Build a minimal menu that overrides the default macOS Quit
-            // item. Without this, Cmd-Q bypasses every cancellable event
-            // (RunEvent::ExitRequested and WindowEvent::CloseRequested both
-            // fail to fire) and the app exits silently.
-            let custom_quit = MenuItemBuilder::new("Quit OrbitXfer")
-                .id(MENU_ID_QUIT)
-                .accelerator("CmdOrCtrl+Q")
-                .build(app)?;
-
-            // No keyboard shortcut — destructive action, intentional speed
-            // bump. The ellipsis follows the macOS convention indicating the
-            // item opens a confirmation dialog before doing anything.
-            let reset_identity = MenuItemBuilder::new("Reset Identity…")
-                .id(MENU_ID_RESET_IDENTITY)
-                .build(app)?;
-
-            let app_submenu = SubmenuBuilder::new(app, "OrbitXfer")
-                .item(&PredefinedMenuItem::about(
-                    app,
-                    Some("About OrbitXfer"),
-                    Some(AboutMetadata::default()),
-                )?)
-                .separator()
-                .item(&PredefinedMenuItem::hide(app, Some("Hide OrbitXfer"))?)
-                .item(&PredefinedMenuItem::hide_others(app, None)?)
-                .item(&PredefinedMenuItem::show_all(app, None)?)
-                .separator()
-                .item(&reset_identity)
-                .separator()
-                .item(&custom_quit)
-                .build()?;
-
-            // Edit submenu so cut/copy/paste/select-all keyboard shortcuts
-            // keep working in textareas once we install our own menu.
-            let edit_submenu = SubmenuBuilder::new(app, "Edit")
-                .item(&PredefinedMenuItem::undo(app, None)?)
-                .item(&PredefinedMenuItem::redo(app, None)?)
-                .separator()
-                .item(&PredefinedMenuItem::cut(app, None)?)
-                .item(&PredefinedMenuItem::copy(app, None)?)
-                .item(&PredefinedMenuItem::paste(app, None)?)
-                .item(&PredefinedMenuItem::select_all(app, None)?)
-                .build()?;
-
-            let menu = MenuBuilder::new(app)
-                .item(&app_submenu)
-                .item(&edit_submenu)
-                .build()?;
-
+            // Build the full menu (OrbitXfer / File / Edit / View / Window)
+            // including the dynamic list of currently-open windows in the
+            // Window submenu. The default Tauri Cmd-Q on macOS bypasses
+            // every cancellable event (RunEvent::ExitRequested AND
+            // WindowEvent::CloseRequested both fail to fire), which is why
+            // we own the OrbitXfer → Quit OrbitXfer item.
+            let menu = build_menu(&app.handle())?;
             app.set_menu(menu)?;
 
             app.on_menu_event(|app, event| {
-                match event.id().as_ref() {
+                let id = event.id().as_ref();
+                match id {
                     MENU_ID_QUIT => handle_app_quit(app),
                     MENU_ID_RESET_IDENTITY => confirm_and_reset_identity(app),
+                    MENU_ID_NEW_WINDOW => {
+                        let _ = create_transfer_window(app);
+                    }
+                    MENU_ID_RESUME_LAST_SEND => {
+                        if let Some(window) = focused_window(app) {
+                            let _ = window.emit("menu:resume-last-send", ());
+                        }
+                    }
+                    MENU_ID_VIEW_ZOOM_IN => {
+                        if let Some(window) = focused_window(app) {
+                            let _ = window.emit("view:zoom-in", ());
+                        }
+                    }
+                    MENU_ID_VIEW_ZOOM_OUT => {
+                        if let Some(window) = focused_window(app) {
+                            let _ = window.emit("view:zoom-out", ());
+                        }
+                    }
+                    MENU_ID_VIEW_ACTUAL_SIZE => {
+                        if let Some(window) = focused_window(app) {
+                            let _ = window.emit("view:actual-size", ());
+                        }
+                    }
+                    _ if id.starts_with(MENU_ID_WINDOW_PREFIX) => {
+                        // Window submenu list item: bring that window to
+                        // front. The label is the menu-id suffix.
+                        let label = &id[MENU_ID_WINDOW_PREFIX.len()..];
+                        if let Some(window) = app.get_webview_window(label) {
+                            let _ = window.set_focus();
+                        }
+                    }
                     _ => {}
                 }
             });
@@ -558,7 +753,8 @@ pub fn run() {
                     // surviving sidecar (e.g. user closed without active
                     // transfer) gets killed here too.
                     let label = window.label().to_string();
-                    if let Some(state) = window.app_handle().try_state::<AppState>() {
+                    let app_handle = window.app_handle();
+                    if let Some(state) = app_handle.try_state::<AppState>() {
                         if let Ok(mut map) = state.windows.lock() {
                             if let Some(mut ws) = map.remove(&label) {
                                 if let Some(child) = ws.sender.take() {
@@ -570,6 +766,13 @@ pub fn run() {
                             }
                         }
                     }
+
+                    // Rebuild the menu so the Window submenu's dynamic list
+                    // reflects the closed window's absence. (Opens trigger
+                    // their rebuild from create_transfer_window().)
+                    if let Ok(menu) = build_menu(app_handle) {
+                        let _ = app_handle.set_menu(menu);
+                    }
                 }
                 _ => {}
             }
@@ -578,7 +781,8 @@ pub fn run() {
             start_send,
             stop_send,
             start_receive,
-            stop_receive
+            stop_receive,
+            open_new_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

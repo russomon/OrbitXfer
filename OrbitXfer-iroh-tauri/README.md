@@ -50,6 +50,16 @@ npm run verify:mac:release     # codesign + spctl + stapler checks
 
 `tauri.env` uses the same `APPLE_API_*` env var names as electron-builder, so existing CI secrets carry over with no rename. CI maps `CSC_LINK / CSC_KEY_PASSWORD` to Tauri's `APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD` automatically.
 
+## Menu bar
+
+- **OrbitXfer**: About, Hide, Hide Others, Show All, Reset Identity…, Quit OrbitXfer
+- **File**: New Transfer Window (⌘N), Resume Last Send Transfer, Close Window (⌘W)
+- **Edit**: Undo, Redo, Cut, Copy, Paste, Select All
+- **View**: Enter Full Screen (^⌘F), Actual Size (⌘0), Zoom In (⌘=), Zoom Out (⌘-)
+- **Window**: Minimize (⌘M), Zoom, plus a dynamic list of every open OrbitXfer window
+
+The Window submenu rebuilds whenever windows open or close, so the list is always accurate. Multiple windows sharing a title are disambiguated with a numeric suffix.
+
 ## Architecture quick reference
 
 - **Per-file persistent identity**: every file you send gets its own iroh identity key, stored at `<app-data>/file-identities/<content-hash>.key`. Same file → same identity → same share ticket forever (re-sending the same file produces the same ticket the first recipient got). Different file → *different* identity, no cross-linking between recipients of different files. Receives stay ephemeral — a receiver doesn't need a stable identity. Mechanism: the Tauri sidecar passes `ORBITXFER_PER_FILE_IDENTITY_DIR` on Send invocations; the CLI hashes the file first, then loads/creates the per-hash key.

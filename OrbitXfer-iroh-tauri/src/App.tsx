@@ -3,12 +3,24 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { downloadDir } from "@tauri-apps/api/path";
 import "./App.css";
 
 type Mode = "send" | "receive";
 type SendStatus = "idle" | "sending" | "ticket_ready" | "complete" | "error";
+type ConnectionMode = "full" | "direct_only";
+
+const LS_CONNECTION_MODE = "orbitxfer.connectionMode.v1";
+
+function loadConnectionMode(): ConnectionMode {
+  try {
+    const v = localStorage.getItem(LS_CONNECTION_MODE);
+    return v === "direct_only" ? "direct_only" : "full";
+  } catch {
+    return "full";
+  }
+}
 type RecvStatus =
   | "idle"
   | "connecting"
@@ -27,6 +39,12 @@ interface RecvProgress {
   bytes: number;
   total: number | null;
   phase: "download" | "export";
+}
+
+interface SendProgress {
+  phase: "hashing" | "uploading";
+  bytes: number;
+  total: number | null;
 }
 
 const OX_EVENT_PREFIX = "OX_EVENT ";
@@ -129,21 +147,66 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[i]}`;
 }
 
+function formatSpeed(bytesPerSec: number | null): string {
+  if (bytesPerSec === null || bytesPerSec < 1) return "—";
+  return `${formatBytes(bytesPerSec)}/s`;
+}
+
+function formatEta(remainingBytes: number, bytesPerSec: number | null): string | null {
+  if (bytesPerSec === null || bytesPerSec < 1) return null;
+  const seconds = remainingBytes / bytesPerSec;
+  if (!isFinite(seconds) || seconds < 0) return null;
+  if (seconds < 1) return "<1s";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) {
+    const m = Math.floor(seconds / 60);
+    const s = Math.round(seconds % 60);
+    return `${m}m ${s}s`;
+  }
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
+interface SpeedSample {
+  at: number; // ms timestamp
+  bytes: number; // cumulative bytes at that time
+}
+
+/// Push a new (timestamp, bytes) sample and trim anything older than the
+/// 5-second window. Returns the trimmed list so callers can compute speed.
+function trackSpeed(samples: SpeedSample[], bytes: number): SpeedSample[] {
+  const now = Date.now();
+  samples.push({ at: now, bytes });
+  const cutoff = now - 5000;
+  while (samples.length > 0 && samples[0].at < cutoff) {
+    samples.shift();
+  }
+  return samples;
+}
+
+/// Compute bytes-per-second over the rolling window. Returns null if there
+/// aren't enough samples or the window is too short to be meaningful.
+function speedFromSamples(samples: SpeedSample[]): number | null {
+  if (samples.length < 2) return null;
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const dt = (last.at - first.at) / 1000;
+  if (dt <= 0.1) return null;
+  const dbytes = last.bytes - first.bytes;
+  return dbytes / dt;
+}
+
 async function openNewTransferWindow() {
-  // Each window needs a unique label so per-window state in Rust stays
-  // isolated. Capabilities use the "window-*" pattern, so labels must
-  // start with "window-".
-  const label = `window-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-  const win = new WebviewWindow(label, {
-    url: "index.html",
-    title: "OrbitXfer",
-    width: 900,
-    height: 700,
-  });
-  // Surface creation errors so they don't disappear silently.
-  win.once("tauri://error", (e) => {
-    console.error("New window failed to open:", e);
-  });
+  // Window creation happens Rust-side via the open_new_window command so
+  // the Window submenu can be rebuilt with the new window included. We
+  // could create the window from JS via `new WebviewWindow(...)` but that
+  // bypasses the menu update.
+  try {
+    await invoke("open_new_window");
+  } catch (err) {
+    console.error("New window failed to open:", err);
+  }
 }
 
 function App() {
@@ -151,6 +214,21 @@ function App() {
   // hidden so a single window stays focused on one task. Open another window
   // for the other direction.
   const [mode, setMode] = useState<Mode>("send");
+
+  // Connection mode — applies to all sends from this window. Persisted in
+  // localStorage so it's remembered across launches; shared across windows
+  // via the storage event below. Default is "full" (direct + relay
+  // fallback, the recommended mode).
+  const [connectionMode, setConnectionMode] = useState<ConnectionMode>(
+    loadConnectionMode
+  );
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_CONNECTION_MODE, connectionMode);
+    } catch (e) {
+      console.error("save connectionMode failed:", e);
+    }
+  }, [connectionMode]);
 
   // Tracks whether the user has explicitly picked a destination via the save
   // dialog. We auto-fill the destination from the parsed ticket's filename,
@@ -174,6 +252,9 @@ function App() {
   const [tickets, setTickets] = useState<Tickets | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
   const [sendLogs, setSendLogs] = useState<string[]>([]);
+  const [sendProgress, setSendProgress] = useState<SendProgress | null>(null);
+  const [sendSpeed, setSendSpeed] = useState<number | null>(null);
+  const sendSpeedRef = useRef<SpeedSample[]>([]);
 
   // Receive state
   const [ticketInput, setTicketInput] = useState("");
@@ -182,6 +263,8 @@ function App() {
   const [recvProgress, setRecvProgress] = useState<RecvProgress | null>(null);
   const [recvError, setRecvError] = useState<string | null>(null);
   const [recvLogs, setRecvLogs] = useState<string[]>([]);
+  const [recvSpeed, setRecvSpeed] = useState<number | null>(null);
+  const recvSpeedRef = useRef<SpeedSample[]>([]);
 
   const win = useMemo(() => getCurrentWindow(), []);
 
@@ -232,6 +315,75 @@ function App() {
     return () => clearTimeout(t);
   }, [identityResetAt]);
 
+  // Generic transient notification used by menu actions that need to tell
+  // the user something didn't happen (e.g. "Resume Last Send" clicked with
+  // no previous send). Same auto-clear pattern as the identity reset banner.
+  const [menuMessage, setMenuMessage] = useState<string | null>(null);
+  useEffect(() => {
+    if (menuMessage === null) return;
+    const t = setTimeout(() => setMenuMessage(null), 4500);
+    return () => clearTimeout(t);
+  }, [menuMessage]);
+
+  // Webview zoom level, controlled by the View menu's zoom items. Stored
+  // per-window in state; the actual zoom is applied via Tauri's webview
+  // setZoom() API. Bounded so the UI can't go off the rails.
+  const [zoomLevel, setZoomLevel] = useState(1.0);
+  const webviewWin = useMemo(() => getCurrentWebviewWindow(), []);
+  useEffect(() => {
+    webviewWin.setZoom(zoomLevel).catch((err) => {
+      console.error("setZoom failed:", err);
+    });
+  }, [zoomLevel, webviewWin]);
+
+  // Listeners for menu events emitted from the Rust side. These fire only
+  // for the focused window (Rust uses emit_to(focused_window)), so each
+  // window responds individually. The events themselves carry no payload.
+  useEffect(() => {
+    const unsubs: Promise<UnlistenFn>[] = [];
+
+    // The Rust menu handler doesn't know about lastSend in localStorage,
+    // so we read it fresh here and either kick off the resume or show a
+    // friendly no-op message. The lastSend state we already have in React
+    // might be stale across cross-window updates, so re-reading guarantees
+    // freshness.
+    unsubs.push(
+      win.listen("menu:resume-last-send", () => {
+        const stored = loadJson<LastSend>(LS_LAST_SEND);
+        if (stored) {
+          setMode("send");
+          setLastSend(stored);
+          startSendWith(stored.filePath);
+        } else {
+          setMenuMessage(
+            "No previous send to resume — start a send first."
+          );
+        }
+      })
+    );
+
+    unsubs.push(
+      win.listen("view:zoom-in", () => {
+        setZoomLevel((z) => Math.min(3.0, z * 1.1));
+      })
+    );
+    unsubs.push(
+      win.listen("view:zoom-out", () => {
+        setZoomLevel((z) => Math.max(0.4, z / 1.1));
+      })
+    );
+    unsubs.push(
+      win.listen("view:actual-size", () => {
+        setZoomLevel(1.0);
+      })
+    );
+
+    return () => {
+      unsubs.forEach((p) => p.then((fn) => fn()));
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [win]);
+
   // When a ticket with a filename is pasted and the user hasn't already
   // picked a destination, auto-fill ~/Downloads/<filename>. This means the
   // received file keeps its original name and extension without the user
@@ -275,18 +427,93 @@ function App() {
         const parsed = parseOxEvent(line);
         if (!parsed) return;
 
-        if (parsed.type === "ticket_variants") {
-          setTickets({
-            direct: parsed.direct ?? null,
-            relay: parsed.relay ?? null,
-            full: parsed.full,
-          });
-          setSendStatus("ticket_ready");
-        } else if (parsed.type === "upload_complete") {
-          setSendStatus("complete");
-        } else if (parsed.type === "error") {
-          setSendError(`${parsed.stage}: ${parsed.message}`);
-          setSendStatus("error");
+        const total =
+          typeof parsed.total === "number" ? parsed.total : null;
+        const bytes = typeof parsed.bytes === "number" ? parsed.bytes : null;
+
+        switch (parsed.type) {
+          case "ticket_hashing_start":
+            sendSpeedRef.current = [];
+            setSendSpeed(null);
+            setSendProgress({ phase: "hashing", bytes: 0, total: null });
+            break;
+          case "ticket_hashing_size":
+            setSendProgress((prev) => ({
+              phase: "hashing",
+              bytes: prev?.bytes ?? 0,
+              total: total ?? prev?.total ?? null,
+            }));
+            break;
+          case "ticket_hashing_progress":
+            if (bytes !== null) {
+              const samples = trackSpeed(sendSpeedRef.current, bytes);
+              setSendSpeed(speedFromSamples(samples));
+            }
+            setSendProgress((prev) => ({
+              phase: "hashing",
+              bytes: bytes ?? prev?.bytes ?? 0,
+              total: total ?? prev?.total ?? null,
+            }));
+            break;
+          case "ticket_hashing_complete":
+            setSendProgress((prev) => ({
+              phase: "hashing",
+              bytes: total ?? prev?.bytes ?? 0,
+              total: total ?? prev?.total ?? null,
+            }));
+            // Reset speed samples — upload phase will track its own.
+            sendSpeedRef.current = [];
+            setSendSpeed(null);
+            break;
+          case "ticket_variants":
+            setTickets({
+              direct: parsed.direct ?? null,
+              relay: parsed.relay ?? null,
+              full: parsed.full,
+            });
+            setSendStatus("ticket_ready");
+            // Clear hashing progress — it's done and the ticket is the
+            // main signal now.
+            setSendProgress(null);
+            break;
+          case "upload_started":
+            sendSpeedRef.current = [];
+            setSendSpeed(null);
+            setSendProgress({
+              phase: "uploading",
+              bytes: 0,
+              total: total ?? null,
+            });
+            break;
+          case "upload_progress":
+            if (bytes !== null) {
+              const samples = trackSpeed(sendSpeedRef.current, bytes);
+              setSendSpeed(speedFromSamples(samples));
+            }
+            setSendProgress((prev) => ({
+              phase: "uploading",
+              bytes: bytes ?? prev?.bytes ?? 0,
+              total: total ?? prev?.total ?? null,
+            }));
+            break;
+          case "upload_complete":
+            setSendStatus("complete");
+            setSendProgress((prev) =>
+              prev
+                ? {
+                    phase: "uploading",
+                    bytes: prev.total ?? prev.bytes,
+                    total: prev.total,
+                  }
+                : null
+            );
+            sendSpeedRef.current = [];
+            setSendSpeed(null);
+            break;
+          case "error":
+            setSendError(`${parsed.stage}: ${parsed.message}`);
+            setSendStatus("error");
+            break;
         }
       })
     );
@@ -330,6 +557,9 @@ function App() {
           case "connect_start":
           case "connect_check_start":
             setRecvStatus((s) => (s === "idle" ? "connecting" : s));
+            // Reset speed tracking when a new transfer cycle starts.
+            recvSpeedRef.current = [];
+            setRecvSpeed(null);
             break;
           case "download_size":
             setRecvProgress({ bytes: 0, total, phase: "download" });
@@ -344,6 +574,10 @@ function App() {
             break;
           case "download_progress":
             setRecvStatus("downloading");
+            if (bytes !== null) {
+              const samples = trackSpeed(recvSpeedRef.current, bytes);
+              setRecvSpeed(speedFromSamples(samples));
+            }
             setRecvProgress((prev) => ({
               bytes: bytes ?? prev?.bytes ?? 0,
               total: total ?? prev?.total ?? null,
@@ -358,6 +592,9 @@ function App() {
               total: total ?? prev?.total ?? null,
               phase: "download",
             }));
+            // Export phase has different bytes; reset speed window.
+            recvSpeedRef.current = [];
+            setRecvSpeed(null);
             break;
           case "export_started":
             setRecvStatus("exporting");
@@ -376,6 +613,10 @@ function App() {
             break;
           case "export_progress":
             setRecvStatus("exporting");
+            if (bytes !== null) {
+              const samples = trackSpeed(recvSpeedRef.current, bytes);
+              setRecvSpeed(speedFromSamples(samples));
+            }
             setRecvProgress((prev) => ({
               bytes: bytes ?? prev?.bytes ?? 0,
               total: total ?? prev?.total ?? null,
@@ -449,8 +690,14 @@ function App() {
     setTickets(null);
     setSendError(null);
     setSendLogs([]);
+    setSendProgress(null);
+    setSendSpeed(null);
+    sendSpeedRef.current = [];
     try {
-      await invoke("start_send", { filePath: targetPath });
+      await invoke("start_send", {
+        filePath: targetPath,
+        connectionMode,
+      });
       // Persist the path on successful spawn — even if the transfer is later
       // interrupted, the user can resume with one click.
       const entry: LastSend = { filePath: targetPath, savedAt: Date.now() };
@@ -536,6 +783,8 @@ function App() {
     setRecvProgress(null);
     setRecvError(null);
     setRecvLogs([]);
+    setRecvSpeed(null);
+    recvSpeedRef.current = [];
     try {
       await invoke("start_receive", { ticket, outputPath: dest });
       const entry: LastReceive = {
@@ -610,6 +859,12 @@ function App() {
         </div>
       )}
 
+      {menuMessage !== null && (
+        <div className="menu-banner" role="status">
+          {menuMessage}
+        </div>
+      )}
+
       <div className="mode-switch" role="tablist" aria-label="Window mode">
         <button
           role="tab"
@@ -644,6 +899,36 @@ function App() {
               <code>{basename(lastSend.filePath)}</code>
             </button>
           )}
+
+          <fieldset className="connection-mode" disabled={sendBusy}>
+            <legend>Connection mode</legend>
+            <label>
+              <input
+                type="radio"
+                name={`conn-${win.label}`}
+                value="full"
+                checked={connectionMode === "full"}
+                onChange={() => setConnectionMode("full")}
+              />
+              Direct + relay fallback <span className="recommended">(recommended)</span>
+            </label>
+            <label>
+              <input
+                type="radio"
+                name={`conn-${win.label}`}
+                value="direct_only"
+                checked={connectionMode === "direct_only"}
+                onChange={() => setConnectionMode("direct_only")}
+              />
+              Direct only (no relay)
+            </label>
+            <p className="hint">
+              Transfers are end-to-end encrypted in both modes. Direct-only
+              disables relay fallback, and is true peer-to-peer with no relay
+              server used.
+            </p>
+          </fieldset>
+
           <div className="actions">
             <button onClick={pickFile} disabled={sendBusy}>
               Pick file…
@@ -671,6 +956,63 @@ function App() {
           </p>
 
           {sendError && <p className="error">{sendError}</p>}
+
+          {sendProgress && (() => {
+            const pct =
+              sendProgress.total && sendProgress.total > 0
+                ? Math.min(100, (sendProgress.bytes / sendProgress.total) * 100)
+                : null;
+            const remaining =
+              sendProgress.total !== null
+                ? Math.max(0, sendProgress.total - sendProgress.bytes)
+                : 0;
+            const eta =
+              sendProgress.total !== null
+                ? formatEta(remaining, sendSpeed)
+                : null;
+            const phaseLabel =
+              sendProgress.phase === "hashing" ? "Hashing" : "Uploading";
+            return (
+              <div className="progress-box">
+                <div className="progress-header">
+                  <span className="progress-phase">{phaseLabel}</span>
+                  {pct !== null && (
+                    <span className="progress-pct">{pct.toFixed(1)}%</span>
+                  )}
+                </div>
+                {sendProgress.total ? (
+                  <progress
+                    value={sendProgress.bytes}
+                    max={sendProgress.total}
+                  />
+                ) : (
+                  <progress />
+                )}
+                <div className="progress-footer">
+                  <span className="progress-bytes">
+                    {formatBytes(sendProgress.bytes)}
+                    {sendProgress.total !== null && (
+                      <> / {formatBytes(sendProgress.total)}</>
+                    )}
+                  </span>
+                  {sendSpeed !== null && (
+                    <>
+                      <span className="progress-sep">·</span>
+                      <span className="progress-speed">
+                        {formatSpeed(sendSpeed)}
+                      </span>
+                    </>
+                  )}
+                  {eta !== null && (
+                    <>
+                      <span className="progress-sep">·</span>
+                      <span className="progress-eta">ETA {eta}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
 
           {tickets && (
             <div className="ticket-box">
@@ -786,36 +1128,63 @@ function App() {
 
           {recvError && <p className="error">{recvError}</p>}
 
-          {recvProgress && (
-            <div className="progress-box">
-              {recvProgress.total ? (
-                <progress
-                  value={recvProgress.bytes}
-                  max={recvProgress.total}
-                />
-              ) : (
-                // Indeterminate: total unknown until export_size arrives.
-                <progress />
-              )}
-              <p className="progress-label">
-                <span className="progress-phase">
-                  {recvProgress.phase === "export"
-                    ? "Writing to disk: "
-                    : "Downloading: "}
-                </span>
-                {formatBytes(recvProgress.bytes)}
-                {recvProgress.total !== null && (
-                  <> / {formatBytes(recvProgress.total)}</>
+          {recvProgress && (() => {
+            const remaining =
+              recvProgress.total !== null
+                ? Math.max(0, recvProgress.total - recvProgress.bytes)
+                : 0;
+            const eta =
+              recvProgress.total !== null
+                ? formatEta(remaining, recvSpeed)
+                : null;
+            const phaseLabel =
+              recvProgress.phase === "export"
+                ? "Writing to disk"
+                : "Downloading";
+            return (
+              <div className="progress-box">
+                <div className="progress-header">
+                  <span className="progress-phase">{phaseLabel}</span>
+                  {recvPercent !== null && (
+                    <span className="progress-pct">
+                      {recvPercent.toFixed(1)}%
+                    </span>
+                  )}
+                </div>
+                {recvProgress.total ? (
+                  <progress
+                    value={recvProgress.bytes}
+                    max={recvProgress.total}
+                  />
+                ) : (
+                  // Indeterminate: total unknown until export_size arrives.
+                  <progress />
                 )}
-                {recvPercent !== null && (
-                  <span className="progress-pct">
-                    {" "}
-                    ({recvPercent.toFixed(1)}%)
+                <div className="progress-footer">
+                  <span className="progress-bytes">
+                    {formatBytes(recvProgress.bytes)}
+                    {recvProgress.total !== null && (
+                      <> / {formatBytes(recvProgress.total)}</>
+                    )}
                   </span>
-                )}
-              </p>
-            </div>
-          )}
+                  {recvSpeed !== null && (
+                    <>
+                      <span className="progress-sep">·</span>
+                      <span className="progress-speed">
+                        {formatSpeed(recvSpeed)}
+                      </span>
+                    </>
+                  )}
+                  {eta !== null && (
+                    <>
+                      <span className="progress-sep">·</span>
+                      <span className="progress-eta">ETA {eta}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
 
           <details className="logs">
             <summary>Receive logs ({recvLogs.length})</summary>

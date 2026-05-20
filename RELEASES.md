@@ -1,5 +1,22 @@
 # Releases
 
+## v0.1.62 - 2026-05-19
+- **Full menu bar.** Adds File, View, and Window menus to the OrbitXfer / Edit pair we already had.
+  - **File**: New Transfer Window (⌘N), Resume Last Send Transfer, Close Window (⌘W).
+  - **View**: Enter Full Screen (^⌘F), Actual Size (⌘0), Zoom In (⌘=), Zoom Out (⌘-).
+  - **Window**: Minimize (⌘M), Zoom, plus a dynamic list of every currently-open OrbitXfer window. Each entry is `<title> (<n>)` so windows sharing a title can still be told apart. Selecting an entry brings that window to the front. The list rebuilds automatically when windows open or close.
+  - "Resume Last Send Transfer" is always enabled — clicking it when there's no previously saved send shows a friendly "No previous send to resume" banner instead of failing silently.
+- **Connection mode** is back. The Send panel now has two radio buttons — "Direct + relay fallback (recommended)" and "Direct only (no relay)" — matching the Electron app's behavior. Selection persists across launches (and across windows) via localStorage. Plumbed through to the sidecar via `ORBITXFER_TICKET_MODE`. The explanatory copy under the radios matches the Electron version: *"Transfers are end-to-end encrypted in both modes. Direct-only disables relay fallback, and is true peer-to-peer with no relay server used."*
+- **Real progress counters.** Both Send and Receive panels now show a styled progress box with:
+  - phase label ("Hashing" / "Uploading" for sends; "Downloading" / "Writing to disk" for receives),
+  - percentage,
+  - progress bar (indeterminate when total isn't yet known),
+  - `<current> / <total>` bytes with tabular numerals so digits don't dance,
+  - transfer speed (bytes/sec) computed over a 5-second rolling window,
+  - ETA when the total is known and speed is meaningful.
+- New CLI behavior: `start_send` Tauri command now accepts an optional `connection_mode` parameter and forwards it via the `ORBITXFER_TICKET_MODE` env var on the sidecar. Receive sidecars continue to ignore this env var.
+- Internal: `build_menu()` extracted as a standalone function so it can be re-invoked on window-open / window-destroy to refresh the Window submenu's dynamic list. `open_new_window` Tauri command added so the frontend's "+ New Window" button goes through Rust (which also triggers the menu rebuild).
+
 ## v0.1.61 - 2026-05-19
 - **Per-file persistent identity** replaces v0.1.60's single global identity. Every file you send now gets its own iroh identity key, stored under `<app-data>/file-identities/<content-hash>.key`. Same file → same identity → same share ticket (re-send the same file weeks later, get the identical ticket). Different file → *different* identity, so two recipients of different files cannot cross-link to each other through your Node ID.
 - Receives stay fully ephemeral as before — receivers don't need a stable identity, and not having one means no fingerprint exposure on the receiving side.

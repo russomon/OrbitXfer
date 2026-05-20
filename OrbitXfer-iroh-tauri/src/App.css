@@ -301,22 +301,58 @@ button:disabled {
 
 .progress-box {
   margin-top: 12px;
+  padding: 12px 14px;
+  background: rgba(0, 0, 0, 0.03);
+  border-radius: 8px;
 }
 
 .progress-box progress {
   width: 100%;
-  height: 10px;
+  height: 12px;
+  margin: 6px 0;
 }
 
-.progress-label {
-  margin: 6px 0 0;
+.progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
   font-size: 0.85rem;
-  color: #4b5563;
 }
 
 .progress-phase {
   color: #4b5563;
   font-weight: 500;
+}
+
+.progress-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  font-size: 0.8rem;
+  color: #4b5563;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-bytes {
+  font-feature-settings: "tnum";
+}
+
+.progress-speed,
+.progress-eta {
+  color: #6b7280;
+}
+
+.progress-sep {
+  color: #d1d5db;
+}
+
+/* Legacy .progress-label is no longer rendered, but the rule stays as a
+   no-op safety net in case any older code path is still emitting it. */
+.progress-label {
+  margin: 6px 0 0;
+  font-size: 0.85rem;
+  color: #4b5563;
 }
 
 .diagnostic {
@@ -403,6 +439,84 @@ button:disabled {
   }
 }
 
+.menu-banner {
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  background: rgba(59, 130, 246, 0.08);
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  color: #1d4ed8;
+  border-radius: 8px;
+  animation: reset-banner-in 200ms ease-out;
+}
+
+@media (prefers-color-scheme: dark) {
+  .menu-banner {
+    background: rgba(96, 165, 250, 0.12);
+    border-color: rgba(96, 165, 250, 0.3);
+    color: #93c5fd;
+  }
+}
+
+.connection-mode {
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 0 0 16px;
+}
+
+.connection-mode legend {
+  padding: 0 6px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: #4b5563;
+}
+
+.connection-mode label {
+  display: block;
+  font-size: 0.9rem;
+  padding: 4px 0;
+  cursor: pointer;
+}
+
+.connection-mode input[type="radio"] {
+  margin-right: 8px;
+  cursor: pointer;
+}
+
+.connection-mode .recommended {
+  font-size: 0.8rem;
+  color: #6b7280;
+  font-style: italic;
+}
+
+.connection-mode .hint {
+  margin: 10px 0 0;
+  font-size: 0.8rem;
+  color: #6b7280;
+  line-height: 1.45;
+}
+
+.connection-mode:disabled label,
+.connection-mode[disabled] label {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+@media (prefers-color-scheme: dark) {
+  .connection-mode {
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+  .connection-mode legend {
+    color: #c0c5cc;
+  }
+  .connection-mode .recommended,
+  .connection-mode .hint {
+    color: #9ca3af;
+  }
+}
+
 @media (prefers-color-scheme: dark) {
   .resume-button {
     background: rgba(96, 165, 250, 0.12);
@@ -433,14 +547,30 @@ button:disabled {
 }
 
 .progress-pct {
-  color: #6b7280;
+  color: #1f2937;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
 }
 
 @media (prefers-color-scheme: dark) {
-  .progress-label {
+  .progress-box {
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .progress-label,
+  .progress-footer {
+    color: #c0c5cc;
+  }
+  .progress-phase {
     color: #c0c5cc;
   }
   .progress-pct {
+    color: #f3f4f6;
+  }
+  .progress-speed,
+  .progress-eta {
     color: #9ca3af;
+  }
+  .progress-sep {
+    color: #4b5563;
   }
 }
