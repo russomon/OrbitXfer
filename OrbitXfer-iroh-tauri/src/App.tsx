@@ -814,6 +814,24 @@ function App() {
       setRecvStatus("error");
       return;
     }
+
+    // If the ticket carries a filename, override whatever basename the
+    // user picked in the save dialog. The user picks the FOLDER; the
+    // filename comes from the ticket so the received file keeps its
+    // original name and extension. Fixes the "saved as Untitled" footgun
+    // when the user clicked Pick destination before pasting the ticket.
+    let finalDest = dest;
+    if (parsed?.suggestedName) {
+      const destBasename = basename(dest);
+      if (destBasename !== parsed.suggestedName) {
+        const destDir = dest.substring(
+          0,
+          dest.length - destBasename.length
+        );
+        finalDest = destDir + parsed.suggestedName;
+        setOutputPath(finalDest);
+      }
+    }
     setRecvStatus("connecting");
     setRecvProgress(null);
     setRecvError(null);
@@ -821,10 +839,10 @@ function App() {
     setRecvSpeed(null);
     recvSpeedRef.current = [];
     try {
-      await invoke("start_receive", { ticket, outputPath: dest });
+      await invoke("start_receive", { ticket, outputPath: finalDest });
       const entry: LastReceive = {
         ticketInput: rawInput,
-        outputPath: dest,
+        outputPath: finalDest,
         savedAt: Date.now(),
       };
       saveJson(LS_LAST_RECV, entry);
@@ -1227,6 +1245,13 @@ function App() {
                     </>
                   )}
                 </div>
+                {recvProgress.phase === "download" &&
+                  recvProgress.total === null && (
+                    <p className="progress-hint">
+                      Total size becomes known once the download finishes
+                      — the bar shows activity until then.
+                    </p>
+                  )}
               </div>
             );
           })()}

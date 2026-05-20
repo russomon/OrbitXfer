@@ -30,7 +30,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.63";
+const CLI_VERSION: &str = "0.1.64";
 
 fn print_usage() {
     eprintln!("Usage:");
@@ -178,6 +178,45 @@ fn ticket_mode_from_env() -> String {
         return "relay_only".to_string();
     }
     "full".to_string()
+}
+
+/// Rate-limits progress event emission so a fast transfer (or a download
+/// at multi-Gbit speeds) doesn't drown the parent's stdin reader and the
+/// UI thread in events. Emits when either 4 MB has accumulated OR 500 ms
+/// has elapsed since the last emit, whichever comes first.
+///
+/// The send-side hashing/upload loops already use this same pattern
+/// inline. This struct factors it out so the receive-side download and
+/// export loops can apply identical throttling without copy-pasting.
+/// Without it, a 26 GB receive at ~350 MB/s on loopback freezes the
+/// webview because iroh's progress stream emits thousands of events
+/// per second.
+struct ProgressThrottle {
+    last_emit_bytes: u64,
+    last_emit_at: Instant,
+}
+
+impl ProgressThrottle {
+    fn new() -> Self {
+        Self {
+            last_emit_bytes: 0,
+            last_emit_at: Instant::now(),
+        }
+    }
+
+    fn should_emit(&mut self, bytes: u64) -> bool {
+        const STEP_BYTES: u64 = 4 * 1024 * 1024;
+        const STEP_TIME: Duration = Duration::from_millis(500);
+        let by_bytes = bytes.saturating_sub(self.last_emit_bytes) >= STEP_BYTES;
+        let by_time = self.last_emit_at.elapsed() >= STEP_TIME;
+        if by_bytes || by_time {
+            self.last_emit_bytes = bytes;
+            self.last_emit_at = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn emit_line(line: &str) {
@@ -752,6 +791,7 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
             .fetch(conn, ticket.hash_and_format())
             .stream();
         let mut connected = false;
+        let mut throttle = ProgressThrottle::new();
         while let Some(item) = stream.next().await {
             match item {
                 GetProgressItem::Progress(bytes) => {
@@ -759,11 +799,13 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
                         connected = true;
                         emit_event(json!({ "type": "connect_success" }));
                     }
-                    emit_event(json!({
-                        "type": "download_progress",
-                        "bytes": bytes,
-                        "total": total_size
-                    }));
+                    if throttle.should_emit(bytes) {
+                        emit_event(json!({
+                            "type": "download_progress",
+                            "bytes": bytes,
+                            "total": total_size
+                        }));
+                    }
                 }
                 GetProgressItem::Done(_) => {
                     if !connected {
@@ -829,6 +871,7 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
         let mut download_error: Option<anyhow::Error> = None;
         let mut providers_tried = 0u32;
         let mut providers_failed = 0u32;
+        let mut downloader_throttle = ProgressThrottle::new();
         while let Some(item) = stream.next().await {
             match item {
                 DownloadProgressItem::TryProvider { id, .. } => {
@@ -864,11 +907,13 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
                         connected = true;
                         emit_event(json!({ "type": "connect_success" }));
                     }
-                    emit_event(json!({
-                        "type": "download_progress",
-                        "bytes": bytes,
-                        "total": total_size
-                    }));
+                    if downloader_throttle.should_emit(bytes) {
+                        emit_event(json!({
+                            "type": "download_progress",
+                            "bytes": bytes,
+                            "total": total_size
+                        }));
+                    }
                 }
                 DownloadProgressItem::DownloadError => {
                     download_error = Some(anyhow!("download error"));
@@ -933,6 +978,7 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
         .stream()
         .await;
     let mut export_total: Option<u64> = None;
+    let mut export_throttle = ProgressThrottle::new();
     while let Some(item) = export_stream.next().await {
         match item {
             ExportProgressItem::Size(size) => {
@@ -940,11 +986,13 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
                 emit_event(json!({ "type": "export_size", "total": size }));
             }
             ExportProgressItem::CopyProgress(bytes) => {
-                emit_event(json!({
-                    "type": "export_progress",
-                    "bytes": bytes,
-                    "total": export_total
-                }));
+                if export_throttle.should_emit(bytes) {
+                    emit_event(json!({
+                        "type": "export_progress",
+                        "bytes": bytes,
+                        "total": export_total
+                    }));
+                }
             }
             ExportProgressItem::Done => {
                 emit_event(json!({ "type": "export_complete", "total": export_total }));

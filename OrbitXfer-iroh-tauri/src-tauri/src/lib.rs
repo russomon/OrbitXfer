@@ -514,16 +514,32 @@ fn run_sidecar(
     slot: Slot,
     ticket_mode: Option<&str>,
 ) -> Result<(), String> {
-    let store_dir = store_dir_for(app, &label)?;
     let mut sidecar = app
         .shell()
         .sidecar("orbitxfer-iroh-cli")
-        .map_err(|e| format!("sidecar lookup failed: {e}"))?
-        .env("ORBITXFER_STORE_DIR", store_dir.to_string_lossy().as_ref());
+        .map_err(|e| format!("sidecar lookup failed: {e}"))?;
 
-    // Per-file persistent identity is only meaningful for sends — receives
-    // are clients that benefit from a fresh ephemeral identity each time.
     if matches!(slot, Slot::Send) {
+        // Sends need per-window FsStore isolation so concurrent sends
+        // across multiple windows can't collide on a shared store's
+        // exclusive flock. Receives don't have this problem (each
+        // receive has its own destination dir), and forcing them into
+        // the per-window store has two downsides:
+        //   (1) cache lives invisibly in <app-data> instead of the
+        //       visible `<destination>.orbitxfer-pieces/` folder that
+        //       the v0.1.55 design intended;
+        //   (2) auto-cleanup-on-success in the CLI only fires for the
+        //       per-destination store, so receives in the per-window
+        //       store leave a full copy of the file lingering in
+        //       <app-data> until the next app startup wipes store-*.
+        // So: ONLY sends get ORBITXFER_STORE_DIR. Receives use the
+        // CLI's default per-destination behavior.
+        let store_dir = store_dir_for(app, &label)?;
+        sidecar = sidecar.env(
+            "ORBITXFER_STORE_DIR",
+            store_dir.to_string_lossy().as_ref(),
+        );
+
         let dir = per_file_identity_dir(app)?;
         sidecar = sidecar.env(
             "ORBITXFER_PER_FILE_IDENTITY_DIR",

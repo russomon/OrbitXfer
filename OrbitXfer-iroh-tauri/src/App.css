@@ -376,6 +376,20 @@ button:disabled {
   color: #d1d5db;
 }
 
+.progress-hint {
+  margin: 8px 0 0;
+  font-size: 0.75rem;
+  font-style: italic;
+  color: #6b7280;
+  line-height: 1.45;
+}
+
+@media (prefers-color-scheme: dark) {
+  .progress-hint {
+    color: #9ca3af;
+  }
+}
+
 /* Legacy .progress-label is no longer rendered, but the rule stays as a
    no-op safety net in case any older code path is still emitting it. */
 .progress-label {
