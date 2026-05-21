@@ -30,7 +30,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.64";
+const CLI_VERSION: &str = "0.1.65";
 
 fn print_usage() {
     eprintln!("Usage:");
@@ -492,11 +492,19 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
         None
     };
     let full_ticket = BlobTicket::new(full_addr.clone(), hash, format).to_string();
+    // `total` is the canonical payload size from `std::fs::metadata().len()`
+    // at the start of hashing. We surface it here so the frontend can
+    // append `# size=<N>` to the share line — the receiver parses that to
+    // seed its progress total immediately on paste, before the CLI is even
+    // spawned. Without it the receiver UI doesn't know the denominator
+    // until the provider's `observe()` round-trip lands, which on a relay
+    // path can be several seconds in.
     emit_event(json!({
         "type": "ticket_variants",
         "direct": direct_ticket,
         "relay": relay_ticket,
-        "full": full_ticket
+        "full": full_ticket,
+        "total": total_size
     }));
 
     let mode = ticket_mode_from_env();
@@ -534,6 +542,15 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
         "total": total_size
     }));
 
+    // Canonical total is set once from the file's metadata length (the same
+    // value emitted via `ticket_variants.total` and embedded in the share
+    // line as `# size=<N>`). We deliberately do NOT overwrite this from
+    // `RequestUpdate::Started.size` later — both sides need the exact same
+    // denominator for their percentages to stay visually aligned during the
+    // transfer, and `started.size` is iroh's view of the blob (which can
+    // differ by chunk-padding/encoding details in some formats). The
+    // `upload_started` event still carries `started.size` so logs can show
+    // the protocol-level view if it ever diverges.
     let upload_total = Arc::new(AtomicU64::new(total_size.unwrap_or(0)));
     let upload_total_events = upload_total.clone();
     let spawn_updates = |mut rx: mpsc::Receiver<RequestUpdate>, total: Arc<AtomicU64>| {
@@ -542,8 +559,14 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
             while let Ok(Some(update)) = rx.recv().await {
                 match update {
                     RequestUpdate::Started(started) => {
-                        total.store(started.size, Ordering::Relaxed);
-                        emit_event(json!({ "type": "upload_started", "total": started.size }));
+                        // Surface iroh's started.size for transparency but
+                        // do NOT mutate `total` — the canonical metadata
+                        // size stays pinned.
+                        emit_event(json!({
+                            "type": "upload_started",
+                            "total": total.load(Ordering::Relaxed),
+                            "iroh_size": started.size
+                        }));
                     }
                     RequestUpdate::Progress(progress) => {
                         let bytes = progress.end_offset;

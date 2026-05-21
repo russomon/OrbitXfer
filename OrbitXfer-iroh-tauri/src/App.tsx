@@ -102,15 +102,24 @@ function saveJson<T>(key: string, value: T) {
 interface ParsedReceiveInput {
   ticket: string;
   suggestedName: string | null;
+  /// Canonical payload size extracted from the share line's `# size=<N>`
+  /// suffix, when present. Lets the receiver UI seed its progress total
+  /// the instant the ticket is pasted (before `start_receive` is even
+  /// invoked), so the receive percentage uses the same denominator as
+  /// the sender's upload percentage. null when the share line predates
+  /// v0.1.65 or someone shared the bare ticket.
+  canonicalSize: number | null;
 }
 
-// Extract a blob ticket — and, if present, a suggested filename — from
-// arbitrary input. The ticket itself is just a hash + node ID + relay info;
-// the filename does NOT travel inside it. We rely on the CLI's existing
+// Extract a blob ticket — and, if present, a suggested filename and
+// canonical payload size — from arbitrary input. The ticket itself is
+// just a hash + node ID + relay info; the filename and size do NOT travel
+// inside it. We rely on the CLI's existing
 // "orbitxfer-iroh-cli receive <ticket> <path>" share format to carry the
-// filename alongside the ticket. Anything after the ticket that looks
-// path-like (has a separator) or filename-like (has an extension) becomes
-// the suggested name.
+// filename, and we append a `# size=<bytes>` shell-comment suffix to carry
+// the canonical payload size. Backward-compatible: an old client missing
+// the size suffix still parses fine; the receiver just waits for observe()
+// to learn the total like before.
 function parseReceiveInput(input: string): ParsedReceiveInput | null {
   const trimmed = input.trim();
   if (!trimmed) return null;
@@ -118,10 +127,22 @@ function parseReceiveInput(input: string): ParsedReceiveInput | null {
   if (!match) return null;
   const ticket = match[0];
 
-  const after = trimmed
+  let after = trimmed
     .slice(match.index! + ticket.length)
     .trim()
     .replace(/^['"]|['"]$/g, "");
+
+  // Extract `# size=<N>` first, then strip it out so the basename
+  // logic below doesn't see "12345" as a filename. The pattern is
+  // intentionally loose about spaces so a manually-edited share line
+  // still parses.
+  let canonicalSize: number | null = null;
+  const sizeMatch = after.match(/#\s*size\s*=\s*(\d+)/i);
+  if (sizeMatch) {
+    const n = Number(sizeMatch[1]);
+    if (Number.isFinite(n) && n >= 0) canonicalSize = n;
+    after = after.replace(/#\s*size\s*=\s*\d+.*$/i, "").trim();
+  }
 
   let suggestedName: string | null = null;
   if (after) {
@@ -133,7 +154,7 @@ function parseReceiveInput(input: string): ParsedReceiveInput | null {
     }
   }
 
-  return { ticket, suggestedName };
+  return { ticket, suggestedName, canonicalSize };
 }
 
 function formatBytes(bytes: number): string {
@@ -256,6 +277,12 @@ function App() {
   const [sendProgress, setSendProgress] = useState<SendProgress | null>(null);
   const [sendSpeed, setSendSpeed] = useState<number | null>(null);
   const sendSpeedRef = useRef<SpeedSample[]>([]);
+  // Canonical payload size from the local file's metadata. Captured at
+  // hashing time so we can both (a) keep the upload progress denominator
+  // pinned across phases and (b) embed it in the share line's `# size=<N>`
+  // suffix. null until the CLI's `ticket_variants` (or earlier
+  // `ticket_hashing_size`) event arrives.
+  const [sendTotalSize, setSendTotalSize] = useState<number | null>(null);
 
   // Receive state
   const [ticketInput, setTicketInput] = useState("");
@@ -423,9 +450,36 @@ function App() {
   // picked a destination, auto-fill ~/Downloads/<filename>. This means the
   // received file keeps its original name and extension without the user
   // having to click Pick destination at all. They can still override.
+  //
+  // Also, if the share line carries a `# size=<N>` suffix, seed the
+  // receive progress total from it RIGHT NOW — before the user hits
+  // Start Receive, before the sidecar is spawned, before observe()
+  // round-trips to the provider. This keeps the receiver's percentage
+  // denominator identical to the sender's the moment the ticket is
+  // pasted, so the two progress bars stay visually aligned through the
+  // whole transfer.
   useEffect(() => {
-    if (userPickedDest.current) return;
     const parsed = parseReceiveInput(ticketInput);
+
+    // Size seed is independent of the destination-auto-fill. Apply it
+    // only while we're still idle/error so we don't clobber a live
+    // recvProgress mid-transfer if the user happens to edit the ticket
+    // textarea.
+    if (parsed?.canonicalSize !== undefined && parsed?.canonicalSize !== null) {
+      if (recvStatus === "idle" || recvStatus === "error") {
+        setRecvProgress({
+          bytes: 0,
+          total: parsed.canonicalSize,
+          phase: "download",
+        });
+      }
+    } else if (recvStatus === "idle") {
+      // Ticket has no size hint and we're idle; clear any stale seed
+      // from a previous paste.
+      setRecvProgress(null);
+    }
+
+    if (userPickedDest.current) return;
     if (!parsed?.suggestedName) {
       // Ticket without filename info; clear any previously auto-filled path.
       if (outputPath !== null) setOutputPath(null);
@@ -473,6 +527,10 @@ function App() {
             setSendProgress({ phase: "hashing", bytes: 0, total: null });
             break;
           case "ticket_hashing_size":
+            // First authoritative reading of the file's payload size.
+            // Cache it now so we can embed it in the share line even
+            // before `ticket_variants` arrives.
+            if (total !== null) setSendTotalSize(total);
             setSendProgress((prev) => ({
               phase: "hashing",
               bytes: prev?.bytes ?? 0,
@@ -506,6 +564,10 @@ function App() {
               relay: parsed.relay ?? null,
               full: parsed.full,
             });
+            // Confirm the canonical total. `ticket_hashing_size` already
+            // set it once; we refresh here in case the source of truth
+            // (e.g. a slightly different store-reported size) shifted.
+            if (total !== null) setSendTotalSize(total);
             setSendStatus("ticket_ready");
             // Clear hashing progress — it's done and the ticket is the
             // main signal now.
@@ -717,6 +779,7 @@ function App() {
       setTickets(null);
       setSendError(null);
       setSendStatus("idle");
+      setSendTotalSize(null);
     }
   }
 
@@ -728,6 +791,7 @@ function App() {
     setSendProgress(null);
     setSendSpeed(null);
     sendSpeedRef.current = [];
+    setSendTotalSize(null);
     try {
       await invoke("start_send", {
         filePath: targetPath,
@@ -833,13 +897,31 @@ function App() {
       }
     }
     setRecvStatus("connecting");
-    setRecvProgress(null);
+    // Keep the size-seeded total if we have one. Reset bytes to 0 but
+    // preserve the denominator so the bar doesn't jump to indeterminate
+    // for a frame between Start Receive and the first download_size /
+    // download_progress event from the CLI.
+    const seededTotal = parsed?.canonicalSize ?? null;
+    setRecvProgress(
+      seededTotal !== null
+        ? { bytes: 0, total: seededTotal, phase: "download" }
+        : null
+    );
     setRecvError(null);
     setRecvLogs([]);
     setRecvSpeed(null);
     recvSpeedRef.current = [];
     try {
-      await invoke("start_receive", { ticket, outputPath: finalDest });
+      // Pass expectedSize so the CLI seeds its own download total from
+      // the same canonical value and emits `download_size` immediately —
+      // long before observe() lands. Both sides now share the exact
+      // same denominator. Pass undefined when missing so Tauri's serde
+      // sees Option<u64>::None rather than 0.
+      await invoke("start_receive", {
+        ticket,
+        outputPath: finalDest,
+        expectedSize: seededTotal !== null ? seededTotal : undefined,
+      });
       const entry: LastReceive = {
         ticketInput: rawInput,
         outputPath: finalDest,
@@ -1081,22 +1163,28 @@ function App() {
             <div className="ticket-box">
               <h3>Share this with the recipient</h3>
               <p className="hint">
-                The line below carries the ticket and the filename, so the
-                receiving side can suggest a save name. If the recipient pastes
-                it into OrbitXfer's Receive panel, the filename comes through.
+                The line below carries the ticket, filename, and canonical
+                size, so the recipient's Receive panel can suggest a save
+                name and seed its progress total instantly. The `# size=…`
+                suffix is a shell comment — the CLI ignores it, OrbitXfer
+                reads it.
               </p>
               <textarea
                 readOnly
                 value={
                   filePath
-                    ? `orbitxfer-iroh-cli receive ${tickets.full} ${basename(filePath)}`
+                    ? `orbitxfer-iroh-cli receive ${tickets.full} ${basename(filePath)}${
+                        sendTotalSize !== null
+                          ? `  # size=${sendTotalSize}`
+                          : ""
+                      }`
                     : tickets.full
                 }
                 onClick={(e) => (e.target as HTMLTextAreaElement).select()}
                 rows={3}
               />
               <details>
-                <summary>just the bare ticket (no filename)</summary>
+                <summary>just the bare ticket (no filename or size)</summary>
                 <textarea readOnly value={tickets.full} rows={3} />
               </details>
               {tickets.direct && (

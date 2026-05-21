@@ -506,6 +506,28 @@ fn release_keep_awake(app: &AppHandle) {
     }
 }
 
+/// Extra per-receive overrides that the Tauri command layer can pass to
+/// the CLI sidecar. All None for the default flow (fresh receive into a
+/// previously-unused destination); populated for resume, explicit
+/// custom-store, or known-size flows.
+#[derive(Default)]
+struct ReceiveOverrides {
+    /// Canonical payload size from the share line's `# size=<N>` suffix.
+    /// When set, the CLI seeds its progress total from this value
+    /// immediately and emits `download_size` before observing the provider
+    /// — so the receiver's denominator matches the sender's from frame 0.
+    expected_size: Option<u64>,
+    /// Custom store directory for the receive blob staging area. The
+    /// default behavior (None) is for the CLI to compute
+    /// `<destination>.orbitxfer-pieces/` next to the chosen destination
+    /// AND auto-clean it up on successful finalize. Set this only for:
+    ///   - explicit custom-store override (advanced users), or
+    ///   - intentional resume targeting a known `.orbitxfer-pieces` path
+    ///     where the CLI's auto-cleanup is undesired.
+    /// When set, the CLI honors the path verbatim and skips auto-cleanup.
+    store_dir: Option<String>,
+}
+
 fn run_sidecar(
     app: &AppHandle,
     label: String,
@@ -513,6 +535,7 @@ fn run_sidecar(
     event_prefix: &'static str,
     slot: Slot,
     ticket_mode: Option<&str>,
+    recv_overrides: ReceiveOverrides,
 ) -> Result<(), String> {
     let mut sidecar = app
         .shell()
@@ -532,8 +555,10 @@ fn run_sidecar(
         //       per-destination store, so receives in the per-window
         //       store leave a full copy of the file lingering in
         //       <app-data> until the next app startup wipes store-*.
-        // So: ONLY sends get ORBITXFER_STORE_DIR. Receives use the
-        // CLI's default per-destination behavior.
+        // So: ONLY sends get ORBITXFER_STORE_DIR by default. Receives
+        // use the CLI's default per-destination behavior unless an
+        // explicit override is passed via ReceiveOverrides.store_dir
+        // (advanced users / resume scenarios).
         let store_dir = store_dir_for(app, &label)?;
         sidecar = sidecar.env(
             "ORBITXFER_STORE_DIR",
@@ -552,6 +577,28 @@ fn run_sidecar(
         // CLI, so we only forward an explicit value.
         if let Some(mode) = ticket_mode {
             sidecar = sidecar.env("ORBITXFER_TICKET_MODE", mode);
+        }
+    } else {
+        // Receive sidecar. Only set env vars when the frontend explicitly
+        // asked us to — the CLI defaults handle the fresh-receive case:
+        //   - no ORBITXFER_STORE_DIR → CLI builds
+        //     `<destination>.orbitxfer-pieces/` and auto-cleans it after
+        //     a successful finalize.
+        //   - no ORBITXFER_EXPECTED_SIZE → CLI waits for the provider's
+        //     `observe()` to learn the total.
+        // Both env vars get set when the frontend has authoritative info:
+        //   - expected_size: parsed from the share line's `# size=<N>`.
+        //     Receiver UI seeds its total from the same value too, so the
+        //     denominator matches the sender's instantly.
+        //   - store_dir: passed when the user explicitly opts into a
+        //     custom store path or when resuming into an existing
+        //     `<destination>.orbitxfer-pieces/` (no UI for either yet —
+        //     the param is here so we don't have to plumb it later).
+        if let Some(size) = recv_overrides.expected_size {
+            sidecar = sidecar.env("ORBITXFER_EXPECTED_SIZE", size.to_string());
+        }
+        if let Some(dir) = recv_overrides.store_dir.as_deref() {
+            sidecar = sidecar.env("ORBITXFER_STORE_DIR", dir);
         }
     }
 
@@ -621,6 +668,7 @@ async fn start_send(
         "send",
         Slot::Send,
         mode_ref,
+        ReceiveOverrides::default(),
     )
 }
 
@@ -647,6 +695,8 @@ async fn start_receive(
     window: WebviewWindow,
     ticket: String,
     output_path: String,
+    expected_size: Option<u64>,
+    store_dir: Option<String>,
 ) -> Result<(), String> {
     run_sidecar(
         &app,
@@ -655,6 +705,10 @@ async fn start_receive(
         "recv",
         Slot::Recv,
         None,
+        ReceiveOverrides {
+            expected_size,
+            store_dir,
+        },
     )
 }
 
