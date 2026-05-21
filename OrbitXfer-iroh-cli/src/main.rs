@@ -30,7 +30,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.65";
+const CLI_VERSION: &str = "0.1.66";
 
 fn print_usage() {
     eprintln!("Usage:");
@@ -556,6 +556,15 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
     let spawn_updates = |mut rx: mpsc::Receiver<RequestUpdate>, total: Arc<AtomicU64>| {
         tokio::spawn(async move {
             let mut last_progress = 0u64;
+            // Mirrors the receive-side throttling added in v0.1.64. iroh's
+            // RequestUpdate::Progress fires per chunk/packet, which on a
+            // multi-Gbit/s send is tens of thousands of events per second —
+            // enough to drown the Tauri webview's JS thread and freeze the
+            // Send window's progress bar mid-transfer (the data still flows
+            // fine; only the UI hangs). Gate at 4 MB / 500 ms whichever
+            // first. RequestUpdate::Completed below is NOT throttled, so
+            // the final emit always lands and the bar snaps to 100%.
+            let mut throttle = ProgressThrottle::new();
             while let Ok(Some(update)) = rx.recv().await {
                 match update {
                     RequestUpdate::Started(started) => {
@@ -574,6 +583,9 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
                             continue;
                         }
                         last_progress = bytes;
+                        if !throttle.should_emit(bytes) {
+                            continue;
+                        }
                         let total_val = total.load(Ordering::Relaxed);
                         let total_opt = if total_val > 0 { Some(total_val) } else { None };
                         emit_event(json!({
