@@ -1,5 +1,11 @@
 # Releases
 
+## v0.1.67 - 2026-05-20
+- **Connection mode is now three choices and actually changes the shared ticket.** The Send panel's radios are now: *Direct + Relay fallback (recommended)*, *Relay only (no direct IPs)*, and *Direct only (no relay)*. Previously the radio only ever produced the full ticket regardless of selection — the mode was effectively a no-op for what you shared. Now the main share line renders the variant matching the selected mode, and switching the radio updates it **instantly** (no re-send): the CLI already emits all three address variants with every send, so this is a pure client-side pick.
+  - If the preferred variant isn't available (e.g. no direct IPs behind certain NATs), the share line falls back to the full ticket and shows a note explaining why.
+- **Auto-shown mode descriptions.** The explanatory text for whichever mode is currently selected appears beneath that radio (the other two stay hidden). No click-to-expand. A persistent footer reminds the user all three modes are end-to-end encrypted — the relay can never read file contents, it only routes the connection.
+- **Removed the bare/direct/relay ticket disclosure fields.** With the share line now reflecting the chosen mode directly, the three "just the bare ticket / direct ticket / relay ticket" expandable textareas under the share box are gone — they were a manual workaround for the bug above and are now redundant.
+
 ## v0.1.66 - 2026-05-20
 - **Send-side progress bar no longer freezes on fast transfers.** The CLI's `upload_progress` emit path now uses the same `ProgressThrottle` (4 MB / 500 ms gate) we already had on the receive side. Background: at multi-Gbit/s, iroh's `RequestUpdate::Progress` fires per chunk/packet — tens of thousands of events per second — which drowned the Tauri webview's JS thread and stalled the Send window's progress UI partway through (the actual transfer kept running fine; the receiver still finished). Same root cause as the v0.1.64 receive-side freeze; we just hadn't applied the throttle to the send loop too. `RequestUpdate::Completed` is unthrottled so the final 100% snap always lands.
 

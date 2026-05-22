@@ -30,7 +30,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.66";
+const CLI_VERSION: &str = "0.1.67";
 
 fn print_usage() {
     eprintln!("Usage:");

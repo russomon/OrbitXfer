@@ -10,18 +10,31 @@ import "./App.css";
 
 type Mode = "send" | "receive";
 type SendStatus = "idle" | "sending" | "ticket_ready" | "complete" | "error";
-type ConnectionMode = "full" | "direct_only";
+type ConnectionMode = "full" | "relay_only" | "direct_only";
 
 const LS_CONNECTION_MODE = "orbitxfer.connectionMode.v1";
 
 function loadConnectionMode(): ConnectionMode {
   try {
     const v = localStorage.getItem(LS_CONNECTION_MODE);
-    return v === "direct_only" ? "direct_only" : "full";
+    if (v === "direct_only" || v === "relay_only" || v === "full") return v;
+    return "full";
   } catch {
     return "full";
   }
 }
+
+// Per-mode explanatory copy, auto-shown beneath whichever radio is
+// currently selected (no click-to-expand — the description for the active
+// choice is always visible, the other two are hidden).
+const CONNECTION_MODE_DESCRIPTIONS: Record<ConnectionMode, string> = {
+  full:
+    "A direct peer-to-peer link when the network allows it; uses the relay only if it has to. Recommended for most transfers.",
+  relay_only:
+    "Routes through iroh's relay to get connected, with a direct upgrade happening in the background whenever the network allows it. The most firewall- and NAT-friendly choice, and your IP addresses stay out of the ticket.",
+  direct_only:
+    "True peer-to-peer with zero relay involvement. Same direct attempt as the recommended mode, but with no safety net: a blocked path means a failed transfer. Great on a shared/local network.",
+};
 type RecvStatus =
   | "idle"
   | "connecting"
@@ -975,6 +988,25 @@ function App() {
 
   const sendBusy = sendStatus === "sending";
 
+  // Pick which ticket variant to put in the share line based on the
+  // selected connection mode. The CLI emits all three variants (full /
+  // relay / direct) with every send, so toggling the radio re-renders
+  // this instantly — no re-send needed. If the preferred variant isn't
+  // available (e.g. no direct IPs behind certain NATs), fall back to the
+  // full ticket and flag it so the user knows why.
+  const selectedTicket: string | null = !tickets
+    ? null
+    : connectionMode === "direct_only"
+    ? tickets.direct ?? tickets.full
+    : connectionMode === "relay_only"
+    ? tickets.relay ?? tickets.full
+    : tickets.full;
+
+  const ticketFellBack =
+    tickets !== null &&
+    ((connectionMode === "direct_only" && !tickets.direct) ||
+      (connectionMode === "relay_only" && !tickets.relay));
+
   return (
     <main className="container">
       <header className="app-header">
@@ -1047,6 +1079,7 @@ function App() {
 
           <fieldset className="connection-mode" disabled={sendBusy}>
             <legend>Connection mode</legend>
+
             <label>
               <input
                 type="radio"
@@ -1055,8 +1088,31 @@ function App() {
                 checked={connectionMode === "full"}
                 onChange={() => setConnectionMode("full")}
               />
-              Direct + relay fallback <span className="recommended">(recommended)</span>
+              Direct + Relay fallback{" "}
+              <span className="recommended">(recommended)</span>
             </label>
+            {connectionMode === "full" && (
+              <p className="hint connection-desc">
+                {CONNECTION_MODE_DESCRIPTIONS.full}
+              </p>
+            )}
+
+            <label>
+              <input
+                type="radio"
+                name={`conn-${win.label}`}
+                value="relay_only"
+                checked={connectionMode === "relay_only"}
+                onChange={() => setConnectionMode("relay_only")}
+              />
+              Relay only (no direct IPs)
+            </label>
+            {connectionMode === "relay_only" && (
+              <p className="hint connection-desc">
+                {CONNECTION_MODE_DESCRIPTIONS.relay_only}
+              </p>
+            )}
+
             <label>
               <input
                 type="radio"
@@ -1067,10 +1123,15 @@ function App() {
               />
               Direct only (no relay)
             </label>
+            {connectionMode === "direct_only" && (
+              <p className="hint connection-desc">
+                {CONNECTION_MODE_DESCRIPTIONS.direct_only}
+              </p>
+            )}
+
             <p className="hint">
-              Transfers are end-to-end encrypted in both modes. Direct-only
-              disables relay fallback, and is true peer-to-peer with no relay
-              server used.
+              All three modes are end-to-end encrypted — the relay can never
+              read your files, it only helps route the connection.
             </p>
           </fieldset>
 
@@ -1159,7 +1220,7 @@ function App() {
             );
           })()}
 
-          {tickets && (
+          {tickets && selectedTicket && (
             <div className="ticket-box">
               <h3>Share this with the recipient</h3>
               <p className="hint">
@@ -1167,37 +1228,29 @@ function App() {
                 size, so the recipient's Receive panel can suggest a save
                 name and seed its progress total instantly. The `# size=…`
                 suffix is a shell comment — the CLI ignores it, OrbitXfer
-                reads it.
+                reads it. The ticket reflects the connection mode you picked
+                above; switch the radio to regenerate it instantly.
               </p>
               <textarea
                 readOnly
                 value={
                   filePath
-                    ? `orbitxfer-iroh-cli receive ${tickets.full} ${basename(filePath)}${
+                    ? `orbitxfer-iroh-cli receive ${selectedTicket} ${basename(filePath)}${
                         sendTotalSize !== null
                           ? `  # size=${sendTotalSize}`
                           : ""
                       }`
-                    : tickets.full
+                    : selectedTicket
                 }
                 onClick={(e) => (e.target as HTMLTextAreaElement).select()}
                 rows={3}
               />
-              <details>
-                <summary>just the bare ticket (no filename or size)</summary>
-                <textarea readOnly value={tickets.full} rows={3} />
-              </details>
-              {tickets.direct && (
-                <details>
-                  <summary>direct ticket</summary>
-                  <textarea readOnly value={tickets.direct} />
-                </details>
-              )}
-              {tickets.relay && (
-                <details>
-                  <summary>relay ticket</summary>
-                  <textarea readOnly value={tickets.relay} />
-                </details>
+              {ticketFellBack && (
+                <p className="hint">
+                  {connectionMode === "direct_only"
+                    ? "No direct address is available on this network — sharing the full ticket (direct + relay) instead."
+                    : "No relay address is available — sharing the full ticket (direct + relay) instead."}
+                </p>
               )}
             </div>
           )}

@@ -541,6 +541,15 @@ button:disabled {
   line-height: 1.45;
 }
 
+/* Auto-shown description for the currently-selected connection mode.
+   Indented under the radio with a subtle left rule so it reads as
+   belonging to the option above it. */
+.connection-mode .connection-desc {
+  margin: 2px 0 6px 24px;
+  padding-left: 10px;
+  border-left: 2px solid rgba(0, 0, 0, 0.08);
+}
+
 .connection-mode:disabled label,
 .connection-mode[disabled] label {
   cursor: not-allowed;
