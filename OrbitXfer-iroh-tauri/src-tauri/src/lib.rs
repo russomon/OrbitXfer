@@ -125,7 +125,7 @@ fn handle_app_quit(app: &AppHandle) {
     let app_clone = app.clone();
     app.dialog()
         .message(
-            "Transfers are still in progress. Quit OrbitXfer anyway? \
+            "Transfer(s) may be in progress. Quit OrbitXfer anyway? \
              In-flight sends and receives will be stopped.",
         )
         .title("OrbitXfer")

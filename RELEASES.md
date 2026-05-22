@@ -1,5 +1,10 @@
 # Releases
 
+## v0.1.68 - 2026-05-22
+- **Connection mode always defaults to "Direct + Relay fallback (recommended)".** Every launch and every new window now starts on the recommended mode. The selection is no longer persisted to localStorage — each new window/session begins from the safe default instead of inheriting a previous Relay-only / Direct-only choice.
+- **Clearer quit warning.** The "transfers in progress" quit dialog now reads *"Transfer(s) may be in progress…"* instead of *"Transfers are still in progress…"* — the app can't always be certain a transfer is mid-flight, so the softer wording is more accurate.
+- **Share-box copy tidy-up.** The heading is now *"Send this "Share" Ticket to the recipient:"* and the helper line is trimmed to the essential: *"This ticket reflects the connection mode you picked above; switch the radio button to regenerate it instantly."* (The `# size=…` shell-comment explanation was removed from the UI — it's an implementation detail users don't need.)
+
 ## v0.1.67 - 2026-05-20
 - **Connection mode is now three choices and actually changes the shared ticket.** The Send panel's radios are now: *Direct + Relay fallback (recommended)*, *Relay only (no direct IPs)*, and *Direct only (no relay)*. Previously the radio only ever produced the full ticket regardless of selection — the mode was effectively a no-op for what you shared. Now the main share line renders the variant matching the selected mode, and switching the radio updates it **instantly** (no re-send): the CLI already emits all three address variants with every send, so this is a pure client-side pick.
   - If the preferred variant isn't available (e.g. no direct IPs behind certain NATs), the share line falls back to the full ticket and shows a note explaining why.

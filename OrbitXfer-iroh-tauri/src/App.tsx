@@ -12,18 +12,6 @@ type Mode = "send" | "receive";
 type SendStatus = "idle" | "sending" | "ticket_ready" | "complete" | "error";
 type ConnectionMode = "full" | "relay_only" | "direct_only";
 
-const LS_CONNECTION_MODE = "orbitxfer.connectionMode.v1";
-
-function loadConnectionMode(): ConnectionMode {
-  try {
-    const v = localStorage.getItem(LS_CONNECTION_MODE);
-    if (v === "direct_only" || v === "relay_only" || v === "full") return v;
-    return "full";
-  } catch {
-    return "full";
-  }
-}
-
 // Per-mode explanatory copy, auto-shown beneath whichever radio is
 // currently selected (no click-to-expand — the description for the active
 // choice is always visible, the other two are hidden).
@@ -250,20 +238,12 @@ function App() {
   // for the other direction.
   const [mode, setMode] = useState<Mode>("send");
 
-  // Connection mode — applies to all sends from this window. Persisted in
-  // localStorage so it's remembered across launches; shared across windows
-  // via the storage event below. Default is "full" (direct + relay
-  // fallback, the recommended mode).
-  const [connectionMode, setConnectionMode] = useState<ConnectionMode>(
-    loadConnectionMode
-  );
-  useEffect(() => {
-    try {
-      localStorage.setItem(LS_CONNECTION_MODE, connectionMode);
-    } catch (e) {
-      console.error("save connectionMode failed:", e);
-    }
-  }, [connectionMode]);
+  // Connection mode — applies to all sends from this window. Always starts
+  // at "full" (Direct + Relay fallback, the recommended mode) on every
+  // launch and every new window. Intentionally NOT persisted: each new
+  // window/session begins from the safe recommended default rather than
+  // inheriting a previous niche choice (Relay-only / Direct-only).
+  const [connectionMode, setConnectionMode] = useState<ConnectionMode>("full");
 
   // Tracks whether the user has explicitly picked a destination via the save
   // dialog. We auto-fill the destination from the parsed ticket's filename,
@@ -1222,14 +1202,10 @@ function App() {
 
           {tickets && selectedTicket && (
             <div className="ticket-box">
-              <h3>Share this with the recipient</h3>
+              <h3>Send this "Share" Ticket to the recipient:</h3>
               <p className="hint">
-                The line below carries the ticket, filename, and canonical
-                size, so the recipient's Receive panel can suggest a save
-                name and seed its progress total instantly. The `# size=…`
-                suffix is a shell comment — the CLI ignores it, OrbitXfer
-                reads it. The ticket reflects the connection mode you picked
-                above; switch the radio to regenerate it instantly.
+                This ticket reflects the connection mode you picked above;
+                switch the radio button to regenerate it instantly.
               </p>
               <textarea
                 readOnly
