@@ -80,6 +80,7 @@ const LS_LAST_RECV = "orbitxfer.lastReceive.v1";
 interface LastSend {
   filePath: string;
   savedAt: number;
+  isFolder?: boolean;
 }
 
 interface LastReceive {
@@ -115,6 +116,12 @@ interface ParsedReceiveInput {
   /// the sender's upload percentage. null when the share line predates
   /// v0.1.65 or someone shared the bare ticket.
   canonicalSize: number | null;
+  /// True when the share line's name token ends with a trailing slash
+  /// (e.g. `MyFolder/`), indicating the ticket is a folder (collection)
+  /// rather than a single file. This is only a UI hint for showing the
+  /// right destination picker; the CLI reads the authoritative file-vs-
+  /// folder flag from the ticket format itself.
+  isFolder: boolean;
 }
 
 // Extract a blob ticket — and, if present, a suggested filename and
@@ -150,17 +157,24 @@ function parseReceiveInput(input: string): ParsedReceiveInput | null {
     after = after.replace(/#\s*size\s*=\s*\d+.*$/i, "").trim();
   }
 
+  // A trailing slash on the name token marks a folder, e.g. `MyFolder/`.
+  // Detect it, then strip it before deriving the basename.
+  let isFolder = false;
   let suggestedName: string | null = null;
   if (after) {
-    const last = basename(after);
-    const hasSeparator = /[/\\]/.test(after);
+    if (/[/\\]\s*$/.test(after)) {
+      isFolder = true;
+    }
+    const cleaned = after.replace(/[/\\]+\s*$/, "");
+    const last = basename(cleaned);
+    const hasSeparator = /[/\\]/.test(cleaned);
     const hasExtension = /\.[\w]{1,10}$/.test(last);
-    if ((hasSeparator || hasExtension) && last && last.length <= 255) {
+    if ((isFolder || hasSeparator || hasExtension) && last && last.length <= 255) {
       suggestedName = last;
     }
   }
 
-  return { ticket, suggestedName, canonicalSize };
+  return { ticket, suggestedName, canonicalSize, isFolder };
 }
 
 function formatBytes(bytes: number): string {
@@ -281,6 +295,11 @@ function App() {
   // suffix. null until the CLI's `ticket_variants` (or earlier
   // `ticket_hashing_size`) event arrives.
   const [sendTotalSize, setSendTotalSize] = useState<number | null>(null);
+  // True when the current send is a folder (collection). Drives the
+  // trailing-slash folder hint in the share line and the file-count label.
+  const [isFolderSend, setIsFolderSend] = useState(false);
+  // Number of files in a folder send, reported by the CLI's hashing events.
+  const [sendFileCount, setSendFileCount] = useState<number | null>(null);
 
   // Receive state
   const [ticketInput, setTicketInput] = useState("");
@@ -413,7 +432,7 @@ function App() {
         if (stored) {
           setMode("send");
           setLastSend(stored);
-          startSendWith(stored.filePath);
+          startSendWith(stored.filePath, stored.isFolder ?? false);
         } else {
           setMenuMessage(
             "No previous send to resume — start a send first."
@@ -517,6 +536,9 @@ function App() {
         const total =
           typeof parsed.total === "number" ? parsed.total : null;
         const bytes = typeof parsed.bytes === "number" ? parsed.bytes : null;
+
+        // Folder sends carry a file count on their hashing events.
+        if (typeof parsed.files === "number") setSendFileCount(parsed.files);
 
         switch (parsed.type) {
           case "ticket_hashing_start":
@@ -774,15 +796,24 @@ function App() {
     const result = await open({ multiple: false, directory: false });
     if (typeof result === "string") {
       // One-step send: picking a file immediately kicks off the transfer.
-      // startSendWith resets tickets/error/logs/progress/size and sets the
-      // status, so we just record the path and go.
       setFilePath(result);
-      await startSendWith(result);
+      await startSendWith(result, false);
     }
   }
 
-  async function startSendWith(targetPath: string) {
+  async function pickFolder() {
+    const result = await open({ multiple: false, directory: true });
+    if (typeof result === "string") {
+      // One-step folder send: the whole folder becomes a HashSeq collection.
+      setFilePath(result);
+      await startSendWith(result, true);
+    }
+  }
+
+  async function startSendWith(targetPath: string, asFolder: boolean) {
     setSendStatus("creating_ticket");
+    setIsFolderSend(asFolder);
+    setSendFileCount(null);
     setTickets(null);
     setSendError(null);
     setSendLogs([]);
@@ -796,8 +827,13 @@ function App() {
         connectionMode,
       });
       // Persist the path on successful spawn — even if the transfer is later
-      // interrupted, the user can resume with one click.
-      const entry: LastSend = { filePath: targetPath, savedAt: Date.now() };
+      // interrupted, the user can resume with one click. isFolder is kept so
+      // the resumed share line gets the right folder hint.
+      const entry: LastSend = {
+        filePath: targetPath,
+        savedAt: Date.now(),
+        isFolder: asFolder,
+      };
       saveJson(LS_LAST_SEND, entry);
       setLastSend(entry);
     } catch (err) {
@@ -809,7 +845,7 @@ function App() {
   async function resumeLastSend() {
     if (!lastSend) return;
     setFilePath(lastSend.filePath);
-    await startSendWith(lastSend.filePath);
+    await startSendWith(lastSend.filePath, lastSend.isFolder ?? false);
   }
 
   async function stopSend() {
@@ -838,6 +874,28 @@ function App() {
 
   async function pickDestination() {
     const parsed = parseReceiveInput(ticketInput);
+
+    // Folder ticket: the user picks a PARENT directory, and we extract the
+    // collection into <parent>/<foldername>. A save-as dialog wouldn't make
+    // sense for a directory.
+    if (parsed?.isFolder) {
+      const dir = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose where to save the received folder",
+      });
+      if (typeof dir === "string") {
+        const name = parsed.suggestedName ?? "received-folder";
+        const sep = dir.endsWith("/") ? "" : "/";
+        userPickedDest.current = true;
+        setOutputPath(`${dir}${sep}${name}`);
+        setRecvError(null);
+        setRecvProgress(null);
+        setRecvStatus("idle");
+      }
+      return;
+    }
+
     const defaultPath = parsed?.suggestedName
       ? await suggestedAbsolutePath(parsed.suggestedName)
       : undefined;
@@ -955,6 +1013,7 @@ function App() {
   const parsedReceive = parseReceiveInput(ticketInput);
   const parsedTicket = parsedReceive?.ticket ?? null;
   const suggestedName = parsedReceive?.suggestedName ?? null;
+  const isFolderReceive = parsedReceive?.isFolder ?? false;
 
   const recvPercent =
     recvProgress && recvProgress.total && recvProgress.total > 0
@@ -1119,6 +1178,9 @@ function App() {
             <button onClick={pickFile} disabled={sendBusy}>
               Pick file…
             </button>
+            <button onClick={pickFolder} disabled={sendBusy}>
+              Pick folder…
+            </button>
             <button
               onClick={stopSend}
               disabled={
@@ -1130,7 +1192,17 @@ function App() {
             </button>
           </div>
 
-          {filePath && <p className="filepath">{filePath}</p>}
+          {filePath && (
+            <p className="filepath">
+              {filePath}
+              {isFolderSend && sendFileCount !== null && (
+                <>
+                  {" "}
+                  · {sendFileCount} file{sendFileCount === 1 ? "" : "s"}
+                </>
+              )}
+            </p>
+          )}
 
           <p className="status">
             Status: <code>{sendStatus}</code>
@@ -1208,6 +1280,8 @@ function App() {
                 value={
                   filePath
                     ? `orbitxfer-iroh-cli receive ${selectedTicket} ${basename(filePath)}${
+                        isFolderSend ? "/" : ""
+                      }${
                         sendTotalSize !== null
                           ? `  # size=${sendTotalSize}`
                           : ""
@@ -1267,7 +1341,9 @@ function App() {
                       <>
                         {" · "}
                         <span className="diagnostic-name">
-                          suggested filename: {suggestedName}
+                          {isFolderReceive
+                            ? `suggested folder: ${suggestedName}`
+                            : `suggested filename: ${suggestedName}`}
                         </span>
                       </>
                     )}
@@ -1283,7 +1359,7 @@ function App() {
 
           <div className="actions">
             <button onClick={pickDestination} disabled={recvBusy}>
-              Pick destination…
+              {isFolderReceive ? "Pick destination folder…" : "Pick destination…"}
             </button>
             <button
               onClick={startReceive}

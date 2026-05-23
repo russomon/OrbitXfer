@@ -1,5 +1,14 @@
 # Releases
 
+## v0.1.70 - 2026-05-23
+- **Send folders, not just files (Phase 2).** A new "Pick folder…" button (right after "Pick file…") sends an entire directory. Under the hood the folder becomes an iroh-blobs **collection** (`BlobFormat::HashSeq`): every file is added as its own content-addressed blob, bundled under a small metadata blob that carries the relative paths. The recipient downloads the whole collection in one transfer and extracts it, recreating the folder's structure (nested subfolders included).
+  - **CLI:** `run_send` now branches — a path that's a directory is walked recursively (symlinks skipped), each file hashed and added, then bundled via `Collection::store`. `run_receive` reads the ticket's format: a HashSeq ticket is extracted file-by-file into the chosen destination folder (`export_collection`), a Raw ticket stays the single-file path. The download/fetch code already recursed for HashSeq, so only export needed changing.
+  - **Security:** collection entry names are sanitized on extract — absolute paths and `..` components are rejected to prevent writing outside the destination folder (zip-slip).
+  - **Progress stays aligned:** the canonical total for a folder is the **sum of all file sizes**, embedded in the share line's `# size=` just like single files, so the sender and receiver denominators match. For folders the provider `observe()` size check is skipped (it only sees the tiny root metadata blob), relying on the summed total instead.
+- **Folder share lines use a trailing slash.** A folder ticket reads `… MyFolder/  # size=N` — the trailing slash tells the recipient's UI to show a destination-folder picker and label things "folder" instead of "file." The CLI remains authoritative (it reads file-vs-folder from the ticket format itself), so a hint-less paste still works.
+- **Send panel shows the file count** for a folder once hashing reports it (e.g. "MyFolder · 240 files").
+- **Known limitations (MVP):** empty directories, symlinks, and POSIX permissions/xattrs are not preserved.
+
 ## v0.1.69 - 2026-05-23
 - **One-step send.** Picking a file now starts the send immediately — the separate "Start Send" button is gone. Pick a file, get a ticket. (Stop is still there to cancel an in-flight send, and changing the connection mode still regenerates the displayed ticket instantly.)
 - **Clearer send status.** While the file is being hashed and the ticket is being minted, the status now reads `creating_ticket` instead of the misleading `sending` (nothing is sent until a recipient connects). Internally the `"sending"` send-state was renamed `"creating_ticket"`.

@@ -10,11 +10,14 @@ use iroh_blobs::{
     },
     api::downloader::DownloadProgressItem,
     api::remote::GetProgressItem,
+    api::TempTag,
+    format::collection::Collection,
     provider::events::{EventMask, EventSender, ProviderMessage, RequestUpdate, ThrottleMode},
     store::fs::FsStore,
     ticket::BlobTicket,
     BlobFormat,
     BlobsProtocol,
+    Hash,
 };
 use iroh_blobs::protocol::ObserveRequest;
 use serde_json::json;
@@ -30,7 +33,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.69";
+const CLI_VERSION: &str = "0.1.70";
 
 fn print_usage() {
     eprintln!("Usage:");
@@ -338,29 +341,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_send(file_path: PathBuf) -> Result<()> {
-    let abs_path = abs_path(&file_path)?;
-
-    emit_line("Hashing file (this can take a while for large files).");
-    emit_event(json!({ "type": "ticket_hashing_start" }));
-    let store_dir = store_root()?;
-    std::fs::create_dir_all(&store_dir)?;
-    let store = FsStore::load(store_dir.clone()).await?;
-    let store_handle = store.as_ref().clone();
-    let event_mask = EventMask {
-        throttle: ThrottleMode::None,
-        ..EventMask::ALL_READONLY
-    };
-    let (events_tx, mut events_rx) = EventSender::channel(32, event_mask);
-    let blobs = BlobsProtocol::new(&store, Some(events_tx));
-
+/// Add a single file to the store as one Raw blob (the original send
+/// behavior). Emits the `ticket_hashing_*` progress events and returns the
+/// blob's hash, format, total size, and the (leaked) temp tag.
+async fn prepare_single_file(
+    store: &FsStore,
+    abs_path: &Path,
+) -> Result<(Hash, BlobFormat, Option<u64>, Vec<TempTag>)> {
     let add_opts = AddPathOptions {
-        path: abs_path.clone(),
+        path: abs_path.to_path_buf(),
         format: BlobFormat::Raw,
         mode: import_mode_from_env(),
     };
 
-    let mut total_size: Option<u64> = std::fs::metadata(&abs_path).map(|m| m.len()).ok();
+    let mut total_size: Option<u64> = std::fs::metadata(abs_path).map(|m| m.len()).ok();
     if let Some(size) = total_size {
         emit_event(json!({ "type": "ticket_hashing_size", "total": size }));
     }
@@ -423,25 +417,202 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
 
     let mut temp_tag = temp_tag.ok_or_else(|| anyhow!("hashing stream ended unexpectedly"))?;
     temp_tag.leak();
-    let hash_and_format = temp_tag.hash_and_format();
-    let hash = hash_and_format.hash;
-    let format = hash_and_format.format;
+    let hf = temp_tag.hash_and_format();
+    Ok((hf.hash, hf.format, total_size, vec![temp_tag]))
+}
 
-    let status = store.blobs().status(hash).await?;
-    if let Err(err) = store.blobs().export_chunk(hash, 0).await {
-        emit_error("store_warmup", &err);
-        return Err(err.into());
+/// Recursively collect every regular file under `root`, recording each as
+/// `(name, absolute_path)` where `name` is the path relative to `base`
+/// using forward slashes. Symlinks are skipped (MVP) to avoid cycles and
+/// to keep a folder's contents from escaping its own tree.
+fn collect_files(root: &Path, base: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let path = entry.path();
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            collect_files(&path, base, out)?;
+        } else if ft.is_file() {
+            let rel = path.strip_prefix(base).unwrap_or(&path);
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if !rel_str.is_empty() {
+                out.push((rel_str, path.clone()));
+            }
+        }
     }
+    Ok(())
+}
+
+/// Add every file under a directory as its own Raw blob, then bundle them
+/// into a HashSeq collection. Names are relative to the selected folder
+/// (e.g. `a.txt`, `sub/b.txt`) — the top folder name is NOT included, so
+/// the receiver extracts entries directly under the destination folder it
+/// chose. Returns the collection root hash (HashSeq format), the summed
+/// total size, and all temp tags (child blobs + root) to keep alive.
+async fn prepare_folder(
+    store: &FsStore,
+    abs_path: &Path,
+) -> Result<(Hash, BlobFormat, Option<u64>, Vec<TempTag>)> {
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    collect_files(abs_path, abs_path, &mut files)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    if files.is_empty() {
+        bail!("the selected folder contains no files to send");
+    }
+
+    let total: u64 = files
+        .iter()
+        .map(|(_, p)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum();
+    let total_size = Some(total);
+    let file_count = files.len();
     emit_event(json!({
-        "type": "store_warmup_ok",
-        "hash": hash.to_string()
+        "type": "ticket_hashing_size",
+        "total": total,
+        "files": file_count
     }));
 
+    let import_mode = import_mode_from_env();
+    let mut collection = Collection::default();
+    let mut tags: Vec<TempTag> = Vec::with_capacity(file_count + 1);
+    let mut hashed_bytes: u64 = 0;
+    let mut last_emit_bytes = 0u64;
+    let mut last_emit_at = Instant::now();
+    let progress_step_bytes = 4 * 1024 * 1024;
+    let progress_step_time = Duration::from_millis(500);
+
+    for (name, path) in &files {
+        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let add_opts = AddPathOptions {
+            path: path.clone(),
+            format: BlobFormat::Raw,
+            mode: import_mode,
+        };
+        let mut stream = store.blobs().add_path_with_opts(add_opts).stream().await;
+        let file_base = hashed_bytes;
+        let mut tag = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                AddProgressItem::OutboardProgress(bytes) => {
+                    // Aggregate hashing progress across the whole folder:
+                    // bytes already hashed + this file's in-progress bytes.
+                    let cum = file_base + bytes.min(file_size);
+                    let should_emit = cum.saturating_sub(last_emit_bytes) >= progress_step_bytes
+                        || last_emit_at.elapsed() >= progress_step_time;
+                    if should_emit {
+                        last_emit_bytes = cum;
+                        last_emit_at = Instant::now();
+                        emit_event(json!({
+                            "type": "ticket_hashing_progress",
+                            "phase": "hash",
+                            "bytes": cum,
+                            "total": total_size
+                        }));
+                    }
+                }
+                AddProgressItem::Done(tt) => {
+                    tag = Some(tt);
+                    break;
+                }
+                AddProgressItem::Error(e) => {
+                    emit_error("hashing", &e);
+                    return Err(e.into());
+                }
+                _ => {}
+            }
+        }
+        let tag = tag.ok_or_else(|| anyhow!("hashing stream ended unexpectedly for {name}"))?;
+        collection.push(name.clone(), tag.hash());
+        tags.push(tag);
+        hashed_bytes = file_base + file_size;
+    }
+
+    let root_tag = collection
+        .store(store.as_ref())
+        .await
+        .map_err(|e| anyhow!("failed to store collection: {e}"))?;
+    let hf = root_tag.hash_and_format();
+    tags.push(root_tag);
     emit_event(json!({
-        "type": "store_status",
-        "hash": hash.to_string(),
-        "status": format!("{:?}", status)
+        "type": "ticket_hashing_complete",
+        "total": total_size,
+        "files": file_count
     }));
+    Ok((hf.hash, hf.format, total_size, tags))
+}
+
+/// Convert a collection entry name into a SAFE relative path under the
+/// destination directory. Rejects absolute paths and any `..` component to
+/// prevent a malicious sender from writing outside the chosen folder
+/// (zip-slip style). Returns None if the name has no safe components.
+fn safe_relative_path(name: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for comp in name.split(['/', '\\']) {
+        match comp {
+            "" | "." => continue,
+            ".." => return None,
+            _ => out.push(comp),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+async fn run_send(file_path: PathBuf) -> Result<()> {
+    let abs_path = abs_path(&file_path)?;
+
+    emit_line("Hashing file (this can take a while for large files).");
+    emit_event(json!({ "type": "ticket_hashing_start" }));
+    let store_dir = store_root()?;
+    std::fs::create_dir_all(&store_dir)?;
+    let store = FsStore::load(store_dir.clone()).await?;
+    let store_handle = store.as_ref().clone();
+    let event_mask = EventMask {
+        throttle: ThrottleMode::None,
+        ..EventMask::ALL_READONLY
+    };
+    let (events_tx, mut events_rx) = EventSender::channel(32, event_mask);
+    let blobs = BlobsProtocol::new(&store, Some(events_tx));
+
+    // Produce the root hash + format + total size. A single file becomes
+    // one Raw blob (unchanged behavior); a directory becomes a HashSeq
+    // collection of every file inside it. The returned temp tags must
+    // outlive the serving loop below so the blobs they protect aren't
+    // garbage-collected while a receiver is still fetching — they're held
+    // in `_keep_tags` and dropped only when run_send returns (after Ctrl-C).
+    let (hash, format, total_size, _keep_tags): (Hash, BlobFormat, Option<u64>, Vec<TempTag>) =
+        if abs_path.is_dir() {
+            prepare_folder(&store, &abs_path).await?
+        } else {
+            prepare_single_file(&store, &abs_path).await?
+        };
+
+    // Warmup/sanity check only applies to a single Raw blob. For a HashSeq
+    // collection the root is a tiny metadata blob and export_chunk semantics
+    // differ, so we skip it.
+    if matches!(format, BlobFormat::Raw) {
+        let status = store.blobs().status(hash).await?;
+        if let Err(err) = store.blobs().export_chunk(hash, 0).await {
+            emit_error("store_warmup", &err);
+            return Err(err.into());
+        }
+        emit_event(json!({
+            "type": "store_warmup_ok",
+            "hash": hash.to_string()
+        }));
+
+        emit_event(json!({
+            "type": "store_status",
+            "hash": hash.to_string(),
+            "status": format!("{:?}", status)
+        }));
+    }
 
     emit_line("Binding endpoint...");
     // Identity resolution priority:
@@ -677,7 +848,84 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
 
     emit_line("Shutting down.");
     router.shutdown().await?;
-    drop(temp_tag);
+    // `_keep_tags` drops here, releasing the temp tags that kept the served
+    // blob(s) alive for the duration of the session.
+    Ok(())
+}
+
+/// Export a HashSeq collection: load the collection metadata from the
+/// store, then export each child blob to `dest_dir/<safe-relative-name>`,
+/// creating parent directories as needed. Progress is aggregated across all
+/// files so the receiver's "writing to disk" bar matches the canonical
+/// total. Entry names are sanitized to prevent writing outside `dest_dir`.
+async fn export_collection(
+    store: &FsStore,
+    root: Hash,
+    dest_dir: &Path,
+    total_size: Option<u64>,
+) -> Result<()> {
+    let collection = Collection::load(root, store.as_ref())
+        .await
+        .map_err(|e| anyhow!("failed to load collection: {e}"))?;
+    let file_count = collection.len();
+    emit_event(json!({
+        "type": "export_started",
+        "total": total_size,
+        "files": file_count
+    }));
+
+    std::fs::create_dir_all(dest_dir)?;
+    let mut exported: u64 = 0;
+    let mut throttle = ProgressThrottle::new();
+    for (idx, (name, child_hash)) in collection.iter().enumerate() {
+        let Some(rel) = safe_relative_path(name) else {
+            emit_line(&format!("Skipping unsafe entry name: {name}"));
+            continue;
+        };
+        let target = dest_dir.join(&rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut export_stream = store
+            .blobs()
+            .export_with_opts(ExportOptions {
+                hash: *child_hash,
+                mode: ExportMode::TryReference,
+                target: target.clone(),
+            })
+            .stream()
+            .await;
+        let file_base = exported;
+        while let Some(item) = export_stream.next().await {
+            match item {
+                ExportProgressItem::Size(_) => {}
+                ExportProgressItem::CopyProgress(bytes) => {
+                    let cum = file_base + bytes;
+                    if throttle.should_emit(cum) {
+                        emit_event(json!({
+                            "type": "export_progress",
+                            "bytes": cum,
+                            "total": total_size
+                        }));
+                    }
+                }
+                ExportProgressItem::Done => break,
+                ExportProgressItem::Error(err) => {
+                    emit_error("export", &err);
+                    return Err(err.into());
+                }
+            }
+        }
+        exported += std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+        emit_event(json!({
+            "type": "export_file_done",
+            "name": name,
+            "index": idx + 1,
+            "files": file_count
+        }));
+    }
+
+    emit_event(json!({ "type": "export_complete", "total": Some(exported) }));
     Ok(())
 }
 
@@ -685,8 +933,18 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
     let ticket: BlobTicket = ticket_str.parse().context("invalid ticket")?;
     let ticket_addr = ticket.addr().clone();
     emit_line(&format!("Ticket addr: {}", describe_addr(&ticket_addr)));
+    // A HashSeq ticket is a folder (collection); a Raw ticket is a single
+    // file. The format is authoritative — it lives inside the ticket — so we
+    // don't rely on any UI hint to decide how to write to disk.
+    let is_collection = matches!(ticket.hash_and_format().format, BlobFormat::HashSeq);
     let mut abs_path = abs_path(&output_path)?;
-    if abs_path.is_dir() {
+    if is_collection {
+        // For a folder, abs_path is the destination directory the collection
+        // entries are extracted into. Don't synth a filename.
+        emit_line(&format!("Receiving a folder into: {}", abs_path.display()));
+        emit_event(json!({ "type": "receive_kind", "kind": "folder" }));
+    } else if abs_path.is_dir() {
+        // Single file targeted at an existing directory → synth a name.
         let hash_str = ticket.hash().to_string();
         let short = hash_str.chars().take(12).collect::<String>();
         abs_path = abs_path.join(format!("orbitxfer-{short}.blob"));
@@ -754,16 +1012,23 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
         emit_event(json!({ "type": "download_size", "total": size }));
     }
     let mut free_space: Option<u64> = None;
-    if let Some(conn) = preflight_conn.clone() {
-        let mut observe = store
-            .remote()
-            .observe(conn, ObserveRequest::new(ticket.hash()));
-        if let Ok(Some(Ok(bitfield))) = timeout(Duration::from_secs(6), observe.next()).await {
-            let size = bitfield.size();
-            total_size = Some(size);
-            emit_line(&format!("Remote reported size: {} ({})", size, format_bytes(size)));
-            if expected_size.map(|v| v != size).unwrap_or(true) {
-                emit_event(json!({ "type": "download_size", "total": size }));
+    // observe() reports the bitfield/size of a SINGLE blob — for a HashSeq
+    // collection that's just the tiny root metadata blob, not the aggregate
+    // of all files. So we only use it to confirm/refine the total for single
+    // files. For folders the authoritative total is the sender's summed
+    // `# size=` value (ORBITXFER_EXPECTED_SIZE), already emitted above.
+    if !is_collection {
+        if let Some(conn) = preflight_conn.clone() {
+            let mut observe = store
+                .remote()
+                .observe(conn, ObserveRequest::new(ticket.hash()));
+            if let Ok(Some(Ok(bitfield))) = timeout(Duration::from_secs(6), observe.next()).await {
+                let size = bitfield.size();
+                total_size = Some(size);
+                emit_line(&format!("Remote reported size: {} ({})", size, format_bytes(size)));
+                if expected_size.map(|v| v != size).unwrap_or(true) {
+                    emit_event(json!({ "type": "download_size", "total": size }));
+                }
             }
         }
     }
@@ -999,43 +1264,51 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
     }
 
     if !direct_completed {
-        emit_line("Finalizing into destination file.");
+        emit_line(if is_collection {
+            "Finalizing files into destination folder."
+        } else {
+            "Finalizing into destination file."
+        });
     }
 
-    emit_event(json!({ "type": "export_started", "total": total_size }));
-    let mut export_stream = store
-        .blobs()
-        .export_with_opts(ExportOptions {
-            hash: ticket.hash(),
-            mode: ExportMode::TryReference,
-            target: abs_path,
-        })
-        .stream()
-        .await;
-    let mut export_total: Option<u64> = None;
-    let mut export_throttle = ProgressThrottle::new();
-    while let Some(item) = export_stream.next().await {
-        match item {
-            ExportProgressItem::Size(size) => {
-                export_total = Some(size);
-                emit_event(json!({ "type": "export_size", "total": size }));
-            }
-            ExportProgressItem::CopyProgress(bytes) => {
-                if export_throttle.should_emit(bytes) {
-                    emit_event(json!({
-                        "type": "export_progress",
-                        "bytes": bytes,
-                        "total": export_total
-                    }));
+    if is_collection {
+        export_collection(&store, ticket.hash(), &abs_path, total_size).await?;
+    } else {
+        emit_event(json!({ "type": "export_started", "total": total_size }));
+        let mut export_stream = store
+            .blobs()
+            .export_with_opts(ExportOptions {
+                hash: ticket.hash(),
+                mode: ExportMode::TryReference,
+                target: abs_path,
+            })
+            .stream()
+            .await;
+        let mut export_total: Option<u64> = None;
+        let mut export_throttle = ProgressThrottle::new();
+        while let Some(item) = export_stream.next().await {
+            match item {
+                ExportProgressItem::Size(size) => {
+                    export_total = Some(size);
+                    emit_event(json!({ "type": "export_size", "total": size }));
                 }
-            }
-            ExportProgressItem::Done => {
-                emit_event(json!({ "type": "export_complete", "total": export_total }));
-                break;
-            }
-            ExportProgressItem::Error(err) => {
-                emit_error("export", &err);
-                return Err(err.into());
+                ExportProgressItem::CopyProgress(bytes) => {
+                    if export_throttle.should_emit(bytes) {
+                        emit_event(json!({
+                            "type": "export_progress",
+                            "bytes": bytes,
+                            "total": export_total
+                        }));
+                    }
+                }
+                ExportProgressItem::Done => {
+                    emit_event(json!({ "type": "export_complete", "total": export_total }));
+                    break;
+                }
+                ExportProgressItem::Error(err) => {
+                    emit_error("export", &err);
+                    return Err(err.into());
+                }
             }
         }
     }
