@@ -1,5 +1,11 @@
 # Releases
 
+## v0.1.69 - 2026-05-23
+- **One-step send.** Picking a file now starts the send immediately — the separate "Start Send" button is gone. Pick a file, get a ticket. (Stop is still there to cancel an in-flight send, and changing the connection mode still regenerates the displayed ticket instantly.)
+- **Clearer send status.** While the file is being hashed and the ticket is being minted, the status now reads `creating_ticket` instead of the misleading `sending` (nothing is sent until a recipient connects). Internally the `"sending"` send-state was renamed `"creating_ticket"`.
+- **Share-box copy.** The share area now leads with a short heading **"Your Share Ticket:"** followed by smaller instructional text — *"Share this Ticket with the recipient to start the file transfer. They just need to paste it into Receive and click Start Receive."* The previous connection-mode hint line was removed.
+- Groundwork release ahead of folder-send support (Phase 2).
+
 ## v0.1.68 - 2026-05-22
 - **Connection mode always defaults to "Direct + Relay fallback (recommended)".** Every launch and every new window now starts on the recommended mode. The selection is no longer persisted to localStorage — each new window/session begins from the safe default instead of inheriting a previous Relay-only / Direct-only choice.
 - **Clearer quit warning.** The "transfers in progress" quit dialog now reads *"Transfer(s) may be in progress…"* instead of *"Transfers are still in progress…"* — the app can't always be certain a transfer is mid-flight, so the softer wording is more accurate.

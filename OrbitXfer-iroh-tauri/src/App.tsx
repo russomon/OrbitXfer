@@ -9,7 +9,12 @@ import { platform } from "@tauri-apps/plugin-os";
 import "./App.css";
 
 type Mode = "send" | "receive";
-type SendStatus = "idle" | "sending" | "ticket_ready" | "complete" | "error";
+type SendStatus =
+  | "idle"
+  | "creating_ticket"
+  | "ticket_ready"
+  | "complete"
+  | "error";
 type ConnectionMode = "full" | "relay_only" | "direct_only";
 
 // Per-mode explanatory copy, auto-shown beneath whichever radio is
@@ -618,9 +623,9 @@ function App() {
       win.listen<number | null>("send:exit", (e) => {
         setSendLogs((prev) => [...prev, `[exit] code=${e.payload}`]);
         // If the sidecar exited before producing a ticket, surface it as an
-        // error so the UI doesn't sit stuck on "sending".
+        // error so the UI doesn't sit stuck on "creating_ticket".
         setSendStatus((curr) =>
-          curr === "sending" ? "error" : curr
+          curr === "creating_ticket" ? "error" : curr
         );
         setSendError((prev) =>
           prev ??
@@ -768,16 +773,16 @@ function App() {
   async function pickFile() {
     const result = await open({ multiple: false, directory: false });
     if (typeof result === "string") {
+      // One-step send: picking a file immediately kicks off the transfer.
+      // startSendWith resets tickets/error/logs/progress/size and sets the
+      // status, so we just record the path and go.
       setFilePath(result);
-      setTickets(null);
-      setSendError(null);
-      setSendStatus("idle");
-      setSendTotalSize(null);
+      await startSendWith(result);
     }
   }
 
   async function startSendWith(targetPath: string) {
-    setSendStatus("sending");
+    setSendStatus("creating_ticket");
     setTickets(null);
     setSendError(null);
     setSendLogs([]);
@@ -799,11 +804,6 @@ function App() {
       setSendError(String(err));
       setSendStatus("error");
     }
-  }
-
-  async function startSend() {
-    if (!filePath) return;
-    await startSendWith(filePath);
   }
 
   async function resumeLastSend() {
@@ -966,7 +966,7 @@ function App() {
     recvStatus === "downloading" ||
     recvStatus === "exporting";
 
-  const sendBusy = sendStatus === "sending";
+  const sendBusy = sendStatus === "creating_ticket";
 
   // Pick which ticket variant to put in the share line based on the
   // selected connection mode. The CLI emits all three variants (full /
@@ -1120,15 +1120,10 @@ function App() {
               Pick file…
             </button>
             <button
-              onClick={startSend}
-              disabled={!filePath || sendBusy}
-            >
-              Start Send
-            </button>
-            <button
               onClick={stopSend}
               disabled={
-                sendStatus !== "sending" && sendStatus !== "ticket_ready"
+                sendStatus !== "creating_ticket" &&
+                sendStatus !== "ticket_ready"
               }
             >
               Stop
@@ -1202,10 +1197,11 @@ function App() {
 
           {tickets && selectedTicket && (
             <div className="ticket-box">
-              <h3>Send this "Share" Ticket to the recipient:</h3>
+              <h3>Your Share Ticket:</h3>
               <p className="hint">
-                This ticket reflects the connection mode you picked above;
-                switch the radio button to regenerate it instantly.
+                Share this Ticket with the recipient to start the file
+                transfer. They just need to paste it into Receive and click
+                Start Receive.
               </p>
               <textarea
                 readOnly
