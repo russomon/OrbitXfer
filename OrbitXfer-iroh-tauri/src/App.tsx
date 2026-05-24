@@ -54,6 +54,28 @@ interface SendProgress {
   total: number | null;
 }
 
+// A single receiver connected to this sender during the current serving
+// session. Shown in the sender's "Receivers" panel.
+interface ReceiverRow {
+  connectionId: number;
+  endpointId: string | null; // receiver's ephemeral NodeID
+  label: string | null; // nickname the receiver volunteered, if any
+  bytes: number;
+  total: number | null;
+  speed: number | null;
+  status: "active" | "complete" | "disconnected";
+}
+
+const LS_RECEIVER_LABEL = "orbitxfer.receiverLabel.v1";
+
+function loadReceiverLabel(): string {
+  try {
+    return localStorage.getItem(LS_RECEIVER_LABEL) ?? "";
+  } catch {
+    return "";
+  }
+}
+
 const OX_EVENT_PREFIX = "OX_EVENT ";
 
 function parseOxEvent(line: string): any | null {
@@ -300,6 +322,17 @@ function App() {
   const [isFolderSend, setIsFolderSend] = useState(false);
   // Number of files in a folder send, reported by the CLI's hashing events.
   const [sendFileCount, setSendFileCount] = useState<number | null>(null);
+  // Connected receivers for the current send session, keyed by the CLI's
+  // per-connection id. Populated from receiver_connected / upload_* /
+  // receiver_label / receiver_disconnected events so the sender can see
+  // who's downloading. Reset at the start of each send.
+  const [receivers, setReceivers] = useState<ReceiverRow[]>([]);
+  // Per-receiver rolling speed samples, keyed by connection id.
+  const receiverSpeedRef = useRef<Map<number, SpeedSample[]>>(new Map());
+  // Labels volunteered by receivers, keyed by their (ephemeral) NodeID.
+  // Kept separately because a label can arrive before or after the
+  // matching blob connection.
+  const labelsByEndpointRef = useRef<Map<string, string>>(new Map());
 
   // Receive state
   const [ticketInput, setTicketInput] = useState("");
@@ -310,6 +343,16 @@ function App() {
   const [recvLogs, setRecvLogs] = useState<string[]>([]);
   const [recvSpeed, setRecvSpeed] = useState<number | null>(null);
   const recvSpeedRef = useRef<SpeedSample[]>([]);
+  // Opt-in nickname the receiver volunteers so the sender sees who's
+  // downloading. Empty = don't send any label. Persisted across launches.
+  const [receiverLabel, setReceiverLabel] = useState<string>(loadReceiverLabel);
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_RECEIVER_LABEL, receiverLabel);
+    } catch (e) {
+      console.error("save receiverLabel failed:", e);
+    }
+  }, [receiverLabel]);
 
   const win = useMemo(() => getCurrentWindow(), []);
 
@@ -536,9 +579,37 @@ function App() {
         const total =
           typeof parsed.total === "number" ? parsed.total : null;
         const bytes = typeof parsed.bytes === "number" ? parsed.bytes : null;
+        const connId =
+          typeof parsed.connection_id === "number"
+            ? parsed.connection_id
+            : null;
 
         // Folder sends carry a file count on their hashing events.
         if (typeof parsed.files === "number") setSendFileCount(parsed.files);
+
+        // Upsert a receiver row by connection id, creating it if absent.
+        const upsertReceiver = (id: number, patch: Partial<ReceiverRow>) =>
+          setReceivers((prev) => {
+            const idx = prev.findIndex((r) => r.connectionId === id);
+            if (idx === -1) {
+              return [
+                ...prev,
+                {
+                  connectionId: id,
+                  endpointId: null,
+                  label: null,
+                  bytes: 0,
+                  total: null,
+                  speed: null,
+                  status: "active",
+                  ...patch,
+                },
+              ];
+            }
+            const next = [...prev];
+            next[idx] = { ...next[idx], ...patch };
+            return next;
+          });
 
         switch (parsed.type) {
           case "ticket_hashing_start":
@@ -593,6 +664,50 @@ function App() {
             // main signal now.
             setSendProgress(null);
             break;
+          case "receiver_connected":
+            if (connId !== null) {
+              const endpointId =
+                typeof parsed.endpoint_id === "string"
+                  ? parsed.endpoint_id
+                  : null;
+              const knownLabel = endpointId
+                ? labelsByEndpointRef.current.get(endpointId) ?? null
+                : null;
+              upsertReceiver(connId, {
+                endpointId,
+                label: knownLabel,
+                status: "active",
+              });
+            }
+            break;
+          case "receiver_label": {
+            const endpointId =
+              typeof parsed.endpoint_id === "string"
+                ? parsed.endpoint_id
+                : null;
+            const label =
+              typeof parsed.label === "string" ? parsed.label : null;
+            if (endpointId && label) {
+              labelsByEndpointRef.current.set(endpointId, label);
+              setReceivers((prev) =>
+                prev.map((r) =>
+                  r.endpointId === endpointId ? { ...r, label } : r
+                )
+              );
+            }
+            break;
+          }
+          case "receiver_disconnected":
+            if (connId !== null) {
+              setReceivers((prev) =>
+                prev.map((r) =>
+                  r.connectionId === connId && r.status !== "complete"
+                    ? { ...r, status: "disconnected" }
+                    : r
+                )
+              );
+            }
+            break;
           case "upload_started":
             sendSpeedRef.current = [];
             setSendSpeed(null);
@@ -601,6 +716,13 @@ function App() {
               bytes: 0,
               total: total ?? null,
             });
+            if (connId !== null) {
+              upsertReceiver(connId, {
+                bytes: 0,
+                total: total ?? null,
+                status: "active",
+              });
+            }
             break;
           case "upload_progress":
             if (bytes !== null) {
@@ -612,6 +734,17 @@ function App() {
               bytes: bytes ?? prev?.bytes ?? 0,
               total: total ?? prev?.total ?? null,
             }));
+            if (connId !== null && bytes !== null) {
+              const map = receiverSpeedRef.current;
+              const samples = trackSpeed(map.get(connId) ?? [], bytes);
+              map.set(connId, samples);
+              upsertReceiver(connId, {
+                bytes,
+                total: total ?? null,
+                speed: speedFromSamples(samples),
+                status: "active",
+              });
+            }
             break;
           case "upload_complete":
             setSendStatus("complete");
@@ -626,6 +759,20 @@ function App() {
             );
             sendSpeedRef.current = [];
             setSendSpeed(null);
+            if (connId !== null) {
+              setReceivers((prev) =>
+                prev.map((r) =>
+                  r.connectionId === connId
+                    ? {
+                        ...r,
+                        bytes: r.total ?? r.bytes,
+                        speed: null,
+                        status: "complete",
+                      }
+                    : r
+                )
+              );
+            }
             break;
           case "error":
             setSendError(`${parsed.stage}: ${parsed.message}`);
@@ -814,6 +961,9 @@ function App() {
     setSendStatus("creating_ticket");
     setIsFolderSend(asFolder);
     setSendFileCount(null);
+    setReceivers([]);
+    receiverSpeedRef.current.clear();
+    labelsByEndpointRef.current.clear();
     setTickets(null);
     setSendError(null);
     setSendLogs([]);
@@ -972,6 +1122,8 @@ function App() {
         ticket,
         outputPath: finalDest,
         expectedSize: seededTotal !== null ? seededTotal : undefined,
+        // Opt-in: only send a label if the user typed one.
+        receiverLabel: receiverLabel.trim() ? receiverLabel.trim() : undefined,
       });
       const entry: LastReceive = {
         ticketInput: rawInput,
@@ -1210,7 +1362,7 @@ function App() {
 
           {sendError && <p className="error">{sendError}</p>}
 
-          {sendProgress && (() => {
+          {sendProgress && sendProgress.phase === "hashing" && (() => {
             const pct =
               sendProgress.total && sendProgress.total > 0
                 ? Math.min(100, (sendProgress.bytes / sendProgress.total) * 100)
@@ -1301,6 +1453,71 @@ function App() {
             </div>
           )}
 
+          {receivers.length > 0 && (
+            <div className="receivers-panel">
+              <h3>Receivers ({receivers.length})</h3>
+              <p className="hint">
+                Who's downloading right now. Names are provided by the
+                recipient and aren't verified.
+              </p>
+              <ul className="receiver-list">
+                {receivers.map((r, i) => {
+                  const pct =
+                    r.total && r.total > 0
+                      ? Math.min(100, (r.bytes / r.total) * 100)
+                      : null;
+                  const name =
+                    r.label && r.label.trim()
+                      ? r.label
+                      : `Receiver ${i + 1}`;
+                  const nodeShort = r.endpointId
+                    ? `${r.endpointId.slice(0, 8)}…`
+                    : null;
+                  return (
+                    <li key={r.connectionId} className="receiver-row">
+                      <div className="receiver-head">
+                        <span className="receiver-name">{name}</span>
+                        {nodeShort && (
+                          <span className="receiver-node">{nodeShort}</span>
+                        )}
+                        <span className={`receiver-status ${r.status}`}>
+                          {r.status === "complete"
+                            ? "✓ complete"
+                            : r.status === "disconnected"
+                            ? "disconnected"
+                            : pct !== null
+                            ? `${pct.toFixed(0)}%`
+                            : "connecting…"}
+                        </span>
+                      </div>
+                      {r.status === "active" && r.total ? (
+                        <progress value={r.bytes} max={r.total} />
+                      ) : r.status === "active" ? (
+                        <progress />
+                      ) : null}
+                      {r.status === "active" && (
+                        <div className="receiver-meta">
+                          <span>
+                            {formatBytes(r.bytes)}
+                            {r.total !== null && (
+                              <> / {formatBytes(r.total)}</>
+                            )}
+                          </span>
+                          {r.speed !== null && (
+                            <>
+                              <span className="progress-sep">·</span>
+                              <span>{formatSpeed(r.speed)}</span>
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
+
           <details className="logs">
             <summary>Send logs ({sendLogs.length})</summary>
             <pre>{sendLogs.join("\n")}</pre>
@@ -1355,6 +1572,23 @@ function App() {
                 )}
               </p>
             )}
+          </label>
+
+          <label className="field">
+            <span>Your label (optional)</span>
+            <input
+              type="text"
+              value={receiverLabel}
+              onChange={(e) => setReceiverLabel(e.target.value)}
+              placeholder="e.g. Bob's MacBook — leave blank to stay anonymous"
+              disabled={recvBusy}
+              maxLength={64}
+            />
+            <p className="hint">
+              If you enter a name, the sender will see it in their list of
+              receivers so they know who's downloading. Leave it blank to
+              send nothing.
+            </p>
           </label>
 
           <div className="actions">

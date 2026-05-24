@@ -526,6 +526,11 @@ struct ReceiveOverrides {
     ///     where the CLI's auto-cleanup is undesired.
     /// When set, the CLI honors the path verbatim and skips auto-cleanup.
     store_dir: Option<String>,
+    /// Optional free-text nickname the receiver volunteers so the sender
+    /// can see who's downloading. Opt-in: None (or empty) means the CLI
+    /// doesn't open the label side-channel at all. Forwarded as
+    /// `ORBITXFER_RECEIVER_LABEL`.
+    receiver_label: Option<String>,
 }
 
 fn run_sidecar(
@@ -599,6 +604,16 @@ fn run_sidecar(
         }
         if let Some(dir) = recv_overrides.store_dir.as_deref() {
             sidecar = sidecar.env("ORBITXFER_STORE_DIR", dir);
+        }
+        // Opt-in receiver label: only set when non-empty so the CLI skips
+        // the label side-channel entirely otherwise.
+        if let Some(lbl) = recv_overrides
+            .receiver_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            sidecar = sidecar.env("ORBITXFER_RECEIVER_LABEL", lbl);
         }
     }
 
@@ -697,6 +712,7 @@ async fn start_receive(
     output_path: String,
     expected_size: Option<u64>,
     store_dir: Option<String>,
+    receiver_label: Option<String>,
 ) -> Result<(), String> {
     run_sidecar(
         &app,
@@ -708,6 +724,7 @@ async fn start_receive(
         ReceiveOverrides {
             expected_size,
             store_dir,
+            receiver_label,
         },
     )
 }

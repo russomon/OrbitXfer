@@ -1,5 +1,12 @@
 # Releases
 
+## v0.1.71 - 2026-05-23
+- **See who's downloading (opt-in receiver labels + per-receiver rows).** The sender now shows a "Receivers" panel listing everyone currently pulling the file, each with its own progress bar, %, bytes, and speed. Multiple simultaneous receivers are tracked independently (replacing the single jumpy upload bar during the upload phase).
+  - **Receivers can volunteer a nickname.** The Receive panel has a new optional "Your label" field. If filled in, the name shows up on the sender's row for that receiver (e.g. "Bob's MacBook"); left blank, nothing is sent. Empty by default — fully opt-in — and persisted across launches.
+  - **How it works:** a new side-channel ALPN (`orbitxfer/label/0`) registered on the sender's router. The receiver opens a short connection and sends the label; the sender correlates it to the receiver's cryptographically-authenticated NodeID, so a peer can only label *itself*, not impersonate another. Best-effort and backward-compatible — an older sender without the protocol just declines, and the download proceeds normally.
+  - **Privacy/trust notes:** labels are self-asserted and unverified (the panel says so), receiver identities remain ephemeral, and the label travels only to the one sender over an encrypted connection. The CLI sanitizes labels (control chars stripped, capped at 64 chars).
+- **CLI events** now tag `upload_started` / `upload_progress` / `upload_complete` and `receiver_connected` / `receiver_disconnected` with a `connection_id` so the UI can maintain per-receiver rows, plus a new `receiver_label` event.
+
 ## v0.1.70 - 2026-05-23
 - **Send folders, not just files (Phase 2).** A new "Pick folder…" button (right after "Pick file…") sends an entire directory. Under the hood the folder becomes an iroh-blobs **collection** (`BlobFormat::HashSeq`): every file is added as its own content-addressed blob, bundled under a small metadata blob that carries the relative paths. The recipient downloads the whole collection in one transfer and extracts it, recreating the folder's structure (nested subfolders included).
   - **CLI:** `run_send` now branches — a path that's a directory is walked recursively (symlinks skipped), each file hashed and added, then bundled via `Collection::store`. `run_receive` reads the ticket's format: a HashSeq ticket is extracted file-by-file into the chosen destination folder (`export_collection`), a Raw ticket stays the single-file path. The download/fetch code already recursed for HashSeq, so only export needed changing.

@@ -2,7 +2,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use fs2::available_space;
 use futures_lite::StreamExt;
 use irpc::channel::mpsc;
-use iroh::{address_lookup::MemoryLookup, protocol::Router, Endpoint, EndpointAddr};
+use iroh::{
+    address_lookup::MemoryLookup,
+    endpoint::Connection,
+    protocol::{AcceptError, ProtocolHandler, Router},
+    Endpoint, EndpointAddr,
+};
 use iroh_base::SecretKey;
 use iroh_blobs::{
     api::blobs::{
@@ -33,7 +38,57 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.70";
+const CLI_VERSION: &str = "0.1.71";
+
+/// ALPN for the optional "receiver label" side-channel. A receiver may
+/// open a short connection to the sender on this protocol and send a
+/// free-text nickname so the sender can see who's downloading. This is
+/// entirely separate from the iroh-blobs transfer ALPN; an older sender
+/// that doesn't register it just refuses the connection and the receiver
+/// proceeds with the download anyway.
+const ORBITXFER_LABEL_ALPN: &[u8] = b"orbitxfer/label/0";
+
+/// Clamp an attacker-controlled label to something safe to display: drop
+/// control characters, trim, cap at 64 chars.
+fn sanitize_label_text(s: &str) -> String {
+    let cleaned: String = s.chars().filter(|c| !c.is_control()).collect();
+    cleaned.trim().chars().take(64).collect()
+}
+
+/// Sender-side handler for the receiver-label side-channel. Reads one
+/// short message (the receiver's self-chosen nickname) off a uni stream,
+/// correlates it to the receiver's authenticated NodeID, and emits a
+/// `receiver_label` event the UI can match to a download row.
+#[derive(Debug, Clone)]
+struct LabelProtocol;
+
+impl ProtocolHandler for LabelProtocol {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        // The NodeID is cryptographically authenticated by iroh/QUIC, so
+        // a peer can only set its OWN label, not impersonate another's.
+        let endpoint_id = connection.remote_id();
+        let mut recv = connection
+            .accept_uni()
+            .await
+            .map_err(AcceptError::from_err)?;
+        // Cap the read so a malicious peer can't stream forever.
+        let bytes = recv
+            .read_to_end(256)
+            .await
+            .map_err(AcceptError::from_err)?;
+        let label = sanitize_label_text(&String::from_utf8_lossy(&bytes));
+        if !label.is_empty() {
+            emit_event(json!({
+                "type": "receiver_label",
+                "endpoint_id": endpoint_id.to_string(),
+                "label": label
+            }));
+        }
+        // Close from our side so the receiver's `closed()` await returns.
+        connection.close(0u32.into(), b"ok");
+        Ok(())
+    }
+}
 
 fn print_usage() {
     eprintln!("Usage:");
@@ -724,7 +779,9 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
     // the protocol-level view if it ever diverges.
     let upload_total = Arc::new(AtomicU64::new(total_size.unwrap_or(0)));
     let upload_total_events = upload_total.clone();
-    let spawn_updates = |mut rx: mpsc::Receiver<RequestUpdate>, total: Arc<AtomicU64>| {
+    let spawn_updates = |mut rx: mpsc::Receiver<RequestUpdate>,
+                         total: Arc<AtomicU64>,
+                         connection_id: u64| {
         tokio::spawn(async move {
             let mut last_progress = 0u64;
             // Mirrors the receive-side throttling added in v0.1.64. iroh's
@@ -741,9 +798,12 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
                     RequestUpdate::Started(started) => {
                         // Surface iroh's started.size for transparency but
                         // do NOT mutate `total` — the canonical metadata
-                        // size stays pinned.
+                        // size stays pinned. connection_id tags this to a
+                        // specific receiver so the sender UI can show a
+                        // per-receiver row.
                         emit_event(json!({
                             "type": "upload_started",
+                            "connection_id": connection_id,
                             "total": total.load(Ordering::Relaxed),
                             "iroh_size": started.size
                         }));
@@ -761,12 +821,16 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
                         let total_opt = if total_val > 0 { Some(total_val) } else { None };
                         emit_event(json!({
                             "type": "upload_progress",
+                            "connection_id": connection_id,
                             "bytes": bytes,
                             "total": total_opt
                         }));
                     }
                     RequestUpdate::Completed(_) => {
-                        emit_event(json!({ "type": "upload_complete" }));
+                        emit_event(json!({
+                            "type": "upload_complete",
+                            "connection_id": connection_id
+                        }));
                     }
                     RequestUpdate::Aborted(aborted) => {
                         emit_line(&format!("Upload aborted payload={} other_sent={} other_read={}", aborted.stats.payload_bytes_sent, aborted.stats.other_bytes_sent, aborted.stats.other_bytes_read));
@@ -790,6 +854,7 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
                     emit_line(&format!("Receiver connected {:?}", id_str));
                     emit_event(json!({
                         "type": "receiver_connected",
+                        "connection_id": msg.connection_id,
                         "endpoint_id": id_str
                     }));
                     let _ = msg.tx.send(Ok(())).await;
@@ -803,26 +868,33 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
                             "status": format!("{:?}", status)
                         }));
                     }
+                    let connection_id = msg.connection_id;
                     let _ = msg.tx.send(Ok(())).await;
-                    spawn_updates(msg.rx, upload_total_events.clone());
+                    spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
                 }
                 ProviderMessage::GetRequestReceivedNotify(msg) => {
-                    spawn_updates(msg.rx, upload_total_events.clone());
+                    let connection_id = msg.connection_id;
+                    spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
                 }
                 ProviderMessage::GetManyRequestReceived(msg) => {
                     emit_event(json!({
                         "type": "provider_get_many_request",
                         "count": msg.request.hashes.len()
                     }));
+                    let connection_id = msg.connection_id;
                     let _ = msg.tx.send(Ok(())).await;
-                    spawn_updates(msg.rx, upload_total_events.clone());
+                    spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
                 }
                 ProviderMessage::GetManyRequestReceivedNotify(msg) => {
-                    spawn_updates(msg.rx, upload_total_events.clone());
+                    let connection_id = msg.connection_id;
+                    spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
                 }
-                ProviderMessage::ConnectionClosed(_) => {
+                ProviderMessage::ConnectionClosed(msg) => {
                     emit_line("Receiver disconnected");
-                    emit_event(json!({ "type": "receiver_disconnected" }));
+                    emit_event(json!({
+                        "type": "receiver_disconnected",
+                        "connection_id": msg.connection_id
+                    }));
                 }
                 ProviderMessage::Throttle(msg) => {
                     let _ = msg.tx.send(Ok(())).await;
@@ -834,6 +906,7 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
 
     let router = Router::builder(endpoint)
         .accept(iroh_blobs::ALPN, blobs)
+        .accept(ORBITXFER_LABEL_ALPN, LabelProtocol)
         .spawn();
 
     emit_line("Hashing complete.");
@@ -929,6 +1002,25 @@ async fn export_collection(
     Ok(())
 }
 
+/// Receiver-side: open a short connection to the provider on the label
+/// ALPN and send our chosen nickname. Best-effort — the caller wraps this
+/// in a timeout and ignores failures (e.g. an older provider that doesn't
+/// speak this protocol).
+async fn send_receiver_label(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    label: &str,
+) -> Result<()> {
+    let conn = endpoint.connect(addr, ORBITXFER_LABEL_ALPN).await?;
+    let mut send = conn.open_uni().await?;
+    send.write_all(label.as_bytes()).await?;
+    send.finish()?;
+    // The provider reads the label, then closes the connection; waiting for
+    // that close confirms delivery before we drop the connection.
+    conn.closed().await;
+    Ok(())
+}
+
 async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
     let ticket: BlobTicket = ticket_str.parse().context("invalid ticket")?;
     let ticket_addr = ticket.addr().clone();
@@ -969,6 +1061,26 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
     endpoint.online().await;
     let receiver_addr = endpoint.addr();
     emit_line(&format!("Receiver endpoint addr: {}", describe_addr(&receiver_addr)));
+
+    // Optional: volunteer a label to the sender so they can see who's
+    // downloading. Opt-in — only sent when the user provided one. Best
+    // effort: a short timeout and any failure is ignored so the download
+    // proceeds regardless (e.g. older provider without the label ALPN).
+    if let Ok(label_raw) = env::var("ORBITXFER_RECEIVER_LABEL") {
+        let label = sanitize_label_text(&label_raw);
+        if !label.is_empty() {
+            match timeout(
+                Duration::from_secs(8),
+                send_receiver_label(&endpoint, ticket_addr.clone(), &label),
+            )
+            .await
+            {
+                Ok(Ok(())) => emit_line(&format!("Sent receiver label: {label}")),
+                Ok(Err(e)) => emit_line(&format!("Could not send receiver label: {e}")),
+                Err(_) => emit_line("Receiver label send timed out (provider may not support it)."),
+            }
+        }
+    }
 
     let (store_dir, auto_store_cleanup) = store_root_for_receive(&abs_path)?;
     std::fs::create_dir_all(&store_dir)?;

@@ -316,6 +316,107 @@ button:disabled {
   box-sizing: border-box;
 }
 
+.field input[type="text"] {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 0.9rem;
+  border-radius: 6px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: #fafbfc;
+  box-sizing: border-box;
+}
+
+/* ---- Sender's "Receivers" panel ---- */
+.receivers-panel {
+  margin-top: 16px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.receivers-panel h3 {
+  margin: 0 0 4px;
+  font-size: 0.95rem;
+}
+
+.receiver-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+
+.receiver-row {
+  padding: 8px 0;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.receiver-row:first-child {
+  border-top: none;
+}
+
+.receiver-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.receiver-name {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.receiver-node {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.75rem;
+  color: #9ca3af;
+}
+
+.receiver-status {
+  margin-left: auto;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  color: #4b5563;
+}
+
+.receiver-status.complete {
+  color: #15803d;
+}
+
+.receiver-status.disconnected {
+  color: #b45309;
+}
+
+.receiver-row progress {
+  width: 100%;
+  height: 6px;
+  margin: 6px 0 2px;
+}
+
+.receiver-meta {
+  display: flex;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: #6b7280;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-color-scheme: dark) {
+  .field input[type="text"] {
+    background: #1f2430;
+    color: #e5e7eb;
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+  .receivers-panel {
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+  .receiver-row {
+    border-top-color: rgba(255, 255, 255, 0.08);
+  }
+  .receiver-status {
+    color: #9ca3af;
+  }
+}
+
 .field textarea:disabled {
   opacity: 0.6;
 }
