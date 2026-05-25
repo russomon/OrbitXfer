@@ -326,6 +326,61 @@ button:disabled {
   box-sizing: border-box;
 }
 
+/* ---- Folder receive: current file + file list ---- */
+.progress-file {
+  margin: 6px 0 0;
+  font-size: 0.8rem;
+  color: #4b5563;
+  overflow-wrap: anywhere;
+}
+
+.progress-file code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.78rem;
+}
+
+.progress-files {
+  margin-top: 6px;
+}
+
+.progress-files details {
+  margin-top: 4px;
+}
+
+.progress-files summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: #6b7280;
+}
+
+.file-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0 0 0 4px;
+  max-height: 160px;
+  overflow-y: auto;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.75rem;
+  color: #4b5563;
+}
+
+.file-list li {
+  padding: 1px 0;
+  overflow-wrap: anywhere;
+}
+
+.file-list li.more {
+  color: #9ca3af;
+  font-style: italic;
+}
+
+@media (prefers-color-scheme: dark) {
+  .progress-file,
+  .file-list {
+    color: #9ca3af;
+  }
+}
+
 /* ---- Sender's "Receivers" panel ---- */
 .receivers-panel {
   margin-top: 16px;

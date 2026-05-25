@@ -38,7 +38,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.71";
+const CLI_VERSION: &str = "0.1.72";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -926,6 +926,35 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Best-effort: fetch ONLY the collection's root + metadata blob (offset 0
+/// = root HashSeq, child 0 = the names metadata) — not the file data — so
+/// the receiver UI can show the folder's file list while the full download
+/// is still running. Returns the loaded Collection. Any failure is
+/// non-fatal; the caller logs and proceeds with the normal download (the
+/// root+meta it fetched here are simply re-used, since the main download
+/// only pulls what's still missing).
+async fn prefetch_collection_files(
+    store: &FsStore,
+    conn: &Connection,
+    root: Hash,
+) -> Result<Collection> {
+    let request = iroh_blobs::protocol::GetRequest::builder()
+        .root(iroh_blobs::protocol::ChunkRanges::all())
+        .child(0, iroh_blobs::protocol::ChunkRanges::all())
+        .build(root);
+    let mut stream = store.remote().execute_get(conn.clone(), request).stream();
+    while let Some(item) = stream.next().await {
+        match item {
+            GetProgressItem::Done(_) => break,
+            GetProgressItem::Error(e) => return Err(anyhow!(e)),
+            GetProgressItem::Progress(_) => {}
+        }
+    }
+    Collection::load(root, store.as_ref())
+        .await
+        .map_err(|e| anyhow!("load collection metadata: {e}"))
+}
+
 /// Export a HashSeq collection: load the collection metadata from the
 /// store, then export each child blob to `dest_dir/<safe-relative-name>`,
 /// creating parent directories as needed. Progress is aggregated across all
@@ -959,6 +988,12 @@ async fn export_collection(
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        emit_event(json!({
+            "type": "export_file_start",
+            "name": name,
+            "index": idx + 1,
+            "files": file_count
+        }));
         let mut export_stream = store
             .blobs()
             .export_with_opts(ExportOptions {
@@ -1141,6 +1176,42 @@ async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
                 if expected_size.map(|v| v != size).unwrap_or(true) {
                     emit_event(json!({ "type": "download_size", "total": size }));
                 }
+            }
+        }
+    }
+
+    // For a folder, fetch just the tiny collection metadata up front so the
+    // UI can show the folder's file list/count WHILE the file data is still
+    // downloading. Best-effort: if it fails (older provider, transient
+    // error), we log and carry on — the file list just won't appear until
+    // the writing-to-disk phase.
+    if is_collection {
+        if let Some(conn) = preflight_conn.clone() {
+            match timeout(
+                Duration::from_secs(8),
+                prefetch_collection_files(&store, &conn, ticket.hash()),
+            )
+            .await
+            {
+                Ok(Ok(collection)) => {
+                    let total_files = collection.len();
+                    let mut names: Vec<String> =
+                        collection.iter().map(|(n, _)| n.clone()).collect();
+                    // Bound the event size for folders with very many files.
+                    let truncated = names.len() > 500;
+                    names.truncate(500);
+                    emit_line(&format!("Folder contains {total_files} files."));
+                    emit_event(json!({
+                        "type": "collection_files",
+                        "files": total_files,
+                        "names": names,
+                        "truncated": truncated
+                    }));
+                }
+                Ok(Err(e)) => {
+                    emit_line(&format!("Could not prefetch folder file list: {e}"))
+                }
+                Err(_) => emit_line("Folder file-list prefetch timed out."),
             }
         }
     }

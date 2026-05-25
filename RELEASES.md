@@ -1,5 +1,12 @@
 # Releases
 
+## v0.1.72 - 2026-05-24
+- **Folder receives now show what's inside.** Two additions for folder transfers:
+  - **During download:** the receiver pre-fetches just the tiny collection metadata (root + names blob) up front, so it can show "Folder · N files" plus an expandable file list *while the data is still transferring*. Best-effort and isolated — if the prefetch fails it's logged and the normal download proceeds unaffected. The list is capped at 500 names for very large folders (with an "…and X more" note); the count is always exact.
+  - **During finalize:** the "Writing to disk" phase now shows the current file — "Writing file 12 of 240: photos/IMG_0042.jpg" — driven by a new per-file `export_file_start` event.
+- Note: live "currently downloading file K" *during the network transfer* is intentionally not shown — iroh's high-level downloader reports only aggregate bytes and child sizes aren't known up front, so per-file network progress would require dropping the robust retry/fallback downloader. The file list during download + per-file during finalize covers the visibility without that tradeoff.
+- CLI: new `collection_files` event (prefetched names/count) and `export_file_start` event. Uses a targeted `GetRequest` (root + child 0) to fetch only the collection structure.
+
 ## v0.1.71 - 2026-05-23
 - **See who's downloading (opt-in receiver labels + per-receiver rows).** The sender now shows a "Receivers" panel listing everyone currently pulling the file, each with its own progress bar, %, bytes, and speed. Multiple simultaneous receivers are tracked independently (replacing the single jumpy upload bar during the upload phase).
   - **Receivers can volunteer a nickname.** The Receive panel has a new optional "Your label" field. If filled in, the name shows up on the sender's row for that receiver (e.g. "Bob's MacBook"); left blank, nothing is sent. Empty by default — fully opt-in — and persisted across launches.

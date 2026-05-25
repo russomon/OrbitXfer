@@ -343,6 +343,20 @@ function App() {
   const [recvLogs, setRecvLogs] = useState<string[]>([]);
   const [recvSpeed, setRecvSpeed] = useState<number | null>(null);
   const recvSpeedRef = useRef<SpeedSample[]>([]);
+  // Folder receive: file count + (capped) name list, learned from the
+  // CLI's `collection_files` metadata prefetch so we can show what's in
+  // the folder during the download. null for single-file receives.
+  const [recvFolderFileCount, setRecvFolderFileCount] = useState<number | null>(
+    null
+  );
+  const [recvFolderFiles, setRecvFolderFiles] = useState<string[] | null>(null);
+  const [recvFolderTruncated, setRecvFolderTruncated] = useState(false);
+  // The file currently being written to disk during the export phase.
+  const [recvCurrentFile, setRecvCurrentFile] = useState<{
+    index: number;
+    name: string;
+    files: number | null;
+  } | null>(null);
   // Opt-in nickname the receiver volunteers so the sender sees who's
   // downloading. Empty = don't send any label. Persisted across launches.
   const [receiverLabel, setReceiverLabel] = useState<string>(loadReceiverLabel);
@@ -816,6 +830,7 @@ function App() {
         const total =
           typeof parsed.total === "number" ? parsed.total : null;
         const bytes = typeof parsed.bytes === "number" ? parsed.bytes : null;
+        const files = typeof parsed.files === "number" ? parsed.files : null;
 
         switch (parsed.type) {
           case "connect_start":
@@ -824,6 +839,31 @@ function App() {
             // Reset speed tracking when a new transfer cycle starts.
             recvSpeedRef.current = [];
             setRecvSpeed(null);
+            break;
+          case "collection_files":
+            // The CLI prefetched the folder's metadata — show the list/count
+            // while the file data is still downloading.
+            setRecvFolderFileCount(files);
+            if (Array.isArray(parsed.names)) {
+              setRecvFolderFiles(
+                parsed.names.filter((n: unknown) => typeof n === "string")
+              );
+            }
+            setRecvFolderTruncated(parsed.truncated === true);
+            break;
+          case "export_file_start":
+            setRecvStatus("exporting");
+            if (
+              typeof parsed.name === "string" &&
+              typeof parsed.index === "number"
+            ) {
+              setRecvCurrentFile({
+                index: parsed.index,
+                name: parsed.name,
+                files,
+              });
+            }
+            if (files !== null) setRecvFolderFileCount(files);
             break;
           case "download_size":
             setRecvProgress({ bytes: 0, total, phase: "download" });
@@ -862,6 +902,7 @@ function App() {
             break;
           case "export_started":
             setRecvStatus("exporting");
+            if (files !== null) setRecvFolderFileCount(files);
             setRecvProgress((prev) => ({
               bytes: 0,
               total: total ?? prev?.total ?? null,
@@ -889,6 +930,7 @@ function App() {
             break;
           case "export_complete":
             setRecvStatus("complete");
+            setRecvCurrentFile(null);
             setRecvProgress((prev) => ({
               bytes: total ?? prev?.bytes ?? 0,
               total: total ?? prev?.total ?? null,
@@ -1112,6 +1154,10 @@ function App() {
     setRecvLogs([]);
     setRecvSpeed(null);
     recvSpeedRef.current = [];
+    setRecvFolderFileCount(null);
+    setRecvFolderFiles(null);
+    setRecvFolderTruncated(false);
+    setRecvCurrentFile(null);
     try {
       // Pass expectedSize so the CLI seeds its own download total from
       // the same canonical value and emits `download_size` immediately —
@@ -1668,6 +1714,41 @@ function App() {
                     </>
                   )}
                 </div>
+                {recvProgress.phase === "export" && recvCurrentFile && (
+                  <p className="progress-file">
+                    Writing file {recvCurrentFile.index}
+                    {recvCurrentFile.files
+                      ? ` of ${recvCurrentFile.files}`
+                      : ""}
+                    : <code>{recvCurrentFile.name}</code>
+                  </p>
+                )}
+                {recvProgress.phase === "download" &&
+                  recvFolderFileCount !== null && (
+                    <div className="progress-files">
+                      <span className="progress-hint">
+                        Folder · {recvFolderFileCount} file
+                        {recvFolderFileCount === 1 ? "" : "s"}
+                      </span>
+                      {recvFolderFiles && recvFolderFiles.length > 0 && (
+                        <details>
+                          <summary>show files</summary>
+                          <ul className="file-list">
+                            {recvFolderFiles.map((n, i) => (
+                              <li key={i}>{n}</li>
+                            ))}
+                            {recvFolderTruncated && (
+                              <li className="more">
+                                …and{" "}
+                                {recvFolderFileCount - recvFolderFiles.length}{" "}
+                                more
+                              </li>
+                            )}
+                          </ul>
+                        </details>
+                      )}
+                    </div>
+                  )}
                 {recvProgress.phase === "download" &&
                   recvProgress.total === null && (
                     <p className="progress-hint">
