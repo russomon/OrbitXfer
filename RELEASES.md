@@ -1,5 +1,11 @@
 # Releases
 
+## v0.1.73 - 2026-05-24
+- **Send progress bar no longer resets per file during a folder upload.** The CLI's `spawn_updates` now aggregates `RequestUpdate::Progress.end_offset` across all blobs in a HashSeq, so the sender's bar climbs monotonically across the whole folder instead of snapping back to 0 each time iroh advances to the next child blob. Single-file (Raw) sends are unchanged. Receive-side progress was already aggregate (iroh's downloader reports cumulative bytes) — this brings the send side into parity.
+- **"Transfer Complete" summary** on both Send and Receive windows. When a transfer finishes, the bare `Status: complete` line is replaced by a green-accented block listing the file/folder name (with file count for folders), total size, average speed (= size / elapsed), and total time. For multi-receiver sends, stats reflect the first receiver's completion; per-receiver speed/time stays accurate in the Receivers panel.
+- **"Don't close this window" warning** under the share textarea — amber left-border so it stands out from the normal hint text. Wording: *"Don't close this window. The file is only available to download while this window stays open."*
+- **Softer close-window warning.** Replaced the three variants of "A send/receive/transfer is in progress…" with a single unified line: *"A transfer may be in progress. Closing this window will stop the transfer. Close anyway?"* — matches the recent quit-dialog wording.
+
 ## v0.1.72 - 2026-05-24
 - **Folder receives now show what's inside.** Two additions for folder transfers:
   - **During download:** the receiver pre-fetches just the tiny collection metadata (root + names blob) up front, so it can show "Folder · N files" plus an expandable file list *while the data is still transferring*. Best-effort and isolated — if the prefetch fails it's logged and the normal download proceeds unaffected. The list is capped at 500 names for very large folders (with an "…and X more" note); the count is always exact.

@@ -326,6 +326,92 @@ button:disabled {
   box-sizing: border-box;
 }
 
+/* ---- "Keep this window open" warning under the share textarea ---- */
+.keep-open-warning {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-left: 3px solid #f59e0b; /* amber-500 */
+  background: rgba(245, 158, 11, 0.08);
+  border-radius: 4px;
+  font-size: 0.85rem;
+  color: #92400e; /* amber-800 */
+  line-height: 1.4;
+}
+
+@media (prefers-color-scheme: dark) {
+  .keep-open-warning {
+    background: rgba(245, 158, 11, 0.14);
+    color: #fbbf24; /* amber-400 */
+  }
+}
+
+/* ---- "Transfer Complete" summary block (Send + Receive) ---- */
+.completion-summary {
+  margin: 8px 0 12px;
+  padding: 12px 14px;
+  border: 1px solid rgba(21, 128, 61, 0.25);
+  border-left: 4px solid #15803d; /* green-700 — matches receiver-status.complete */
+  background: rgba(21, 128, 61, 0.06);
+  border-radius: 6px;
+}
+
+.completion-summary h3 {
+  margin: 0 0 8px;
+  font-size: 1rem;
+  color: #15803d;
+}
+
+.completion-summary dl {
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  font-size: 0.88rem;
+}
+
+.completion-summary dl > div {
+  display: contents;
+}
+
+.completion-summary dt {
+  color: #4b5563;
+  font-weight: 500;
+}
+
+.completion-summary dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.completion-summary dd code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.85rem;
+}
+
+.completion-summary .summary-meta {
+  color: #6b7280;
+  font-size: 0.82rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  .completion-summary {
+    background: rgba(34, 197, 94, 0.08);
+    border-color: rgba(34, 197, 94, 0.25);
+    border-left-color: #22c55e;
+  }
+  .completion-summary h3 {
+    color: #4ade80;
+  }
+  .completion-summary dt {
+    color: #9ca3af;
+  }
+  .completion-summary .summary-meta {
+    color: #9ca3af;
+  }
+}
+
 /* ---- Folder receive: current file + file list ---- */
 .progress-file {
   margin: 6px 0 0;

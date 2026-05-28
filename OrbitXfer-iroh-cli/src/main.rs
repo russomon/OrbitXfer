@@ -38,7 +38,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.72";
+const CLI_VERSION: &str = "0.1.73";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -783,38 +783,49 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
                          total: Arc<AtomicU64>,
                          connection_id: u64| {
         tokio::spawn(async move {
+            // For a HashSeq (folder) send, iroh's `Progress.end_offset`
+            // is the byte offset within the CURRENT blob and resets to 0
+            // every time a new child blob starts streaming. Without
+            // aggregation the sender's UI bar would snap back to 0 each
+            // time we move to the next file. We track the sum of
+            // already-finished blobs in `completed_bytes` and emit
+            // `bytes = completed_bytes + end_offset` so the bar climbs
+            // monotonically across the whole folder. A single-file (Raw)
+            // send collapses to the old behavior (one Started, end_offset
+            // == file size, one Completed). Throttling (4 MB / 500 ms)
+            // still gates the event rate — applied to the aggregate so
+            // we don't drown the webview at multi-Gbit/s.
             let mut last_progress = 0u64;
-            // Mirrors the receive-side throttling added in v0.1.64. iroh's
-            // RequestUpdate::Progress fires per chunk/packet, which on a
-            // multi-Gbit/s send is tens of thousands of events per second —
-            // enough to drown the Tauri webview's JS thread and freeze the
-            // Send window's progress bar mid-transfer (the data still flows
-            // fine; only the UI hangs). Gate at 4 MB / 500 ms whichever
-            // first. RequestUpdate::Completed below is NOT throttled, so
-            // the final emit always lands and the bar snaps to 100%.
+            let mut completed_bytes = 0u64;
+            let mut current_blob_size: Option<u64> = None;
             let mut throttle = ProgressThrottle::new();
             while let Ok(Some(update)) = rx.recv().await {
                 match update {
                     RequestUpdate::Started(started) => {
-                        // Surface iroh's started.size for transparency but
-                        // do NOT mutate `total` — the canonical metadata
-                        // size stays pinned. connection_id tags this to a
-                        // specific receiver so the sender UI can show a
-                        // per-receiver row.
+                        // A new blob is beginning. The previous blob (if
+                        // any) implicitly finished — its end_offset reached
+                        // its size — so promote it into completed_bytes
+                        // before starting fresh.
+                        if let Some(prev) = current_blob_size.take() {
+                            completed_bytes = completed_bytes.saturating_add(prev);
+                        }
+                        current_blob_size = Some(started.size);
                         emit_event(json!({
                             "type": "upload_started",
                             "connection_id": connection_id,
                             "total": total.load(Ordering::Relaxed),
-                            "iroh_size": started.size
+                            "iroh_size": started.size,
+                            "completed_bytes": completed_bytes
                         }));
                     }
                     RequestUpdate::Progress(progress) => {
-                        let bytes = progress.end_offset;
-                        if bytes == last_progress {
+                        let aggregate = completed_bytes
+                            .saturating_add(progress.end_offset);
+                        if aggregate == last_progress {
                             continue;
                         }
-                        last_progress = bytes;
-                        if !throttle.should_emit(bytes) {
+                        last_progress = aggregate;
+                        if !throttle.should_emit(aggregate) {
                             continue;
                         }
                         let total_val = total.load(Ordering::Relaxed);
@@ -822,14 +833,21 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
                         emit_event(json!({
                             "type": "upload_progress",
                             "connection_id": connection_id,
-                            "bytes": bytes,
+                            "bytes": aggregate,
                             "total": total_opt
                         }));
                     }
                     RequestUpdate::Completed(_) => {
+                        // The final blob finishes now (its size hasn't yet
+                        // been promoted into completed_bytes because no
+                        // further Started followed it).
+                        if let Some(prev) = current_blob_size.take() {
+                            completed_bytes = completed_bytes.saturating_add(prev);
+                        }
                         emit_event(json!({
                             "type": "upload_complete",
-                            "connection_id": connection_id
+                            "connection_id": connection_id,
+                            "bytes": completed_bytes
                         }));
                     }
                     RequestUpdate::Aborted(aborted) => {

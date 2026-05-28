@@ -216,6 +216,22 @@ function formatSpeed(bytesPerSec: number | null): string {
   return `${formatBytes(bytesPerSec)}/s`;
 }
 
+/// Format a duration in seconds as "Xs" / "Xm Ys" / "Xh Ym" — used by both
+/// the live ETA and the post-transfer completion summary's "Time" row.
+function formatDuration(seconds: number): string {
+  if (!isFinite(seconds) || seconds < 0) return "—";
+  if (seconds < 1) return "<1s";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) {
+    const m = Math.floor(seconds / 60);
+    const s = Math.round(seconds % 60);
+    return `${m}m ${s}s`;
+  }
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
 function formatEta(remainingBytes: number, bytesPerSec: number | null): string | null {
   if (bytesPerSec === null || bytesPerSec < 1) return null;
   const seconds = remainingBytes / bytesPerSec;
@@ -333,6 +349,13 @@ function App() {
   // Kept separately because a label can arrive before or after the
   // matching blob connection.
   const labelsByEndpointRef = useRef<Map<string, string>>(new Map());
+  // Timestamps bracketing the actual data transfer, used to compute the
+  // average speed + total time in the "Transfer Complete" summary. For
+  // sends with multiple receivers the stats reflect the FIRST receiver's
+  // completion (when the user conceptually thinks of the send as "done");
+  // per-receiver figures stay accurate in the Receivers panel.
+  const [sendStartedAt, setSendStartedAt] = useState<number | null>(null);
+  const [sendCompletedAt, setSendCompletedAt] = useState<number | null>(null);
 
   // Receive state
   const [ticketInput, setTicketInput] = useState("");
@@ -357,6 +380,11 @@ function App() {
     name: string;
     files: number | null;
   } | null>(null);
+  // Timestamps bracketing the receive — used for the completion summary.
+  // Start = first download_started, end = export_complete (includes the
+  // local write phase, matching the user's perceived total wait).
+  const [recvStartedAt, setRecvStartedAt] = useState<number | null>(null);
+  const [recvCompletedAt, setRecvCompletedAt] = useState<number | null>(null);
   // Opt-in nickname the receiver volunteers so the sender sees who's
   // downloading. Empty = don't send any label. Persisted across launches.
   const [receiverLabel, setReceiverLabel] = useState<string>(loadReceiverLabel);
@@ -730,6 +758,9 @@ function App() {
               bytes: 0,
               total: total ?? null,
             });
+            // Bracket the transfer for the completion-summary stats. Only
+            // the FIRST upload_started (across all receivers) wins.
+            setSendStartedAt((prev) => prev ?? Date.now());
             if (connId !== null) {
               upsertReceiver(connId, {
                 bytes: 0,
@@ -762,6 +793,10 @@ function App() {
             break;
           case "upload_complete":
             setSendStatus("complete");
+            // Mark the completion moment for the summary stats. Only the
+            // FIRST receiver's completion sets this (the moment the send
+            // becomes conceptually "done" for the user).
+            setSendCompletedAt((prev) => prev ?? Date.now());
             setSendProgress((prev) =>
               prev
                 ? {
@@ -870,6 +905,8 @@ function App() {
             break;
           case "download_started":
             setRecvStatus("downloading");
+            // Start the receive clock when bytes actually begin flowing.
+            setRecvStartedAt((prev) => prev ?? Date.now());
             setRecvProgress((prev) => ({
               bytes: prev?.bytes ?? 0,
               total: total ?? prev?.total ?? null,
@@ -930,6 +967,11 @@ function App() {
             break;
           case "export_complete":
             setRecvStatus("complete");
+            // End the receive clock when the file(s) are fully written to
+            // disk — this matches the user's perceived "how long did it
+            // take" (which includes the local export phase, not just the
+            // network transfer).
+            setRecvCompletedAt((prev) => prev ?? Date.now());
             setRecvCurrentFile(null);
             setRecvProgress((prev) => ({
               bytes: total ?? prev?.bytes ?? 0,
@@ -1006,6 +1048,8 @@ function App() {
     setReceivers([]);
     receiverSpeedRef.current.clear();
     labelsByEndpointRef.current.clear();
+    setSendStartedAt(null);
+    setSendCompletedAt(null);
     setTickets(null);
     setSendError(null);
     setSendLogs([]);
@@ -1158,6 +1202,8 @@ function App() {
     setRecvFolderFiles(null);
     setRecvFolderTruncated(false);
     setRecvCurrentFile(null);
+    setRecvStartedAt(null);
+    setRecvCompletedAt(null);
     try {
       // Pass expectedSize so the CLI seeds its own download total from
       // the same canonical value and emits `download_size` immediately —
@@ -1243,6 +1289,34 @@ function App() {
     tickets !== null &&
     ((connectionMode === "direct_only" && !tickets.direct) ||
       (connectionMode === "relay_only" && !tickets.relay));
+
+  // ---- Completion-summary stats (sender + receiver) ----
+  // Computed once per render rather than stored, so they stay in sync
+  // with the latest timestamps / canonical size.
+  const sendElapsedSec =
+    sendStartedAt !== null && sendCompletedAt !== null
+      ? Math.max(0, (sendCompletedAt - sendStartedAt) / 1000)
+      : null;
+  const sendAvgSpeed =
+    sendTotalSize !== null &&
+    sendElapsedSec !== null &&
+    sendElapsedSec > 0
+      ? sendTotalSize / sendElapsedSec
+      : null;
+  const recvElapsedSec =
+    recvStartedAt !== null && recvCompletedAt !== null
+      ? Math.max(0, (recvCompletedAt - recvStartedAt) / 1000)
+      : null;
+  // For receive total: prefer the latest progress total, else fall back to
+  // the share-line's canonical size.
+  const recvTotalForSummary =
+    recvProgress?.total ?? parsedReceive?.canonicalSize ?? null;
+  const recvAvgSpeed =
+    recvTotalForSummary !== null &&
+    recvElapsedSec !== null &&
+    recvElapsedSec > 0
+      ? recvTotalForSummary / recvElapsedSec
+      : null;
 
   return (
     <main className="container">
@@ -1402,9 +1476,59 @@ function App() {
             </p>
           )}
 
-          <p className="status">
-            Status: <code>{sendStatus}</code>
-          </p>
+          {sendStatus !== "complete" && (
+            <p className="status">
+              Status: <code>{sendStatus}</code>
+            </p>
+          )}
+
+          {sendStatus === "complete" && (
+            <div className="completion-summary">
+              <h3>✓ Transfer Complete</h3>
+              <dl>
+                <div>
+                  <dt>Name</dt>
+                  <dd>
+                    <code>
+                      {filePath ? basename(filePath) : "—"}
+                      {isFolderSend ? "/" : ""}
+                    </code>
+                    {isFolderSend && sendFileCount !== null && (
+                      <span className="summary-meta">
+                        {" "}
+                        ({sendFileCount} file
+                        {sendFileCount === 1 ? "" : "s"})
+                      </span>
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Size</dt>
+                  <dd>
+                    {sendTotalSize !== null
+                      ? formatBytes(sendTotalSize)
+                      : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Speed</dt>
+                  <dd>
+                    {sendAvgSpeed !== null
+                      ? `${formatSpeed(sendAvgSpeed)} (avg)`
+                      : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Time</dt>
+                  <dd>
+                    {sendElapsedSec !== null
+                      ? formatDuration(sendElapsedSec)
+                      : "—"}
+                  </dd>
+                </div>
+              </dl>
+            </div>
+          )}
 
           {sendError && <p className="error">{sendError}</p>}
 
@@ -1489,6 +1613,10 @@ function App() {
                 onClick={(e) => (e.target as HTMLTextAreaElement).select()}
                 rows={3}
               />
+              <p className="keep-open-warning" role="status">
+                ⚠ Don't close this window. The file is only available to
+                download while this window stays open.
+              </p>
               {ticketFellBack && (
                 <p className="hint">
                   {connectionMode === "direct_only"
@@ -1654,13 +1782,63 @@ function App() {
 
           {outputPath && <p className="filepath">{outputPath}</p>}
 
-          <p className="status">
-            Status: <code>{recvStatus}</code>
-          </p>
+          {recvStatus !== "complete" && (
+            <p className="status">
+              Status: <code>{recvStatus}</code>
+            </p>
+          )}
+
+          {recvStatus === "complete" && (
+            <div className="completion-summary">
+              <h3>✓ Transfer Complete</h3>
+              <dl>
+                <div>
+                  <dt>Name</dt>
+                  <dd>
+                    <code>
+                      {outputPath ? basename(outputPath) : "—"}
+                      {isFolderReceive ? "/" : ""}
+                    </code>
+                    {isFolderReceive && recvFolderFileCount !== null && (
+                      <span className="summary-meta">
+                        {" "}
+                        ({recvFolderFileCount} file
+                        {recvFolderFileCount === 1 ? "" : "s"})
+                      </span>
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Size</dt>
+                  <dd>
+                    {recvTotalForSummary !== null
+                      ? formatBytes(recvTotalForSummary)
+                      : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Speed</dt>
+                  <dd>
+                    {recvAvgSpeed !== null
+                      ? `${formatSpeed(recvAvgSpeed)} (avg)`
+                      : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Time</dt>
+                  <dd>
+                    {recvElapsedSec !== null
+                      ? formatDuration(recvElapsedSec)
+                      : "—"}
+                  </dd>
+                </div>
+              </dl>
+            </div>
+          )}
 
           {recvError && <p className="error">{recvError}</p>}
 
-          {recvProgress && (() => {
+          {recvStatus !== "complete" && recvProgress && (() => {
             const remaining =
               recvProgress.total !== null
                 ? Math.max(0, recvProgress.total - recvProgress.bytes)

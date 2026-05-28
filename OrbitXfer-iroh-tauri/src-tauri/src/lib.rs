@@ -864,20 +864,12 @@ pub fn run() {
 
                     api.prevent_close();
 
-                    let body = match active_kinds.as_slice() {
-                        ["send"] => {
-                            "A send is in progress in this window. Closing \
-                             will stop the transfer. Close anyway?"
-                        }
-                        ["receive"] => {
-                            "A receive is in progress in this window. Closing \
-                             will stop the download. Close anyway?"
-                        }
-                        _ => {
-                            "Transfers are in progress in this window. \
-                             Closing will stop them. Close anyway?"
-                        }
-                    };
+                    // Single uniform message — the softer "may be in progress"
+                    // wording matches the quit-dialog style and avoids overstating
+                    // certainty about the in-flight state of the sidecar.
+                    let _ = active_kinds; // (intentionally unused with unified copy)
+                    let body = "A transfer may be in progress. Closing this \
+                                window will stop the transfer. Close anyway?";
 
                     let window_clone = window.clone();
                     let label_clone = label.clone();
