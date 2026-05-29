@@ -1,5 +1,10 @@
 # Releases
 
+## v0.1.75 - 2026-05-28
+- **CI now builds a signed Intel Mac DMG** alongside the existing Apple Silicon one. GitHub's `macos-latest` is now Apple Silicon (macos-14), so every release through v0.1.74 shipped arm64-Mac-only. The build matrix now includes `macos-13` (Intel) too, with the same signing + notarization path, producing a second signed/notarized DMG per tag release (`OrbitXfer_<version>_x64.dmg`).
+- Artifact names are arch-aware (`OrbitXfer-macOS-ARM64` vs `OrbitXfer-macOS-X64`) so the two Mac matrix entries don't collide in the release job.
+- **No app code changes from v0.1.74** — this is a CI-only release to deliver the first signed Intel build. If you're on Apple Silicon, the v0.1.74 and v0.1.75 DMGs are functionally identical.
+
 ## v0.1.74 - 2026-05-28
 - **Fix premature "✓ Transfer Complete" on the Send window.** iroh fires `RequestUpdate::Completed` PER CHILD BLOB during a HashSeq (folder) send — root → meta → file₁ → file₂ → … — and the v0.1.73 frontend unconditionally treated the first one as the end. With the root blob completing in microseconds, the summary box flashed on as soon as the transfer began. The CLI's `upload_complete` event now carries both `bytes` (running `completed_bytes`) and `total`, and the frontend only flips to "complete" + locks in the summary stats when `bytes ≥ total`. Intermediate per-blob completions are silent no-ops. Single-file (Raw) sends still hit completion on their lone Completed (`bytes == total`).
 - **Per-receiver ETA** on the Sender's "Receivers" panel — mirrors the Receive window's ETA on the per-row meta line, computed from each receiver's rolling speed + remaining bytes.
