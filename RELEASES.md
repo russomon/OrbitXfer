@@ -1,5 +1,9 @@
 # Releases
 
+## v0.1.77 - 2026-05-29
+- **CI hotfix for v0.1.76's universal2 build.** No app code changes. v0.1.76's CI run failed in the macOS job because Tauri's `--target universal-apple-darwin` build internally compiles each arch slice separately, and during each slice the `tauri-build` build script looks up the sidecar at the slice's *own* triple (`<name>-x86_64-apple-darwin`, then `<name>-aarch64-apple-darwin`) — not the universal one. The original workflow only produced the universal sidecar, so the x86_64 slice's build script panicked. v0.1.77 places all three sidecars (x86_64, aarch64, universal) plus a host-arch CLI at the path `sync:cli` expects.
+- The universal Mac DMG and rest of the matrix are unchanged in spirit from v0.1.76 — same app, now actually buildable.
+
 ## v0.1.76 - 2026-05-29
 - **One universal Mac DMG instead of two arch-specific ones.** CI now produces a single `OrbitXfer_<version>_universal.dmg` that runs natively on both Apple Silicon and Intel Macs — same signed/notarized DMG works everywhere. Eliminates the dependency on GitHub's `macos-13` Intel runner pool, which had become unreliable (multi-hour queues, sometimes days). No app code changes from v0.1.75.
 - **How it works:** the (Apple Silicon) `macos-latest` runner now also installs the `x86_64-apple-darwin` Rust target, builds the CLI sidecar for both archs, lipo-merges them into a `universal-apple-darwin` fat binary, then runs `tauri build --target universal-apple-darwin` for a universal2 .app. Single codesign + notarization pass. Slightly larger DMG (~1.5–2× since both archs' code is included) in exchange for one-DMG simplicity.

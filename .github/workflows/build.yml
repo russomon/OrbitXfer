@@ -148,21 +148,41 @@ jobs:
         if: runner.os == 'macOS'
         run: rustup target add x86_64-apple-darwin
 
-      - name: Build universal2 CLI sidecar (mac)
+      - name: Build universal2 CLI sidecars (mac)
         if: runner.os == 'macOS'
         working-directory: OrbitXfer-iroh-cli
         run: |
           set -euo pipefail
           cargo build --release --target x86_64-apple-darwin
           cargo build --release --target aarch64-apple-darwin
-          mkdir -p ../OrbitXfer-iroh-tauri/src-tauri/binaries
+          BIN_DIR=../OrbitXfer-iroh-tauri/src-tauri/binaries
+          mkdir -p "$BIN_DIR"
+          # Tauri's `--target universal-apple-darwin` compiles each arch
+          # slice SEPARATELY, and during each slice's build the tauri-build
+          # build script looks up the sidecar at the slice's own triple
+          # (`<name>-x86_64-apple-darwin` then `<name>-aarch64-apple-darwin`),
+          # NOT the universal one. Provide all three:
+          cp target/x86_64-apple-darwin/release/orbitxfer-iroh-cli \
+             "$BIN_DIR/orbitxfer-iroh-cli-x86_64-apple-darwin"
+          cp target/aarch64-apple-darwin/release/orbitxfer-iroh-cli \
+             "$BIN_DIR/orbitxfer-iroh-cli-aarch64-apple-darwin"
           lipo -create \
             target/x86_64-apple-darwin/release/orbitxfer-iroh-cli \
             target/aarch64-apple-darwin/release/orbitxfer-iroh-cli \
-            -output ../OrbitXfer-iroh-tauri/src-tauri/binaries/orbitxfer-iroh-cli-universal-apple-darwin
-          chmod +x ../OrbitXfer-iroh-tauri/src-tauri/binaries/orbitxfer-iroh-cli-universal-apple-darwin
-          echo "=== sidecar arch ==="
-          file ../OrbitXfer-iroh-tauri/src-tauri/binaries/orbitxfer-iroh-cli-universal-apple-darwin
+            -output "$BIN_DIR/orbitxfer-iroh-cli-universal-apple-darwin"
+          chmod +x "$BIN_DIR"/orbitxfer-iroh-cli-*
+          # Tauri's beforeBuildCommand runs `npm run sync:cli`, which looks
+          # for the CLI at OrbitXfer-iroh-cli/target/release/orbitxfer-iroh-cli
+          # (no target triple). Our --target builds above put binaries
+          # under target/<triple>/release/, so that path is empty. Place
+          # the host-arch (aarch64) binary there so sync:cli succeeds and
+          # writes the same content into the aarch64 sidecar slot (idempotent).
+          mkdir -p target/release
+          cp target/aarch64-apple-darwin/release/orbitxfer-iroh-cli target/release/orbitxfer-iroh-cli
+          echo "=== sidecar arches ==="
+          for f in "$BIN_DIR"/orbitxfer-iroh-cli-*; do
+            file "$f"
+          done
 
       - name: Build Tauri bundle (mac universal2)
         if: runner.os == 'macOS'
