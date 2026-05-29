@@ -15,15 +15,27 @@ project_dir="$(cd "${script_dir}/.." && pwd)"
 
 app_path="${1:-}"
 if [[ -z "${app_path}" ]]; then
-  # Look in both the host-arch and universal-apple-darwin bundle paths —
-  # the universal2 build (from v0.1.76 onward in CI) lands its .app at
+  # Look in both the host-arch and universal-apple-darwin bundle paths.
+  # The universal2 build (v0.1.76+ in CI) lands its .app at
   # target/universal-apple-darwin/release/bundle/macos/.
-  app_path="$(find \
-    "${project_dir}/src-tauri/target/release/bundle/macos" \
-    "${project_dir}/src-tauri/target/universal-apple-darwin/release/bundle/macos" \
-    -maxdepth 2 -type d -name 'OrbitXfer.app' 2>/dev/null \
-    | sort \
-    | head -n 1)"
+  #
+  # We iterate per-candidate (not one multi-arg `find`) because passing a
+  # non-existent path to `find` makes it exit 1, and with `set -euo
+  # pipefail` that aborts the script before we ever discover the .app at
+  # the other (existing) candidate.
+  candidates=(
+    "${project_dir}/src-tauri/target/release/bundle/macos"
+    "${project_dir}/src-tauri/target/universal-apple-darwin/release/bundle/macos"
+  )
+  for dir in "${candidates[@]}"; do
+    if [[ -d "${dir}" ]]; then
+      hit="$(find "${dir}" -maxdepth 2 -type d -name 'OrbitXfer.app' 2>/dev/null | sort | head -n 1)"
+      if [[ -n "${hit}" ]]; then
+        app_path="${hit}"
+        break
+      fi
+    fi
+  done
 fi
 
 if [[ -z "${app_path}" || ! -d "${app_path}" ]]; then

@@ -1,5 +1,10 @@
 # Releases
 
+## v0.1.78 - 2026-05-29
+- **CI hotfix for v0.1.77's mac verify step.** No app code changes. v0.1.77's mac build actually succeeded and produced a signed/notarized universal DMG — but the post-build `verify-macos-release.sh` script aborted with exit 1 before validating it. Cause: the script passed two candidate search paths to a single `find` invocation, and when one path didn't exist (the host-arch `target/release/bundle/macos`, which doesn't exist anymore with `--target` builds), `find` exited 1, and `set -euo pipefail` killed the script before the other (existing, universal) path could be searched.
+- Script now iterates the candidate paths individually, skipping ones that don't exist, so it reliably locates the .app in the universal-apple-darwin output.
+- Validated locally: the verify script now gets past the find step and reaches codesign on a fresh-state .app.
+
 ## v0.1.77 - 2026-05-29
 - **CI hotfix for v0.1.76's universal2 build.** No app code changes. v0.1.76's CI run failed in the macOS job because Tauri's `--target universal-apple-darwin` build internally compiles each arch slice separately, and during each slice the `tauri-build` build script looks up the sidecar at the slice's *own* triple (`<name>-x86_64-apple-darwin`, then `<name>-aarch64-apple-darwin`) — not the universal one. The original workflow only produced the universal sidecar, so the x86_64 slice's build script panicked. v0.1.77 places all three sidecars (x86_64, aarch64, universal) plus a host-arch CLI at the path `sync:cli` expects.
 - The universal Mac DMG and rest of the matrix are unchanged in spirit from v0.1.76 — same app, now actually buildable.
