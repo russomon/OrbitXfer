@@ -1,5 +1,9 @@
 # Releases
 
+## v0.1.79 - 2026-05-29
+- **CI hotfix: clean stale bundle outputs before each tag build.** No app code changes. v0.1.78's release inadvertently included Windows/Linux installers from v0.1.76 (`OrbitXfer_0.1.76_x64-setup.exe`, `.msi`, `.deb`, `.rpm`) alongside the correct `0.1.78_` ones. Cause: the Cargo cache covers `OrbitXfer-iroh-tauri/src-tauri/target/`, which includes the `bundle/` output directory Tauri writes installers to, and the cache key only hashes `Cargo.lock` (which doesn't change on version bumps). v0.1.76's still-present bundles got restored from cache, lingered in the directory, and were glob-uploaded next to v0.1.78's fresh outputs.
+- Workflow now runs `rm -rf src-tauri/target/release/bundle src-tauri/target/universal-apple-darwin/release/bundle` before each `tauri build`, so only freshly-built artifacts make it into the release. Cross-platform via `shell: bash`.
+
 ## v0.1.78 - 2026-05-29
 - **CI hotfix for v0.1.77's mac verify step.** No app code changes. v0.1.77's mac build actually succeeded and produced a signed/notarized universal DMG — but the post-build `verify-macos-release.sh` script aborted with exit 1 before validating it. Cause: the script passed two candidate search paths to a single `find` invocation, and when one path didn't exist (the host-arch `target/release/bundle/macos`, which doesn't exist anymore with `--target` builds), `find` exited 1, and `set -euo pipefail` killed the script before the other (existing, universal) path could be searched.
 - Script now iterates the candidate paths individually, skipping ones that don't exist, so it reliably locates the .app in the universal-apple-darwin output.

@@ -184,6 +184,19 @@ jobs:
             file "$f"
           done
 
+      # The Cargo cache (above) covers OrbitXfer-iroh-tauri/src-tauri/target,
+      # which includes the `bundle/` output dir Tauri writes installers to.
+      # Without this clean, a cached `bundle/` from a previous version's
+      # successful build (e.g. v0.1.76's Win/Linux DMG/MSI/deb/rpm) sticks
+      # around and gets glob-uploaded alongside the freshly-built ones.
+      # Cache key only hashes Cargo.lock, so it survives version bumps.
+      # Cross-platform via `shell: bash`.
+      - name: Clean stale bundle outputs
+        shell: bash
+        run: |
+          rm -rf OrbitXfer-iroh-tauri/src-tauri/target/release/bundle
+          rm -rf OrbitXfer-iroh-tauri/src-tauri/target/universal-apple-darwin/release/bundle
+
       - name: Build Tauri bundle (mac universal2)
         if: runner.os == 'macOS'
         working-directory: OrbitXfer-iroh-tauri
