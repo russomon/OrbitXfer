@@ -16,7 +16,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        # macos-latest is Apple Silicon (arm64). Add macos-13 to also
+        # produce an Intel (x86_64) Mac DMG. Both run through the same
+        # signing + notarization steps so we get two signed Mac DMGs per
+        # tag release. Windows and Linux are single-arch builds.
+        os: [macos-latest, macos-13, windows-latest, ubuntu-latest]
 
     steps:
       - name: Checkout
@@ -147,7 +151,9 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: OrbitXfer-${{ runner.os }}
+          # Include arch so the two macOS matrix entries (arm64 + x64)
+          # don't collide on the same artifact name.
+          name: OrbitXfer-${{ runner.os }}-${{ runner.arch }}
           # Pick up every user-installable artifact format Tauri's bundler
           # might produce. Missing globs (e.g. .msi on Linux) are silently
           # ignored by upload-artifact.
