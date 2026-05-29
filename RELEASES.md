@@ -1,5 +1,10 @@
 # Releases
 
+## v0.1.76 - 2026-05-29
+- **One universal Mac DMG instead of two arch-specific ones.** CI now produces a single `OrbitXfer_<version>_universal.dmg` that runs natively on both Apple Silicon and Intel Macs — same signed/notarized DMG works everywhere. Eliminates the dependency on GitHub's `macos-13` Intel runner pool, which had become unreliable (multi-hour queues, sometimes days). No app code changes from v0.1.75.
+- **How it works:** the (Apple Silicon) `macos-latest` runner now also installs the `x86_64-apple-darwin` Rust target, builds the CLI sidecar for both archs, lipo-merges them into a `universal-apple-darwin` fat binary, then runs `tauri build --target universal-apple-darwin` for a universal2 .app. Single codesign + notarization pass. Slightly larger DMG (~1.5–2× since both archs' code is included) in exchange for one-DMG simplicity.
+- **CI matrix back to three entries** (`macos-latest`, `windows-latest`, `ubuntu-latest`); no more `macos-13`. The Intel runner queue purgatory is over.
+
 ## v0.1.75 - 2026-05-28
 - **CI now builds a signed Intel Mac DMG** alongside the existing Apple Silicon one. GitHub's `macos-latest` is now Apple Silicon (macos-14), so every release through v0.1.74 shipped arm64-Mac-only. The build matrix now includes `macos-13` (Intel) too, with the same signing + notarization path, producing a second signed/notarized DMG per tag release (`OrbitXfer_<version>_x64.dmg`).
 - Artifact names are arch-aware (`OrbitXfer-macOS-ARM64` vs `OrbitXfer-macOS-X64`) so the two Mac matrix entries don't collide in the release job.

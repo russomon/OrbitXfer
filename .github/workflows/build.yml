@@ -16,11 +16,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-latest is Apple Silicon (arm64). Add macos-13 to also
-        # produce an Intel (x86_64) Mac DMG. Both run through the same
-        # signing + notarization steps so we get two signed Mac DMGs per
-        # tag release. Windows and Linux are single-arch builds.
-        os: [macos-latest, macos-13, windows-latest, ubuntu-latest]
+        # macos-latest = Apple Silicon. We cross-compile the Intel slice
+        # on this same runner and lipo-merge into a single universal2 .app
+        # so one signed/notarized DMG installs on both Mac archs. This
+        # avoids the (now-starved) macos-13 Intel runner queue entirely.
+        os: [macos-latest, windows-latest, ubuntu-latest]
 
     steps:
       - name: Checkout
@@ -139,7 +139,38 @@ jobs:
           [[ "${ORBITXFER_MAC_SIGNING_READY}" == "true" ]] || (echo "Tagged macOS releases require CSC_LINK and CSC_KEY_PASSWORD secrets." && exit 1)
           [[ "${ORBITXFER_MAC_NOTARIZATION_READY}" == "true" ]] || (echo "Tagged macOS releases require APPLE_API_KEY, APPLE_API_KEY_ID, and APPLE_API_ISSUER secrets." && exit 1)
 
-      - name: Build Tauri bundle
+      # ----------------------------------------------------------------
+      # macOS universal2 prep: lipo-merge an x86_64 + aarch64 CLI sidecar
+      # so Tauri's `--target universal-apple-darwin` finds a fat-binary
+      # sidecar named `<name>-universal-apple-darwin`. Runs only on mac.
+      # ----------------------------------------------------------------
+      - name: Add x86_64-apple-darwin Rust target (mac)
+        if: runner.os == 'macOS'
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Build universal2 CLI sidecar (mac)
+        if: runner.os == 'macOS'
+        working-directory: OrbitXfer-iroh-cli
+        run: |
+          set -euo pipefail
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          mkdir -p ../OrbitXfer-iroh-tauri/src-tauri/binaries
+          lipo -create \
+            target/x86_64-apple-darwin/release/orbitxfer-iroh-cli \
+            target/aarch64-apple-darwin/release/orbitxfer-iroh-cli \
+            -output ../OrbitXfer-iroh-tauri/src-tauri/binaries/orbitxfer-iroh-cli-universal-apple-darwin
+          chmod +x ../OrbitXfer-iroh-tauri/src-tauri/binaries/orbitxfer-iroh-cli-universal-apple-darwin
+          echo "=== sidecar arch ==="
+          file ../OrbitXfer-iroh-tauri/src-tauri/binaries/orbitxfer-iroh-cli-universal-apple-darwin
+
+      - name: Build Tauri bundle (mac universal2)
+        if: runner.os == 'macOS'
+        working-directory: OrbitXfer-iroh-tauri
+        run: npm run tauri -- build --target universal-apple-darwin
+
+      - name: Build Tauri bundle (win/linux)
+        if: runner.os != 'macOS'
         working-directory: OrbitXfer-iroh-tauri
         run: npm run tauri build
 
@@ -151,14 +182,14 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          # Include arch so the two macOS matrix entries (arm64 + x64)
-          # don't collide on the same artifact name.
-          name: OrbitXfer-${{ runner.os }}-${{ runner.arch }}
+          name: OrbitXfer-${{ runner.os }}
           # Pick up every user-installable artifact format Tauri's bundler
           # might produce. Missing globs (e.g. .msi on Linux) are silently
-          # ignored by upload-artifact.
+          # ignored by upload-artifact. The `universal-apple-darwin/`
+          # path is where Tauri's --target lands the mac DMG.
           path: |
             OrbitXfer-iroh-tauri/src-tauri/target/release/bundle/dmg/*.dmg
+            OrbitXfer-iroh-tauri/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
             OrbitXfer-iroh-tauri/src-tauri/target/release/bundle/nsis/*.exe
             OrbitXfer-iroh-tauri/src-tauri/target/release/bundle/msi/*.msi
             OrbitXfer-iroh-tauri/src-tauri/target/release/bundle/appimage/*.AppImage
