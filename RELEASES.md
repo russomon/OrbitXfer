@@ -1,5 +1,10 @@
 # Releases
 
+## v0.1.74 - 2026-05-28
+- **Fix premature "✓ Transfer Complete" on the Send window.** iroh fires `RequestUpdate::Completed` PER CHILD BLOB during a HashSeq (folder) send — root → meta → file₁ → file₂ → … — and the v0.1.73 frontend unconditionally treated the first one as the end. With the root blob completing in microseconds, the summary box flashed on as soon as the transfer began. The CLI's `upload_complete` event now carries both `bytes` (running `completed_bytes`) and `total`, and the frontend only flips to "complete" + locks in the summary stats when `bytes ≥ total`. Intermediate per-blob completions are silent no-ops. Single-file (Raw) sends still hit completion on their lone Completed (`bytes == total`).
+- **Per-receiver ETA** on the Sender's "Receivers" panel — mirrors the Receive window's ETA on the per-row meta line, computed from each receiver's rolling speed + remaining bytes.
+- **Send-side completion summary moved down.** The "✓ Transfer Complete" block now appears just above the Send logs (after the Receivers panel) instead of up by the status line — keeps the ticket and live receiver rows in their natural reading flow during the transfer and uses the summary as a closing note.
+
 ## v0.1.73 - 2026-05-24
 - **Send progress bar no longer resets per file during a folder upload.** The CLI's `spawn_updates` now aggregates `RequestUpdate::Progress.end_offset` across all blobs in a HashSeq, so the sender's bar climbs monotonically across the whole folder instead of snapping back to 0 each time iroh advances to the next child blob. Single-file (Raw) sends are unchanged. Receive-side progress was already aggregate (iroh's downloader reports cumulative bytes) — this brings the send side into parity.
 - **"Transfer Complete" summary** on both Send and Receive windows. When a transfer finishes, the bare `Status: complete` line is replaced by a green-accented block listing the file/folder name (with file count for folders), total size, average speed (= size / elapsed), and total time. For multi-receiver sends, stats reflect the first receiver's completion; per-receiver speed/time stays accurate in the Receivers panel.

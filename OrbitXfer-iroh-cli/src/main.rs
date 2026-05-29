@@ -38,7 +38,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.73";
+const CLI_VERSION: &str = "0.1.74";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -838,16 +838,26 @@ async fn run_send(file_path: PathBuf) -> Result<()> {
                         }));
                     }
                     RequestUpdate::Completed(_) => {
-                        // The final blob finishes now (its size hasn't yet
-                        // been promoted into completed_bytes because no
-                        // further Started followed it).
+                        // For a HashSeq send, iroh fires Completed PER child
+                        // blob, not once per request — so this branch runs
+                        // for the root, the meta, and every file blob. Each
+                        // emit carries the running `completed_bytes` and
+                        // the canonical `total`, so the frontend can tell
+                        // an intermediate per-blob completion (`bytes` <
+                        // `total`) from the true final one (`bytes` covers
+                        // the whole payload). Without that distinction the
+                        // sender would flash "Transfer Complete" the moment
+                        // the tiny root blob finishes.
                         if let Some(prev) = current_blob_size.take() {
                             completed_bytes = completed_bytes.saturating_add(prev);
                         }
+                        let total_val = total.load(Ordering::Relaxed);
+                        let total_opt = if total_val > 0 { Some(total_val) } else { None };
                         emit_event(json!({
                             "type": "upload_complete",
                             "connection_id": connection_id,
-                            "bytes": completed_bytes
+                            "bytes": completed_bytes,
+                            "total": total_opt
                         }));
                     }
                     RequestUpdate::Aborted(aborted) => {

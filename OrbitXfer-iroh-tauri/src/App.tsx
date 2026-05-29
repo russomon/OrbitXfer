@@ -791,38 +791,59 @@ function App() {
               });
             }
             break;
-          case "upload_complete":
-            setSendStatus("complete");
-            // Mark the completion moment for the summary stats. Only the
-            // FIRST receiver's completion sets this (the moment the send
-            // becomes conceptually "done" for the user).
-            setSendCompletedAt((prev) => prev ?? Date.now());
-            setSendProgress((prev) =>
-              prev
-                ? {
-                    phase: "uploading",
-                    bytes: prev.total ?? prev.bytes,
-                    total: prev.total,
-                  }
-                : null
-            );
-            sendSpeedRef.current = [];
-            setSendSpeed(null);
-            if (connId !== null) {
-              setReceivers((prev) =>
-                prev.map((r) =>
-                  r.connectionId === connId
-                    ? {
-                        ...r,
-                        bytes: r.total ?? r.bytes,
-                        speed: null,
-                        status: "complete",
-                      }
-                    : r
-                )
+          case "upload_complete": {
+            // For a HashSeq (folder) send, iroh fires Completed PER child
+            // blob — root, meta, then each file — so this event arrives
+            // many times. Only treat it as "the transfer is done" when the
+            // running completed_bytes (carried as `bytes`) covers the
+            // canonical `total`. Without this gate the summary would flash
+            // ✓ Transfer Complete the moment the tiny root blob finishes
+            // (which is microseconds after Start).
+            const completedBytes =
+              typeof parsed.bytes === "number" ? parsed.bytes : null;
+            const totalForCheck =
+              typeof parsed.total === "number" ? parsed.total : null;
+            const isFinal =
+              totalForCheck === null ||
+              completedBytes === null ||
+              completedBytes >= totalForCheck;
+            if (isFinal) {
+              setSendStatus("complete");
+              // Mark the completion moment for the summary stats. Only the
+              // FIRST receiver's TRUE completion sets this (the moment the
+              // send is actually done for that receiver).
+              setSendCompletedAt((prev) => prev ?? Date.now());
+              setSendProgress((prev) =>
+                prev
+                  ? {
+                      phase: "uploading",
+                      bytes: prev.total ?? prev.bytes,
+                      total: prev.total,
+                    }
+                  : null
               );
+              sendSpeedRef.current = [];
+              setSendSpeed(null);
+              if (connId !== null) {
+                setReceivers((prev) =>
+                  prev.map((r) =>
+                    r.connectionId === connId
+                      ? {
+                          ...r,
+                          bytes: r.total ?? r.bytes,
+                          speed: null,
+                          status: "complete",
+                        }
+                      : r
+                  )
+                );
+              }
             }
+            // Intermediate per-blob completions are intentionally a no-op:
+            // upload_started for the next blob will arrive and the speed/
+            // bytes display continues uninterrupted.
             break;
+          }
           case "error":
             setSendError(`${parsed.stage}: ${parsed.message}`);
             setSendStatus("error");
@@ -1482,54 +1503,6 @@ function App() {
             </p>
           )}
 
-          {sendStatus === "complete" && (
-            <div className="completion-summary">
-              <h3>✓ Transfer Complete</h3>
-              <dl>
-                <div>
-                  <dt>Name</dt>
-                  <dd>
-                    <code>
-                      {filePath ? basename(filePath) : "—"}
-                      {isFolderSend ? "/" : ""}
-                    </code>
-                    {isFolderSend && sendFileCount !== null && (
-                      <span className="summary-meta">
-                        {" "}
-                        ({sendFileCount} file
-                        {sendFileCount === 1 ? "" : "s"})
-                      </span>
-                    )}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Size</dt>
-                  <dd>
-                    {sendTotalSize !== null
-                      ? formatBytes(sendTotalSize)
-                      : "—"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Speed</dt>
-                  <dd>
-                    {sendAvgSpeed !== null
-                      ? `${formatSpeed(sendAvgSpeed)} (avg)`
-                      : "—"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Time</dt>
-                  <dd>
-                    {sendElapsedSec !== null
-                      ? formatDuration(sendElapsedSec)
-                      : "—"}
-                  </dd>
-                </div>
-              </dl>
-            </div>
-          )}
-
           {sendError && <p className="error">{sendError}</p>}
 
           {sendProgress && sendProgress.phase === "hashing" && (() => {
@@ -1647,6 +1620,12 @@ function App() {
                   const nodeShort = r.endpointId
                     ? `${r.endpointId.slice(0, 8)}…`
                     : null;
+                  // Per-receiver ETA: estimate of time-to-go from this
+                  // receiver's rolling speed + remaining bytes.
+                  const eta =
+                    r.total !== null && r.speed !== null && r.speed > 0
+                      ? formatEta(Math.max(0, r.total - r.bytes), r.speed)
+                      : null;
                   return (
                     <li key={r.connectionId} className="receiver-row">
                       <div className="receiver-head">
@@ -1683,12 +1662,66 @@ function App() {
                               <span>{formatSpeed(r.speed)}</span>
                             </>
                           )}
+                          {eta !== null && (
+                            <>
+                              <span className="progress-sep">·</span>
+                              <span>ETA {eta}</span>
+                            </>
+                          )}
                         </div>
                       )}
                     </li>
                   );
                 })}
               </ul>
+            </div>
+          )}
+
+          {sendStatus === "complete" && (
+            <div className="completion-summary">
+              <h3>✓ Transfer Complete</h3>
+              <dl>
+                <div>
+                  <dt>Name</dt>
+                  <dd>
+                    <code>
+                      {filePath ? basename(filePath) : "—"}
+                      {isFolderSend ? "/" : ""}
+                    </code>
+                    {isFolderSend && sendFileCount !== null && (
+                      <span className="summary-meta">
+                        {" "}
+                        ({sendFileCount} file
+                        {sendFileCount === 1 ? "" : "s"})
+                      </span>
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Size</dt>
+                  <dd>
+                    {sendTotalSize !== null
+                      ? formatBytes(sendTotalSize)
+                      : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Speed</dt>
+                  <dd>
+                    {sendAvgSpeed !== null
+                      ? `${formatSpeed(sendAvgSpeed)} (avg)`
+                      : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Time</dt>
+                  <dd>
+                    {sendElapsedSec !== null
+                      ? formatDuration(sendElapsedSec)
+                      : "—"}
+                  </dd>
+                </div>
+              </dl>
             </div>
           )}
 
