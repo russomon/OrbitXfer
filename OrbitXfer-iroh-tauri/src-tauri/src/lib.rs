@@ -21,6 +21,9 @@ const MENU_ID_RESUME_LAST_SEND: &str = "ox-resume-last-send";
 const MENU_ID_VIEW_ZOOM_IN: &str = "ox-view-zoom-in";
 const MENU_ID_VIEW_ZOOM_OUT: &str = "ox-view-zoom-out";
 const MENU_ID_VIEW_ACTUAL_SIZE: &str = "ox-view-actual-size";
+const MENU_ID_THEME_AUTO: &str = "ox-theme-auto";
+const MENU_ID_THEME_LIGHT: &str = "ox-theme-light";
+const MENU_ID_THEME_DARK: &str = "ox-theme-dark";
 const MENU_ID_WINDOW_PREFIX: &str = "ox-window-";
 
 /// Each transfer window has its own isolated send/receive process slot.
@@ -265,12 +268,35 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .id(MENU_ID_VIEW_ACTUAL_SIZE)
         .accelerator("CmdOrCtrl+0")
         .build(app)?;
+
+    // ---- Theme submenu (under View) ----
+    // Each item emits a `theme:set` event with the corresponding payload
+    // ("auto" | "light" | "dark") to ALL windows (theme is global). The
+    // frontend persists the choice in localStorage and applies the
+    // resolved palette via the `data-theme` attribute on <html>.
+    let theme_auto = MenuItemBuilder::new("Auto (Follow System)")
+        .id(MENU_ID_THEME_AUTO)
+        .build(app)?;
+    let theme_light = MenuItemBuilder::new("Light")
+        .id(MENU_ID_THEME_LIGHT)
+        .build(app)?;
+    let theme_dark = MenuItemBuilder::new("Dark")
+        .id(MENU_ID_THEME_DARK)
+        .build(app)?;
+    let theme_submenu = SubmenuBuilder::new(app, "Theme")
+        .item(&theme_auto)
+        .item(&theme_light)
+        .item(&theme_dark)
+        .build()?;
+
     let view_submenu = SubmenuBuilder::new(app, "View")
         .item(&PredefinedMenuItem::fullscreen(app, None)?)
         .separator()
         .item(&actual_size)
         .item(&zoom_in)
         .item(&zoom_out)
+        .separator()
+        .item(&theme_submenu)
         .build()?;
 
     // ---- Window menu ----
@@ -811,6 +837,18 @@ pub fn run() {
                         if let Some(window) = focused_window(app) {
                             let _ = window.emit("view:actual-size", ());
                         }
+                    }
+                    MENU_ID_THEME_AUTO => {
+                        // Theme is global — emit to ALL windows (not just
+                        // the focused one). Every window updates its
+                        // data-theme attribute and persists to localStorage.
+                        let _ = app.emit("theme:set", "auto");
+                    }
+                    MENU_ID_THEME_LIGHT => {
+                        let _ = app.emit("theme:set", "light");
+                    }
+                    MENU_ID_THEME_DARK => {
+                        let _ = app.emit("theme:set", "dark");
                     }
                     _ if id.starts_with(MENU_ID_WINDOW_PREFIX) => {
                         // Window submenu list item: bring that window to

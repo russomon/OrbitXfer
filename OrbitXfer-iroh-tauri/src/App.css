@@ -1,20 +1,76 @@
+/* ============================================================
+   OrbitXfer palette — 13 role-based tokens.
+   Light values live on :root; dark values override on
+   [data-theme="dark"]. The theme is set on <html> by an inline
+   script in index.html (to avoid flash) and then managed by React.
+   System "Auto" mode resolves to one of these two in JS.
+   ============================================================ */
+
 :root {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
     "Helvetica Neue", Arial, sans-serif;
   color-scheme: light dark;
+
+  /* Light palette (default) */
+  --bg:               #f6f7f9;
+  --surface:          #ffffff;
+  --surface-elevated: #fafbfc;
+  --border:           #e5e7eb;
+  --text:             #0f172a;
+  --text-muted:       #475569;
+  --text-subtle:      #94a3b8;
+  --accent:           #2563eb;
+  --accent-bg:        rgba(37, 99, 235, 0.08);
+  --accent-border:    rgba(37, 99, 235, 0.25);
+  --success:          #15803d;
+  --success-bg:       rgba(21, 128, 61, 0.06);
+  --success-border:   rgba(21, 128, 61, 0.25);
+  --warn:             #f59e0b;
+  --warn-bg:          rgba(245, 158, 11, 0.08);
+  --warn-border:      rgba(245, 158, 11, 0.25);
+  --warn-text:        #92400e;
+  --danger:           #dc2626;
+  --danger-bg:        rgba(220, 38, 38, 0.06);
+  --code-bg:          #f1f5f9;
+  --code-bg-soft:     rgba(0, 0, 0, 0.04);
+  --shadow-soft:      0 1px 2px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.04);
 }
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg:               #0f1419;
+  --surface:          #161b25;
+  --surface-elevated: #1e2533;
+  --border:           #262d3a;
+  --text:             #e2e8f0;
+  --text-muted:       #94a3b8;
+  --text-subtle:      #64748b;
+  --accent:           #60a5fa;
+  --accent-bg:        rgba(96, 165, 250, 0.12);
+  --accent-border:    rgba(96, 165, 250, 0.3);
+  --success:          #4ade80;
+  --success-bg:       rgba(74, 222, 128, 0.08);
+  --success-border:   rgba(74, 222, 128, 0.25);
+  --warn:             #fbbf24;
+  --warn-bg:          rgba(251, 191, 36, 0.10);
+  --warn-border:      rgba(251, 191, 36, 0.3);
+  --warn-text:        #fbbf24;
+  --danger:           #f87171;
+  --danger-bg:        rgba(248, 113, 113, 0.08);
+  --code-bg:          #0d121b;
+  --code-bg-soft:     rgba(255, 255, 255, 0.04);
+  --shadow-soft:      0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+/* ============================================================
+   Base
+   ============================================================ */
 
 body {
   margin: 0;
-  background: #f4f5f7;
-  color: #1a1f2c;
-}
-
-@media (prefers-color-scheme: dark) {
-  body {
-    background: #15181f;
-    color: #e6e8ed;
-  }
+  background: var(--bg);
+  color: var(--text);
 }
 
 .container {
@@ -37,11 +93,22 @@ header h1 {
   margin-bottom: 24px;
 }
 
+.app-header > div {
+  flex: 1;
+  min-width: 0;
+}
+
 .app-header-right {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
+}
+
+.subtitle {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 0.9rem;
 }
 
 .keep-awake-badge {
@@ -51,30 +118,11 @@ header h1 {
   padding: 4px 10px;
   font-size: 0.75rem;
   font-weight: 500;
-  background: rgba(180, 83, 9, 0.1);
-  border: 1px solid rgba(180, 83, 9, 0.25);
-  color: #92400e;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  color: var(--warn-text);
   border-radius: 999px;
   white-space: nowrap;
-}
-
-@media (prefers-color-scheme: dark) {
-  .keep-awake-badge {
-    background: rgba(251, 191, 36, 0.12);
-    border-color: rgba(251, 191, 36, 0.3);
-    color: #fcd34d;
-  }
-}
-
-.app-header > div {
-  flex: 1;
-  min-width: 0;
-}
-
-.subtitle {
-  margin: 4px 0 0;
-  color: #6b7280;
-  font-size: 0.9rem;
 }
 
 .ghost-button {
@@ -82,18 +130,17 @@ header h1 {
   padding: 6px 12px;
   font-size: 0.85rem;
   background: transparent;
-  border: 1px solid rgba(0, 0, 0, 0.15);
+  border: 1px solid var(--border);
+  color: var(--text);
 }
 
-@media (prefers-color-scheme: dark) {
-  .ghost-button {
-    border-color: rgba(255, 255, 255, 0.15);
-  }
-}
+/* ============================================================
+   Mode switch tabs (Send / Receive)
+   ============================================================ */
 
 .mode-switch {
   display: inline-flex;
-  background: rgba(0, 0, 0, 0.06);
+  background: var(--code-bg-soft);
   border-radius: 8px;
   padding: 3px;
   margin-bottom: 16px;
@@ -106,56 +153,45 @@ header h1 {
   padding: 6px 18px;
   border-radius: 6px;
   font-size: 0.9rem;
-  color: #4b5563;
+  color: var(--text-muted);
   cursor: pointer;
   box-shadow: none;
   transition: background 120ms ease, color 120ms ease;
 }
 
 .mode-switch button:hover:not(:disabled):not(.active) {
-  background: rgba(0, 0, 0, 0.04);
+  background: var(--code-bg-soft);
 }
 
 .mode-switch button.active {
-  background: white;
-  color: #1a1f2c;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-soft);
   font-weight: 500;
 }
 
-@media (prefers-color-scheme: dark) {
-  .mode-switch {
-    background: rgba(255, 255, 255, 0.05);
-  }
-  .mode-switch button {
-    color: #9ca3af;
-  }
-  .mode-switch button:hover:not(:disabled):not(.active) {
-    background: rgba(255, 255, 255, 0.04);
-  }
-  .mode-switch button.active {
-    background: #2a303b;
-    color: #e6e8ed;
-  }
-}
+/* ============================================================
+   Panel
+   ============================================================ */
 
 .panel {
-  background: white;
+  background: var(--surface);
   border-radius: 12px;
   padding: 24px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.04);
-}
-
-@media (prefers-color-scheme: dark) {
-  .panel {
-    background: #1f242e;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
-  }
+  box-shadow: var(--shadow-soft);
 }
 
 .panel h2 {
   margin-top: 0;
 }
+
+.panel + .panel {
+  margin-top: 20px;
+}
+
+/* ============================================================
+   Buttons + actions
+   ============================================================ */
 
 .actions {
   display: flex;
@@ -166,15 +202,16 @@ header h1 {
 button {
   padding: 8px 16px;
   border-radius: 8px;
-  border: 1px solid rgba(0, 0, 0, 0.12);
-  background: #fff;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
   font-size: 0.95rem;
   cursor: pointer;
   transition: background 120ms ease;
 }
 
 button:hover:not(:disabled) {
-  background: #eef0f3;
+  background: var(--surface-elevated);
 }
 
 button:disabled {
@@ -182,53 +219,44 @@ button:disabled {
   cursor: not-allowed;
 }
 
-@media (prefers-color-scheme: dark) {
-  button {
-    background: #2a303b;
-    border-color: rgba(255, 255, 255, 0.1);
-    color: inherit;
-  }
-  button:hover:not(:disabled) {
-    background: #353c49;
-  }
-}
+/* ============================================================
+   Filepath + status
+   ============================================================ */
 
 .filepath {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 0.85rem;
-  color: #4b5563;
+  color: var(--text-muted);
   word-break: break-all;
-  background: rgba(0, 0, 0, 0.04);
+  background: var(--code-bg-soft);
   padding: 8px 10px;
   border-radius: 6px;
 }
 
-@media (prefers-color-scheme: dark) {
-  .filepath {
-    background: rgba(255, 255, 255, 0.05);
-    color: #c0c5cc;
-  }
-}
-
 .status code {
-  background: rgba(0, 0, 0, 0.05);
+  background: var(--code-bg-soft);
   padding: 2px 6px;
   border-radius: 4px;
   font-size: 0.85rem;
+  color: var(--text);
 }
 
 .error {
-  color: #b91c1c;
-  background: #fef2f2;
+  color: var(--danger);
+  background: var(--danger-bg);
   padding: 8px 12px;
   border-radius: 6px;
   font-size: 0.9rem;
 }
 
+/* ============================================================
+   Ticket box
+   ============================================================ */
+
 .ticket-box {
   margin-top: 16px;
   padding-top: 16px;
-  border-top: 1px solid rgba(0, 0, 0, 0.08);
+  border-top: 1px solid var(--border);
 }
 
 .ticket-box h3 {
@@ -243,23 +271,20 @@ button:disabled {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 0.8rem;
   border-radius: 6px;
-  border: 1px solid rgba(0, 0, 0, 0.12);
+  border: 1px solid var(--border);
   resize: vertical;
-  background: #fafbfc;
-}
-
-@media (prefers-color-scheme: dark) {
-  .ticket-box textarea {
-    background: #15181f;
-    border-color: rgba(255, 255, 255, 0.1);
-    color: inherit;
-  }
+  background: var(--code-bg);
+  color: var(--text);
 }
 
 .ticket-box details {
   margin-top: 8px;
   font-size: 0.85rem;
 }
+
+/* ============================================================
+   Logs disclosure
+   ============================================================ */
 
 .logs {
   margin-top: 16px;
@@ -269,22 +294,17 @@ button:disabled {
 .logs pre {
   max-height: 240px;
   overflow: auto;
-  background: rgba(0, 0, 0, 0.04);
+  background: var(--code-bg-soft);
+  color: var(--text);
   padding: 12px;
   border-radius: 8px;
   font-size: 0.75rem;
   margin: 8px 0 0;
 }
 
-@media (prefers-color-scheme: dark) {
-  .logs pre {
-    background: rgba(255, 255, 255, 0.03);
-  }
-}
-
-.panel + .panel {
-  margin-top: 20px;
-}
+/* ============================================================
+   Field (label + textarea/input)
+   ============================================================ */
 
 .field {
   display: block;
@@ -294,71 +314,64 @@ button:disabled {
 .field > span {
   display: block;
   font-size: 0.85rem;
-  color: #4b5563;
+  color: var(--text-muted);
   margin-bottom: 4px;
 }
 
-@media (prefers-color-scheme: dark) {
-  .field > span {
-    color: #9ca3af;
-  }
-}
-
-.field textarea {
-  width: 100%;
-  padding: 8px 10px;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 0.8rem;
-  border-radius: 6px;
-  border: 1px solid rgba(0, 0, 0, 0.12);
-  resize: vertical;
-  background: #fafbfc;
-  box-sizing: border-box;
-}
-
+.field textarea,
 .field input[type="text"] {
   width: 100%;
   padding: 8px 10px;
   font-size: 0.9rem;
   border-radius: 6px;
-  border: 1px solid rgba(0, 0, 0, 0.12);
-  background: #fafbfc;
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+  color: var(--text);
   box-sizing: border-box;
 }
 
-/* ---- "Keep this window open" warning under the share textarea ---- */
+.field textarea {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.8rem;
+  resize: vertical;
+}
+
+.field textarea:disabled {
+  opacity: 0.6;
+}
+
+/* ============================================================
+   "Keep this window open" warning under share textarea
+   ============================================================ */
+
 .keep-open-warning {
   margin: 8px 0 0;
   padding: 8px 10px;
-  border-left: 3px solid #f59e0b; /* amber-500 */
-  background: rgba(245, 158, 11, 0.08);
+  border-left: 3px solid var(--warn);
+  background: var(--warn-bg);
   border-radius: 4px;
   font-size: 0.85rem;
-  color: #92400e; /* amber-800 */
+  color: var(--warn-text);
   line-height: 1.4;
 }
 
-@media (prefers-color-scheme: dark) {
-  .keep-open-warning {
-    background: rgba(245, 158, 11, 0.14);
-    color: #fbbf24; /* amber-400 */
-  }
-}
+/* ============================================================
+   "Transfer Complete" summary block (Send + Receive)
+   ============================================================ */
 
-/* ---- "Transfer Complete" summary block (Send + Receive) ---- */
 .completion-summary {
   margin: 8px 0 12px;
   padding: 12px 14px;
-  border: 1px solid rgba(21, 128, 61, 0.25);
-  border-left: 4px solid #15803d; /* green-700 — matches receiver-status.complete */
-  background: rgba(21, 128, 61, 0.06);
+  border: 1px solid var(--success-border);
+  border-left: 4px solid var(--success);
+  background: var(--success-bg);
   border-radius: 6px;
 }
 
 .completion-summary h3 {
   margin: 0 0 8px;
   font-size: 1rem;
-  color: #15803d;
+  color: var(--success);
 }
 
 .completion-summary dl {
@@ -375,7 +388,7 @@ button:disabled {
 }
 
 .completion-summary dt {
-  color: #4b5563;
+  color: var(--text-muted);
   font-weight: 500;
 }
 
@@ -391,32 +404,18 @@ button:disabled {
 }
 
 .completion-summary .summary-meta {
-  color: #6b7280;
+  color: var(--text-subtle);
   font-size: 0.82rem;
 }
 
-@media (prefers-color-scheme: dark) {
-  .completion-summary {
-    background: rgba(34, 197, 94, 0.08);
-    border-color: rgba(34, 197, 94, 0.25);
-    border-left-color: #22c55e;
-  }
-  .completion-summary h3 {
-    color: #4ade80;
-  }
-  .completion-summary dt {
-    color: #9ca3af;
-  }
-  .completion-summary .summary-meta {
-    color: #9ca3af;
-  }
-}
+/* ============================================================
+   Folder receive: current file + file list
+   ============================================================ */
 
-/* ---- Folder receive: current file + file list ---- */
 .progress-file {
   margin: 6px 0 0;
   font-size: 0.8rem;
-  color: #4b5563;
+  color: var(--text-muted);
   overflow-wrap: anywhere;
 }
 
@@ -436,7 +435,7 @@ button:disabled {
 .progress-files summary {
   cursor: pointer;
   font-size: 0.78rem;
-  color: #6b7280;
+  color: var(--text-muted);
 }
 
 .file-list {
@@ -447,7 +446,7 @@ button:disabled {
   overflow-y: auto;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 0.75rem;
-  color: #4b5563;
+  color: var(--text-muted);
 }
 
 .file-list li {
@@ -456,23 +455,20 @@ button:disabled {
 }
 
 .file-list li.more {
-  color: #9ca3af;
+  color: var(--text-subtle);
   font-style: italic;
 }
 
-@media (prefers-color-scheme: dark) {
-  .progress-file,
-  .file-list {
-    color: #9ca3af;
-  }
-}
+/* ============================================================
+   Sender's "Receivers" panel
+   ============================================================ */
 
-/* ---- Sender's "Receivers" panel ---- */
 .receivers-panel {
   margin-top: 16px;
-  border: 1px solid rgba(0, 0, 0, 0.1);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 12px 14px;
+  background: var(--surface-elevated);
 }
 
 .receivers-panel h3 {
@@ -488,7 +484,7 @@ button:disabled {
 
 .receiver-row {
   padding: 8px 0;
-  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  border-top: 1px solid var(--border);
 }
 
 .receiver-row:first-child {
@@ -509,71 +505,48 @@ button:disabled {
 .receiver-node {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 0.75rem;
-  color: #9ca3af;
+  color: var(--text-subtle);
 }
 
 .receiver-status {
   margin-left: auto;
   font-size: 0.8rem;
   font-variant-numeric: tabular-nums;
-  color: #4b5563;
+  color: var(--text-muted);
 }
 
 .receiver-status.complete {
-  color: #15803d;
+  color: var(--success);
 }
 
 .receiver-status.disconnected {
-  color: #b45309;
+  color: var(--danger);
 }
 
 .receiver-row progress {
   width: 100%;
   height: 6px;
   margin: 6px 0 2px;
+  accent-color: var(--accent);
 }
 
 .receiver-meta {
   display: flex;
   gap: 6px;
   font-size: 0.78rem;
-  color: #6b7280;
+  color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
 
-@media (prefers-color-scheme: dark) {
-  .field input[type="text"] {
-    background: #1f2430;
-    color: #e5e7eb;
-    border-color: rgba(255, 255, 255, 0.12);
-  }
-  .receivers-panel {
-    border-color: rgba(255, 255, 255, 0.12);
-  }
-  .receiver-row {
-    border-top-color: rgba(255, 255, 255, 0.08);
-  }
-  .receiver-status {
-    color: #9ca3af;
-  }
-}
-
-.field textarea:disabled {
-  opacity: 0.6;
-}
-
-@media (prefers-color-scheme: dark) {
-  .field textarea {
-    background: #15181f;
-    border-color: rgba(255, 255, 255, 0.1);
-    color: inherit;
-  }
-}
+/* ============================================================
+   Progress box (download / writing-to-disk)
+   ============================================================ */
 
 .progress-box {
   margin-top: 12px;
   padding: 12px 14px;
-  background: rgba(0, 0, 0, 0.03);
+  background: var(--surface-elevated);
+  border: 1px solid var(--border);
   border-radius: 8px;
 }
 
@@ -581,6 +554,7 @@ button:disabled {
   width: 100%;
   height: 12px;
   margin: 6px 0;
+  accent-color: var(--accent);
 }
 
 .progress-header {
@@ -591,8 +565,14 @@ button:disabled {
 }
 
 .progress-phase {
-  color: #4b5563;
+  color: var(--text-muted);
   font-weight: 500;
+}
+
+.progress-pct {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
 }
 
 .progress-footer {
@@ -601,7 +581,7 @@ button:disabled {
   gap: 6px;
   align-items: center;
   font-size: 0.8rem;
-  color: #4b5563;
+  color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
 
@@ -611,25 +591,19 @@ button:disabled {
 
 .progress-speed,
 .progress-eta {
-  color: #6b7280;
+  color: var(--text-subtle);
 }
 
 .progress-sep {
-  color: #d1d5db;
+  color: var(--text-subtle);
 }
 
 .progress-hint {
   margin: 8px 0 0;
   font-size: 0.75rem;
   font-style: italic;
-  color: #6b7280;
+  color: var(--text-muted);
   line-height: 1.45;
-}
-
-@media (prefers-color-scheme: dark) {
-  .progress-hint {
-    color: #9ca3af;
-  }
 }
 
 /* Legacy .progress-label is no longer rendered, but the rule stays as a
@@ -637,8 +611,12 @@ button:disabled {
 .progress-label {
   margin: 6px 0 0;
   font-size: 0.85rem;
-  color: #4b5563;
+  color: var(--text-muted);
 }
+
+/* ============================================================
+   Diagnostic line beneath the ticket textarea
+   ============================================================ */
 
 .diagnostic {
   margin: 6px 0 0;
@@ -646,25 +624,29 @@ button:disabled {
 }
 
 .diagnostic-ok {
-  color: #15803d;
+  color: var(--success);
   font-weight: 500;
 }
 
 .diagnostic-warn {
-  color: #a16207;
+  color: var(--warn);
 }
 
 .diagnostic-name {
-  color: #4b5563;
+  color: var(--text-muted);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
 }
 
 .hint {
   margin: 0 0 8px;
   font-size: 0.8rem;
-  color: #6b7280;
+  color: var(--text-muted);
   line-height: 1.45;
 }
+
+/* ============================================================
+   Resume button + banners
+   ============================================================ */
 
 .resume-button {
   display: inline-flex;
@@ -673,9 +655,9 @@ button:disabled {
   margin-bottom: 12px;
   padding: 6px 12px;
   font-size: 0.85rem;
-  background: rgba(59, 130, 246, 0.08);
-  border: 1px solid rgba(59, 130, 246, 0.25);
-  color: #1d4ed8;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  color: var(--accent);
   border-radius: 6px;
   max-width: 100%;
   overflow: hidden;
@@ -684,7 +666,8 @@ button:disabled {
 }
 
 .resume-button:hover:not(:disabled) {
-  background: rgba(59, 130, 246, 0.14);
+  background: var(--accent-bg);
+  filter: brightness(1.05);
 }
 
 .resume-button code {
@@ -698,9 +681,21 @@ button:disabled {
   padding: 10px 14px;
   font-size: 0.85rem;
   line-height: 1.45;
-  background: rgba(234, 88, 12, 0.1);
-  border: 1px solid rgba(234, 88, 12, 0.3);
-  color: #9a3412;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  color: var(--warn-text);
+  border-radius: 8px;
+  animation: reset-banner-in 200ms ease-out;
+}
+
+.menu-banner {
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  color: var(--accent);
   border-radius: 8px;
   animation: reset-banner-in 200ms ease-out;
 }
@@ -716,36 +711,12 @@ button:disabled {
   }
 }
 
-@media (prefers-color-scheme: dark) {
-  .reset-banner {
-    background: rgba(251, 146, 60, 0.15);
-    border-color: rgba(251, 146, 60, 0.35);
-    color: #fdba74;
-  }
-}
-
-.menu-banner {
-  margin: 0 0 16px;
-  padding: 10px 14px;
-  font-size: 0.85rem;
-  line-height: 1.45;
-  background: rgba(59, 130, 246, 0.08);
-  border: 1px solid rgba(59, 130, 246, 0.25);
-  color: #1d4ed8;
-  border-radius: 8px;
-  animation: reset-banner-in 200ms ease-out;
-}
-
-@media (prefers-color-scheme: dark) {
-  .menu-banner {
-    background: rgba(96, 165, 250, 0.12);
-    border-color: rgba(96, 165, 250, 0.3);
-    color: #93c5fd;
-  }
-}
+/* ============================================================
+   Connection mode fieldset
+   ============================================================ */
 
 .connection-mode {
-  border: 1px solid rgba(0, 0, 0, 0.1);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 12px 14px;
   margin: 0 0 16px;
@@ -755,7 +726,7 @@ button:disabled {
   padding: 0 6px;
   font-size: 0.85rem;
   font-weight: 500;
-  color: #4b5563;
+  color: var(--text-muted);
 }
 
 .connection-mode label {
@@ -772,14 +743,14 @@ button:disabled {
 
 .connection-mode .recommended {
   font-size: 0.8rem;
-  color: #6b7280;
+  color: var(--text-subtle);
   font-style: italic;
 }
 
 .connection-mode .hint {
   margin: 10px 0 0;
   font-size: 0.8rem;
-  color: #6b7280;
+  color: var(--text-muted);
   line-height: 1.45;
 }
 
@@ -789,82 +760,11 @@ button:disabled {
 .connection-mode .connection-desc {
   margin: 2px 0 6px 24px;
   padding-left: 10px;
-  border-left: 2px solid rgba(0, 0, 0, 0.08);
+  border-left: 2px solid var(--border);
 }
 
 .connection-mode:disabled label,
 .connection-mode[disabled] label {
   cursor: not-allowed;
   opacity: 0.5;
-}
-
-@media (prefers-color-scheme: dark) {
-  .connection-mode {
-    border-color: rgba(255, 255, 255, 0.1);
-  }
-  .connection-mode legend {
-    color: #c0c5cc;
-  }
-  .connection-mode .recommended,
-  .connection-mode .hint {
-    color: #9ca3af;
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  .resume-button {
-    background: rgba(96, 165, 250, 0.12);
-    border-color: rgba(96, 165, 250, 0.3);
-    color: #93c5fd;
-  }
-  .resume-button:hover:not(:disabled) {
-    background: rgba(96, 165, 250, 0.2);
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  .diagnostic-name {
-    color: #c0c5cc;
-  }
-  .hint {
-    color: #9ca3af;
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  .diagnostic-ok {
-    color: #4ade80;
-  }
-  .diagnostic-warn {
-    color: #fbbf24;
-  }
-}
-
-.progress-pct {
-  color: #1f2937;
-  font-variant-numeric: tabular-nums;
-  font-weight: 600;
-}
-
-@media (prefers-color-scheme: dark) {
-  .progress-box {
-    background: rgba(255, 255, 255, 0.04);
-  }
-  .progress-label,
-  .progress-footer {
-    color: #c0c5cc;
-  }
-  .progress-phase {
-    color: #c0c5cc;
-  }
-  .progress-pct {
-    color: #f3f4f6;
-  }
-  .progress-speed,
-  .progress-eta {
-    color: #9ca3af;
-  }
-  .progress-sep {
-    color: #4b5563;
-  }
 }

@@ -9,6 +9,8 @@ import { platform } from "@tauri-apps/plugin-os";
 import "./App.css";
 
 type Mode = "send" | "receive";
+type ThemePref = "auto" | "light" | "dark";
+type ResolvedTheme = "light" | "dark";
 type SendStatus =
   | "idle"
   | "creating_ticket"
@@ -67,6 +69,34 @@ interface ReceiverRow {
 }
 
 const LS_RECEIVER_LABEL = "orbitxfer.receiverLabel.v1";
+
+// Theme preference. "auto" follows the system; "light"/"dark" force a
+// specific palette. Persisted in localStorage and applied globally via
+// the `data-theme` attribute on <html>. An inline script in index.html
+// already sets data-theme before React mounts (no flash); React keeps
+// it in sync after that.
+const LS_THEME = "orbitxfer.theme.v1";
+
+function loadThemePref(): ThemePref {
+  try {
+    const v = localStorage.getItem(LS_THEME);
+    if (v === "light" || v === "dark" || v === "auto") return v;
+    return "auto";
+  } catch {
+    return "auto";
+  }
+}
+
+function resolveTheme(pref: ThemePref): ResolvedTheme {
+  if (pref === "light" || pref === "dark") return pref;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches
+    ? "dark"
+    : "light";
+}
+
+function applyTheme(resolved: ResolvedTheme) {
+  document.documentElement.setAttribute("data-theme", resolved);
+}
 
 function loadReceiverLabel(): string {
   try {
@@ -294,6 +324,59 @@ function App() {
   // hidden so a single window stays focused on one task. Open another window
   // for the other direction.
   const [mode, setMode] = useState<Mode>("send");
+
+  // Global theme preference. Lives in localStorage so every window in the
+  // app stays in sync (we listen for storage events below). Auto follows
+  // the system; Light/Dark force a specific palette. The View menu has
+  // three items that emit `theme:set` events handled below.
+  const [themePref, setThemePref] = useState<ThemePref>(loadThemePref);
+
+  // Persist + apply on change. Resolves Auto → system pref each time.
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_THEME, themePref);
+    } catch (e) {
+      console.error("save theme failed:", e);
+    }
+    applyTheme(resolveTheme(themePref));
+  }, [themePref]);
+
+  // When the user is on "Auto", react live to OS light/dark changes so
+  // the app flips with the system (mid-session light→dark sunset, etc).
+  useEffect(() => {
+    if (themePref !== "auto") return;
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = () => applyTheme(resolveTheme("auto"));
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, [themePref]);
+
+  // Cross-window sync: when one window changes the theme, every other
+  // open window picks it up via the storage event.
+  useEffect(() => {
+    function onStorage(e: StorageEvent) {
+      if (e.key === LS_THEME) {
+        setThemePref(loadThemePref());
+      }
+    }
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  // Menu wiring: the View > Theme submenu in Rust emits `theme:set` with
+  // the new pref as payload. Emitted app-wide (not per-window) since the
+  // theme is a global setting.
+  useEffect(() => {
+    const unlisten = listen<string>("theme:set", (e) => {
+      const v = e.payload;
+      if (v === "auto" || v === "light" || v === "dark") {
+        setThemePref(v);
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
 
   // Connection mode — applies to all sends from this window. Always starts
   // at "full" (Direct + Relay fallback, the recommended mode) on every

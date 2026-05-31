@@ -1,5 +1,12 @@
 # Releases
 
+## v0.1.80 - 2026-05-29
+- **Dark mode — proper, system-aware, with a manual override.** OrbitXfer now ships a coherent light/dark palette and a three-state theme picker under **View → Theme → {Auto (Follow System), Light, Dark}**.
+- **Three-state preference, global, persisted.** The choice is stored in localStorage and synced across every open window via the `storage` event. "Auto" follows the OS and live-updates when the system flips (e.g. macOS scheduled appearance).
+- **No flash of light mode** on dark systems: an inline script in `index.html` resolves and applies the theme on `<html>` before React mounts.
+- **CSS refactor under the hood.** App.css was rebuilt around a 13-token role-based palette (`--bg`, `--surface`, `--surface-elevated`, `--border`, `--text`, `--text-muted`, `--text-subtle`, `--accent`, `--success`, `--warn`, `--danger`, `--code-bg`, etc.) with light/dark values on `:root` and `[data-theme="dark"]`. The 23 scattered `@media (prefers-color-scheme: dark)` blocks are gone — any future tweak is one variable change.
+- **No app code or transfer-protocol changes.** Pure UI/UX work; CI pipeline unchanged.
+
 ## v0.1.79 - 2026-05-29
 - **CI hotfix: clean stale bundle outputs before each tag build.** No app code changes. v0.1.78's release inadvertently included Windows/Linux installers from v0.1.76 (`OrbitXfer_0.1.76_x64-setup.exe`, `.msi`, `.deb`, `.rpm`) alongside the correct `0.1.78_` ones. Cause: the Cargo cache covers `OrbitXfer-iroh-tauri/src-tauri/target/`, which includes the `bundle/` output directory Tauri writes installers to, and the cache key only hashes `Cargo.lock` (which doesn't change on version bumps). v0.1.76's still-present bundles got restored from cache, lingered in the directory, and were glob-uploaded next to v0.1.78's fresh outputs.
 - Workflow now runs `rm -rf src-tauri/target/release/bundle src-tauri/target/universal-apple-darwin/release/bundle` before each `tauri build`, so only freshly-built artifacts make it into the release. Cross-platform via `shell: bash`.

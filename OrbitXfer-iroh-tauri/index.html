@@ -8,6 +8,23 @@
   </head>
 
   <body>
+    <script>
+      // Resolve and apply the theme BEFORE React mounts to avoid a
+      // flash-of-light-mode on dark systems. React takes over from here
+      // and keeps data-theme in sync on user/system changes.
+      (function () {
+        try {
+          var pref = localStorage.getItem("orbitxfer.theme.v1") || "auto";
+          var resolved =
+            pref === "light" || pref === "dark"
+              ? pref
+              : window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light";
+          document.documentElement.setAttribute("data-theme", resolved);
+        } catch (e) {}
+      })();
+    </script>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
