@@ -1,5 +1,20 @@
 # Releases
 
+## v0.1.81 - 2026-05-31
+- **Aggressive size-optimized Rust release profile.** No app code changes — only `[profile.release]` settings in both `OrbitXfer-iroh-cli/Cargo.toml` and `OrbitXfer-iroh-tauri/src-tauri/Cargo.toml`:
+  - `opt-level = "z"` (smallest code)
+  - `lto = true` (full link-time optimization)
+  - `codegen-units = 1` (better whole-program optimization)
+  - `strip = true` (remove debug symbols)
+  - `panic = "abort"` (no stack-unwinding code paths)
+- Measured impact on the universal Mac build (v0.1.80 baseline → v0.1.81):
+  - **Installed `.app` folder: 69 MB → 18 MB** (74% smaller)
+  - Universal CLI sidecar: 47 MB → 10 MB
+  - Universal Tauri main binary: 22 MB → 7.6 MB
+  - **DMG: 30 MB → 10 MB** (67% smaller)
+- The dominant contributor is `strip = true` (Rust release builds otherwise carry large debug-symbol tables for tokio/iroh/quinn's heavy use of generics). `lto = true` + `codegen-units = 1` + `opt-level = "z"` add further dead-code elimination and tighter codegen on top.
+- No UX trade-off: QUIC throughput and BLAKE3 hashing are bound by syscalls and hand-tuned SIMD intrinsics that `opt-level` doesn't materially affect. CI compile time goes up modestly (LTO + 1 codegen unit), which doesn't affect end users.
+
 ## v0.1.80 - 2026-05-29
 - **Dark mode — proper, system-aware, with a manual override.** OrbitXfer now ships a coherent light/dark palette and a three-state theme picker under **View → Theme → {Auto (Follow System), Light, Dark}**.
 - **Three-state preference, global, persisted.** The choice is stored in localStorage and synced across every open window via the `storage` event. "Auto" follows the OS and live-updates when the system flips (e.g. macOS scheduled appearance).

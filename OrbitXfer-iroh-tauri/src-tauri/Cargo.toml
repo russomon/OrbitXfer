@@ -14,6 +14,16 @@ edition = "2021"
 name = "orbitxfer_iroh_tauri_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Aggressive size-optimized release profile (v0.1.81+). Matches the
+# settings in OrbitXfer-iroh-cli/Cargo.toml — see the comments there
+# for the rationale and trade-offs.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

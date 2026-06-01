@@ -1,7 +1,19 @@
 [package]
 name = "orbitxfer-iroh-cli"
-version = "0.1.80"
+version = "0.1.81"
 edition = "2021"
+
+# Aggressive size-optimized release profile (v0.1.81+). Trades compile
+# time for smaller, leaner binaries. For a non-hot-path desktop tool
+# like OrbitXfer the perf delta vs opt-level=3 is imperceptible; QUIC
+# throughput is bound by kernel syscalls and BLAKE3's SIMD intrinsics
+# which the optimizer doesn't materially affect.
+[profile.release]
+opt-level = "z"      # smallest code; "s" if any hot path ever regresses
+lto = true           # full link-time optimization
+codegen-units = 1    # better whole-program optimization
+strip = true         # remove debug symbols from the final binary
+panic = "abort"      # no stack-unwinding code paths (panics already fatal)
 
 [dependencies]
 anyhow = "1"
