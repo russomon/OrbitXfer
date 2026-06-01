@@ -230,12 +230,16 @@ function parseReceiveInput(input: string): ParsedReceiveInput | null {
 }
 
 function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
+  // Decimal (SI) units, base 1000 — matches what Finder, modern Windows
+  // Explorer, and most consumer file-size displays show. Pre-v0.1.82 used
+  // base 1024 (technically KiB/MiB/...) with KB/MB/... labels, which
+  // could read ~7% off vs the OS's reported size for the same file.
+  if (bytes < 1000) return `${bytes} B`;
   const units = ["KB", "MB", "GB", "TB"];
-  let value = bytes / 1024;
+  let value = bytes / 1000;
   let i = 0;
-  while (value >= 1024 && i < units.length - 1) {
-    value /= 1024;
+  while (value >= 1000 && i < units.length - 1) {
+    value /= 1000;
     i++;
   }
   return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[i]}`;

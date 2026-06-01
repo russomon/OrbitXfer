@@ -38,7 +38,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.81";
+const CLI_VERSION: &str = "0.1.82";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -302,11 +302,15 @@ fn describe_addr(addr: &EndpointAddr) -> String {
 }
 
 fn format_bytes(bytes: u64) -> String {
+    // Decimal (SI) units, base 1000 — matches the GUI's formatBytes() and
+    // Finder/Explorer's reported file sizes. Pre-v0.1.82 used base 1024
+    // (technically KiB/MiB/...) which read ~7% smaller than the OS's
+    // reported size for the same file.
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut idx = 0usize;
-    while value >= 1024.0 && idx < UNITS.len() - 1 {
-        value /= 1024.0;
+    while value >= 1000.0 && idx < UNITS.len() - 1 {
+        value /= 1000.0;
         idx += 1;
     }
     if idx == 0 {

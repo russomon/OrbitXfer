@@ -1,5 +1,9 @@
 # Releases
 
+## v0.1.82 - 2026-05-31
+- **Byte sizes now use true decimal (SI) units everywhere** — base 1000, matching Finder, macOS / iOS / iPadOS, Windows Explorer's "size on disk," and the size shown in `ls -l` output. Pre-v0.1.82 the labels said `KB / MB / GB / TB` but the math divided by 1024 (technically `KiB / MiB / GiB / TiB`), which read ~7% smaller than what the OS reports for the same file. Same fix applied to both `formatBytes()` in the frontend and `format_bytes()` in the CLI, so progress bars, completion summaries, receivers panel, transfer-speed display, log lines, and CLI output all read the same and match what users see in their file browser.
+- A 1,000,000,000-byte file now displays as `1.00 GB` instead of `0.93 GB`.
+
 ## v0.1.81 - 2026-05-31
 - **Aggressive size-optimized Rust release profile.** No app code changes — only `[profile.release]` settings in both `OrbitXfer-iroh-cli/Cargo.toml` and `OrbitXfer-iroh-tauri/src-tauri/Cargo.toml`:
   - `opt-level = "z"` (smallest code)
