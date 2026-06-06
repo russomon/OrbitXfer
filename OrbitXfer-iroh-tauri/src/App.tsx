@@ -14,7 +14,7 @@ type ResolvedTheme = "light" | "dark";
 type SendStatus =
   | "idle"
   | "creating_ticket"
-  | "ticket_ready"
+  | "sharing"
   | "complete"
   | "error";
 type ConnectionMode = "full" | "relay_only" | "direct_only";
@@ -788,7 +788,7 @@ function App() {
             // set it once; we refresh here in case the source of truth
             // (e.g. a slightly different store-reported size) shifted.
             if (total !== null) setSendTotalSize(total);
-            setSendStatus("ticket_ready");
+            setSendStatus("sharing");
             // Clear hashing progress — it's done and the ticket is the
             // main signal now.
             setSendProgress(null);
@@ -1377,7 +1377,17 @@ function App() {
     recvStatus === "downloading" ||
     recvStatus === "exporting";
 
+  // Brief hashing window where the connection-mode fieldset is locked.
   const sendBusy = sendStatus === "creating_ticket";
+  // The "a send is going on, don't start another one in this window"
+  // gate. Stays true through hashing + sharing + the post-first-receiver
+  // "complete" state (because the sidecar keeps serving until Stop or
+  // window close). Pick File / Pick Folder / Resume / mode-switch tabs
+  // all use this so the user can't silently kill an in-flight share.
+  const sendActive =
+    sendStatus === "creating_ticket" ||
+    sendStatus === "sharing" ||
+    sendStatus === "complete";
 
   // Pick which ticket variant to put in the share line based on the
   // selected connection mode. The CLI emits all three variants (full /
@@ -1442,9 +1452,9 @@ function App() {
               <span aria-hidden="true">☕</span> Keeping {platformLabel} awake
             </span>
           )}
-          <button className="ghost-button" onClick={openNewTransferWindow}>
-            + New Window
-          </button>
+          {/* "+ New Transfer Window" lives in each panel's actions row
+              (right-justified) from v0.1.83 on. The header slot stays as
+              the home for the keep-awake badge. */}
         </div>
       </header>
 
@@ -1467,7 +1477,7 @@ function App() {
           aria-selected={mode === "send"}
           className={mode === "send" ? "active" : ""}
           onClick={() => setMode("send")}
-          disabled={sendBusy || recvBusy}
+          disabled={sendActive || recvBusy}
         >
           Send
         </button>
@@ -1476,7 +1486,7 @@ function App() {
           aria-selected={mode === "receive"}
           className={mode === "receive" ? "active" : ""}
           onClick={() => setMode("receive")}
-          disabled={sendBusy || recvBusy}
+          disabled={sendActive || recvBusy}
         >
           Receive
         </button>
@@ -1485,7 +1495,7 @@ function App() {
       {mode === "send" && (
         <section className="panel">
           <h2>Send a file</h2>
-          {lastSend && !sendBusy && (
+          {lastSend && !sendActive && (
             <button
               className="resume-button"
               onClick={resumeLastSend}
@@ -1555,20 +1565,20 @@ function App() {
           </fieldset>
 
           <div className="actions">
-            <button onClick={pickFile} disabled={sendBusy}>
-              Pick file…
+            <button onClick={pickFile} disabled={sendActive}>
+              Pick File…
             </button>
-            <button onClick={pickFolder} disabled={sendBusy}>
-              Pick folder…
+            <button onClick={pickFolder} disabled={sendActive}>
+              Pick Folder…
+            </button>
+            <button onClick={stopSend} disabled={!sendActive}>
+              Stop
             </button>
             <button
-              onClick={stopSend}
-              disabled={
-                sendStatus !== "creating_ticket" &&
-                sendStatus !== "ticket_ready"
-              }
+              className="ghost-button new-window-button"
+              onClick={openNewTransferWindow}
             >
-              Stop
+              + New Transfer Window
             </button>
           </div>
 
@@ -1887,7 +1897,7 @@ function App() {
 
           <div className="actions">
             <button onClick={pickDestination} disabled={recvBusy}>
-              {isFolderReceive ? "Pick destination folder…" : "Pick destination…"}
+              {isFolderReceive ? "Pick Destination Folder…" : "Pick Destination…"}
             </button>
             <button
               onClick={startReceive}
@@ -1897,6 +1907,12 @@ function App() {
             </button>
             <button onClick={stopReceive} disabled={!recvBusy}>
               Stop
+            </button>
+            <button
+              className="ghost-button new-window-button"
+              onClick={openNewTransferWindow}
+            >
+              + New Transfer Window
             </button>
           </div>
 

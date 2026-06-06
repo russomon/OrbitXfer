@@ -1,5 +1,12 @@
 # Releases
 
+## v0.1.83 - 2026-06-01
+- **Pick File… / Pick Folder… now stay disabled while a share is active.** Previously, once the share ticket appeared those buttons re-enabled and a click would silently kill the running sidecar — surprising the user out of an in-flight transfer. Now they're gated on a new `sendActive` predicate (`creating_ticket` | `sharing` | `complete`) and only un-gray when the user explicitly clicks **Stop** or closes the window. The Send-side Stop button is now enabled across the entire active window, including the post-first-receiver `complete` state, so the user can always end serving.
+- **"+ New Transfer Window" button moved into both panels' action rows**, right-justified next to **Stop**, and renamed from "+ New Window." Discoverable at the moment you realize you need it. The header still hosts the keep-awake ☕ badge.
+- **Status `ticket_ready` renamed to `sharing`** to convey *not just that the ticket exists* but *that the file is actively being served*. Same one-word, snake_case style as the other states (`idle` / `creating_ticket` / `sharing` / `complete` / `error`).
+- **Title-case action buttons.** "Pick File…", "Pick Folder…", "Pick Destination…", "Pick Destination Folder…" — visual consistency across the GUI.
+- The Receive panel's mode tabs and Resume-last-send button now also gate on `sendActive` (was `sendBusy`) so you can't switch out of an in-flight share without an explicit Stop.
+
 ## v0.1.82 - 2026-05-31
 - **Byte sizes now use true decimal (SI) units everywhere** — base 1000, matching Finder, macOS / iOS / iPadOS, Windows Explorer's "size on disk," and the size shown in `ls -l` output. Pre-v0.1.82 the labels said `KB / MB / GB / TB` but the math divided by 1024 (technically `KiB / MiB / GiB / TiB`), which read ~7% smaller than what the OS reports for the same file. Same fix applied to both `formatBytes()` in the frontend and `format_bytes()` in the CLI, so progress bars, completion summaries, receivers panel, transfer-speed display, log lines, and CLI output all read the same and match what users see in their file browser.
 - A 1,000,000,000-byte file now displays as `1.00 GB` instead of `0.93 GB`.
