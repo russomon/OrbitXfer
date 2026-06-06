@@ -1,6 +1,6 @@
 [package]
 name = "orbitxfer-iroh-cli"
-version = "0.1.83"
+version = "0.1.84"
 edition = "2021"
 
 # Aggressive size-optimized release profile (v0.1.81+). Trades compile
@@ -21,8 +21,23 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 iroh = "0.96"
 iroh-blobs = { version = "0.98", features = ["fs-store"] }
 iroh-base = "0.96"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-lite = "2"
 irpc = { version = "0.12", default-features = false, features = ["stream", "spans", "derive", "varint-util"] }
 fs2 = "0.4"
 getrandom = "0.2"
+
+# v0.1.84 — pairing-code (shareable-code) feature.
+# Phase 1 ships the protocol skeleton. CPace itself is wired via
+# pake-cpace; key-derivation cost via Argon2id; session-traffic AEAD
+# via ChaCha20-Poly1305; word selection via the EFF Long Wordlist.
+pake-cpace = "0.1"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+eff-wordlist = "1"
+postcard = { version = "1", features = ["alloc"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+blake3 = "1"

@@ -1,5 +1,22 @@
 # Releases
 
+## v0.1.84 - 2026-06-06 (phase 1, CLI only — UNRELEASED)
+- **Shareable Code (pairing) protocol — Phase 1 of 3.** Replaces the ~240-character blob ticket with a 4-word code (e.g. `unhelpful-jellied-verse-uncross`) that a receiver types in. Phase 1 ships the protocol skeleton in the CLI only; the GUI is untouched until Phase 2.
+  - **New ALPN `orbitxfer/pair/1`.** Sender's ephemeral NodeID is *derived from the code itself* via BLAKE3 (domain-separated). No rendezvous server needed — iroh's existing relay-based discovery introduces the two peers.
+  - **CPace PAKE** (`pake-cpace = "0.1"`) negotiates a session key over a wire neither side knows in advance. **Argon2id** (64 MiB, 3 iters) wraps the code before CPace consumes it, making every PAKE attempt — honest or malicious — pay a ~1 s memory-hard cost. Per-source short-window rate limit caps online brute force at 5 attempts / 60 s. Combined: 51.7 bits of code entropy → ~74,000 years to crack solo.
+  - **Post-handshake messages are AEAD-sealed** (ChaCha20-Poly1305) under the CPace session key, with per-direction counter-derived nonces. M4 sender→receiver carries the `TransferOffer` (file hash, name, size, is_folder); M5 receiver→sender carries an optional `receiver_label` that piggybacks the v0.1.71 label feature, saving a round-trip.
+  - **EFF Long Wordlist** (`eff-wordlist = "1"`) sources the 4 words. Code format: `word-word-word-word`, lowercase, hyphen-separated. The 4 hyphen-bearing dictionary entries (`drop-down`, `felt-tip`, `t-shirt`, `yo-yo`) are filtered out at generation so the separator stays unambiguous; entropy loss is <0.001 bits/word.
+  - **New CLI subcommands:**
+    - `orbitxfer-iroh-cli pair-host <file>` — generates a code, prints it, waits for a receiver to dial.
+    - `orbitxfer-iroh-cli pair-join <code> <output-path>` — derives the sender's NodeID, dials, runs the PAKE handshake, decrypts the offer.
+  - **New OX_EVENT types** (consumed by a future GUI layer, no UI wiring in Phase 1): `pairing_code_ready`, `pairing_attempt_started`, `pairing_attempt_succeeded`, `pairing_attempt_failed`, `pairing_attempt_rejected`, `pairing_attack_warning`, `pairing_offer_sent`, `pairing_lookup_started`, `pairing_lookup_failed`, `pairing_handshake_started`, `pairing_handshake_succeeded`, `pairing_handshake_failed`, `pairing_offer_received`, `pairing_session_ready`.
+  - **Phase 1 limitations** (intentional, documented as TODOs in `src/pair.rs`):
+    - The offer's hash is a raw BLAKE3 of the file content, not an iroh-blobs HashSeq/Raw hash. Phase 2 will route through `prepare_single_file` / `prepare_folder` so the offer points at a servable blob.
+    - The pairing session ends after the offer/accept exchange; the actual file is *not* transferred. Phase 2 will hand off to the existing blob serving/receiving code paths.
+    - No frontend wiring. Phase 2 adds the UI; Phase 3 polishes.
+  - **Smoke-tested end-to-end** between two local processes on this machine. Handshake completes, offer reaches the receiver, all events fire. Wrong-but-format-valid codes derive a different NodeID and fail at the discovery layer (no information leakage). Off-dictionary codes fail at validation.
+  - **No new infrastructure.** No rendezvous server, no new relays. Pure additive change — the existing `send` / `receive` flow is untouched and remains the supported path until Phase 2.
+
 ## v0.1.83 - 2026-06-01
 - **Pick File… / Pick Folder… now stay disabled while a share is active.** Previously, once the share ticket appeared those buttons re-enabled and a click would silently kill the running sidecar — surprising the user out of an in-flight transfer. Now they're gated on a new `sendActive` predicate (`creating_ticket` | `sharing` | `complete`) and only un-gray when the user explicitly clicks **Stop** or closes the window. The Send-side Stop button is now enabled across the entire active window, including the post-first-receiver `complete` state, so the user can always end serving.
 - **"+ New Transfer Window" button moved into both panels' action rows**, right-justified next to **Stop**, and renamed from "+ New Window." Discoverable at the moment you realize you need it. The header still hosts the keep-awake ☕ badge.

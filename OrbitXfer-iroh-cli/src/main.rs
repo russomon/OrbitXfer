@@ -1,3 +1,8 @@
+// v0.1.84 — pairing-code (shareable-code) feature lives in its own module.
+// Wired into the subcommand dispatch in `main()` as `pair-host` and
+// `pair-join`. Phase 1 is CLI-only; no frontend changes yet.
+mod pair;
+
 use anyhow::{anyhow, bail, Context, Result};
 use fs2::available_space;
 use futures_lite::StreamExt;
@@ -38,7 +43,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.83";
+const CLI_VERSION: &str = "0.1.84";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -94,6 +99,8 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  orbitxfer-iroh-cli send <path-to-file>");
     eprintln!("  orbitxfer-iroh-cli receive <ticket> <output-path>");
+    eprintln!("  orbitxfer-iroh-cli pair-host <path-to-file>");
+    eprintln!("  orbitxfer-iroh-cli pair-join <code> <output-path>");
 }
 
 fn abs_path(path: &Path) -> Result<PathBuf> {
@@ -391,6 +398,30 @@ async fn main() -> Result<()> {
                 bail!("receive takes exactly two arguments");
             }
             run_receive(ticket, PathBuf::from(output)).await?;
+        }
+        // v0.1.84 phase 1: pair-host stands up the sender side of the
+        // shareable-code flow. Phase 1 stops after the receiver
+        // completes the PAKE handshake and acknowledges the offer;
+        // phase 2 will continue with the actual blob serving.
+        "pair-host" => {
+            emit_line(&format!("OrbitXfer CLI {} (pair-host)", CLI_VERSION));
+            let file = args.next().context("missing file path")?;
+            if args.next().is_some() {
+                bail!("pair-host takes exactly one argument");
+            }
+            pair::run_pair_host(PathBuf::from(file)).await?;
+        }
+        // v0.1.84 phase 1: pair-join is the receiver side. Phase 1
+        // ends after the handshake + offer exchange; phase 2 will
+        // continue with the blob download.
+        "pair-join" => {
+            emit_line(&format!("OrbitXfer CLI {} (pair-join)", CLI_VERSION));
+            let code = args.next().context("missing pairing code")?;
+            let output = args.next().context("missing output path")?;
+            if args.next().is_some() {
+                bail!("pair-join takes exactly two arguments");
+            }
+            pair::run_pair_join(code, PathBuf::from(output)).await?;
         }
         _ => {
             print_usage();
