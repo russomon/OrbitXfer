@@ -1,5 +1,21 @@
 # Releases
 
+## v0.1.84 - 2026-06-07 (phase 3, full stack — UNRELEASED)
+- **Pair (Shareable Code) flow wired into the GUI.** Both Send and Receive panels now carry a `Share by Ticket | Share by Code` (resp. `Receive by Ticket | Receive by Code`) sub-toggle. Phase 3a (Tauri backend) wired four commands `start_pair_host` / `stop_pair_host` / `start_pair_join` / `stop_pair_join` to the new CLI subcommands; Phase 3b/c (frontend) added the React UI and event integration.
+  - **Tauri backend (3a):** `WindowState` grew `pair_host` / `pair_join` `CommandChild` slots; `Slot` enum grew `PairHost` / `PairJoin` variants; `run_sidecar` teaches itself a `PairHost` branch (per-window FsStore isolation like Send, but no per-file identity key — pair-host derives its NodeID from the code). Four new `#[tauri::command]`s registered in the `invoke_handler!` list. Sidecar events emit on `pair-host:stdout/stderr/exit` and `pair-join:stdout/stderr/exit`.
+  - **React state (3b/c):** new types `ShareFlow`, `PairHostStatus`, `PairJoinStatus`, `PairAttempt`. Per-window state for code, hash, endpoint id, format, attempts log, error, and offer details. New gates `pairHostActive` / `pairJoinActive` mirror the existing `sendActive` / `recvBusy` gates so the sub-toggle and Pick File can't clobber a running sidecar.
+  - **React listeners:** dedicated handlers for `pair-host:*` (handshake + offer + serve events) and `pair-join:*` (handshake + offer + then *inherited* `download_*` / `export_*` events from the receive pipeline). The receiver's progress UI is the same `<progress>` + bytes-readout the ticket flow uses — pair-join just feeds the same `recvProgress` / `recvStatus` state.
+  - **Sender UI (Share by Code):** Pick File / Pick Folder → "Generate Code" → large monospace 4-word code with copy button → status pill ("Awaiting receiver…" → "Receiver paired" → "Serving the blob") → inline NodeID, iroh-blobs hash, and format (per your "show inline" preference) → live pair-attempts list surfaces every connection, with `succeeded` / `failed` / `rejected` outcomes color-coded so brute-force noise is obvious.
+  - **Receiver UI (Receive by Code):** single text field that accepts spaces, hyphens, or mixed-case (`Violet- Puzzle - River Cathedral` → `violet-puzzle-river-cathedral`), with a live "Will send as:" preview → Pick Destination → Receive → status pill walks through `looking_up` → `handshaking` → `offer_received` (showing the file name + size before the download starts) → `downloading` → `exporting` → `complete`. The existing receiver-label `ORBITXFER_RECEIVER_LABEL` plumbs through the new `start_pair_join` arg so the sender sees a nickname over the AEAD M5 channel.
+  - **Receiver typing → normalization → CLI:** `normalizeCodeInput` matches the CLI's `normalize_code` so cosmetic input variations all reach the same canonical form. CPace then either succeeds (right code) or the receiver derives the wrong NodeID and fails cleanly at the discovery layer — no information leakage.
+  - **CSS palette:** new tokens use the existing `--accent` / `--success` / `--danger` / `--surface-elevated` / `--border` variables, so the pair UI inherits dark-mode and theme switches automatically.
+  - **TypeScript strict mode passes**; **Vite production build clean** (added ~3 kB to gzipped JS, ~1.4 kB to gzipped CSS).
+  - **What's NOT in Phase 3** (intentional, Phase 4 polish):
+    - No transfer-complete summary card (timing, average speed) for the pair flow — the data is collected, just not rendered yet.
+    - No "resume last pair-host" / "resume last pair-join" buttons.
+    - No keyboard shortcut for "Generate Code".
+    - No QR-code rendering of the 4 words for in-person pairing.
+
 ## v0.1.84 - 2026-06-06 (phase 2, CLI only — UNRELEASED)
 - **Pair-host now actually serves the blob** and **pair-join now actually downloads it.** Phase 2 closes the two TODOs Phase 1 left open and completes the end-to-end shareable-code transfer at the CLI level.
   - `pair-host` now routes file/folder hashing through the same `prepare_single_file` / `prepare_folder` helpers `send` uses, so the offer's `(hash, format)` are real iroh-blobs identifiers and a real FsStore-backed blob is sitting on disk ready to serve.

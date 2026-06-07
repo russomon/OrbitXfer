@@ -38,6 +38,50 @@ type RecvStatus =
   | "complete"
   | "error";
 
+// v0.1.84 — Shareable Code (pair) flow. Both Send and Receive panels
+// get a sub-mode toggle: "Ticket" (the existing flow) or "Code" (the
+// new 4-word-code flow). Each panel keeps its own choice; one window
+// can have its Send side in code mode while Receive stays on ticket.
+type ShareFlow = "ticket" | "code";
+
+// Sender (pair-host) status machine. Mirrors SendStatus's shape:
+//   idle → hashing → awaiting_receiver → paired → serving → complete | error
+// "paired" = at least one receiver has finished the PAKE handshake;
+// "serving" = the offer has been delivered and the blob is being
+// pulled; "complete" = at least one receiver finished the download.
+// pair-host keeps running across multiple receivers like classic Send.
+type PairHostStatus =
+  | "idle"
+  | "hashing"
+  | "awaiting_receiver"
+  | "paired"
+  | "serving"
+  | "complete"
+  | "error";
+
+// Receiver (pair-join) status machine.
+//   idle → looking_up → handshaking → offer_received → downloading → exporting → complete | error
+type PairJoinStatus =
+  | "idle"
+  | "looking_up"
+  | "handshaking"
+  | "offer_received"
+  | "downloading"
+  | "exporting"
+  | "complete"
+  | "error";
+
+// One pair attempt against the sender — populated on the host side
+// from pairing_attempt_started/succeeded/failed/rejected events so
+// the user can see "someone with the wrong code tried 3 times" or
+// "you're under brute-force attack".
+interface PairAttempt {
+  endpointId: string;
+  outcome: "in_progress" | "succeeded" | "failed" | "rejected";
+  reason?: string;
+  at: number;
+}
+
 interface Tickets {
   direct: string | null;
   relay: string | null;
@@ -404,6 +448,38 @@ function App() {
   const [lastRecv, setLastRecv] = useState<LastReceive | null>(() =>
     loadJson<LastReceive>(LS_LAST_RECV)
   );
+
+  // v0.1.84 — sub-mode within Send. "ticket" = the classic blob-ticket
+  // flow (existing). "code" = the 4-word pair-code flow (pair-host).
+  // Persisted per-window only in memory; opens fresh each time.
+  const [sendFlow, setSendFlow] = useState<ShareFlow>("ticket");
+  // Same for the Receive panel.
+  const [recvFlow, setRecvFlow] = useState<ShareFlow>("ticket");
+
+  // v0.1.84 — pair-host state (Send-side, sub-mode = code).
+  const [pairCode, setPairCode] = useState<string | null>(null);
+  const [pairHostStatus, setPairHostStatus] = useState<PairHostStatus>("idle");
+  const [pairHostEndpointId, setPairHostEndpointId] = useState<string | null>(null);
+  const [pairHostHash, setPairHostHash] = useState<string | null>(null);
+  const [pairHostFormat, setPairHostFormat] = useState<string | null>(null);
+  const [pairHostError, setPairHostError] = useState<string | null>(null);
+  const [pairHostLogs, setPairHostLogs] = useState<string[]>([]);
+  const [pairAttempts, setPairAttempts] = useState<PairAttempt[]>([]);
+  const [pairCodeCopied, setPairCodeCopied] = useState(false);
+
+  // v0.1.84 — pair-join state (Receive-side, sub-mode = code).
+  const [codeInput, setCodeInput] = useState("");
+  const [pairJoinStatus, setPairJoinStatus] = useState<PairJoinStatus>("idle");
+  const [pairJoinError, setPairJoinError] = useState<string | null>(null);
+  const [pairJoinLogs, setPairJoinLogs] = useState<string[]>([]);
+  // The offer the sender announced over the AEAD channel. Surfaces the
+  // file name and size to the user before the download phase starts so
+  // they can confirm they got the right code.
+  const [pairOffer, setPairOffer] = useState<{
+    name: string;
+    size: number;
+    isFolder: boolean;
+  } | null>(null);
 
   // Send state
   const [filePath, setFilePath] = useState<string | null>(null);
@@ -1124,6 +1200,287 @@ function App() {
       })
     );
 
+    // ====================================================================
+    // v0.1.84 — Pair (Shareable Code) flow listeners.
+    //
+    // The CLI emits pair-specific events (pairing_code_ready,
+    // pairing_attempt_*, pairing_offer_*, pairing_handshake_*,
+    // pairing_session_ready, pairing_download_*) alongside the
+    // existing send/receive events the classic flows already handle.
+    // After pair-host's PAKE completes, the receiver's pair-join
+    // hands off to run_receive — so the standard recv_*/download_*/
+    // export_* events appear on the pair-join channel and we treat
+    // them just like the recv:stdout handler does.
+    // ====================================================================
+
+    unlisteners.push(
+      win.listen<string>("pair-host:stdout", (e) => {
+        const line = e.payload;
+        setPairHostLogs((prev) => [...prev, line]);
+        const parsed = parseOxEvent(line);
+        if (!parsed) return;
+        switch (parsed.type) {
+          case "ticket_hashing_start":
+            setPairHostStatus("hashing");
+            break;
+          case "ticket_hashing_complete":
+            // wait — pairing_code_ready arrives next and is more
+            // specific (it carries the code). Stay in "hashing"
+            // until the code is ready.
+            break;
+          case "pairing_code_ready":
+            setPairCode(typeof parsed.code === "string" ? parsed.code : null);
+            setPairHostEndpointId(
+              typeof parsed.endpoint_id === "string" ? parsed.endpoint_id : null
+            );
+            setPairHostHash(typeof parsed.hash === "string" ? parsed.hash : null);
+            setPairHostFormat(
+              typeof parsed.format === "string" ? parsed.format : null
+            );
+            setPairHostStatus("awaiting_receiver");
+            setPairCodeCopied(false);
+            break;
+          case "pairing_attempt_started":
+            if (typeof parsed.endpoint_id === "string") {
+              setPairAttempts((prev) => [
+                ...prev,
+                {
+                  endpointId: parsed.endpoint_id as string,
+                  outcome: "in_progress",
+                  at: Date.now(),
+                },
+              ]);
+            }
+            break;
+          case "pairing_attempt_succeeded":
+            setPairHostStatus("paired");
+            if (typeof parsed.endpoint_id === "string") {
+              const id = parsed.endpoint_id as string;
+              setPairAttempts((prev) => {
+                const idx = [...prev].reverse().findIndex(
+                  (a) => a.endpointId === id && a.outcome === "in_progress"
+                );
+                if (idx === -1) return prev;
+                const realIdx = prev.length - 1 - idx;
+                const next = [...prev];
+                next[realIdx] = { ...next[realIdx], outcome: "succeeded" };
+                return next;
+              });
+            }
+            break;
+          case "pairing_attempt_failed":
+          case "pairing_attempt_rejected": {
+            if (typeof parsed.endpoint_id === "string") {
+              const id = parsed.endpoint_id as string;
+              const outcome =
+                parsed.type === "pairing_attempt_rejected"
+                  ? ("rejected" as const)
+                  : ("failed" as const);
+              const reason =
+                typeof parsed.reason === "string"
+                  ? (parsed.reason as string)
+                  : undefined;
+              setPairAttempts((prev) => {
+                const idx = [...prev].reverse().findIndex(
+                  (a) => a.endpointId === id && a.outcome === "in_progress"
+                );
+                if (idx === -1) {
+                  return [
+                    ...prev,
+                    {
+                      endpointId: id,
+                      outcome,
+                      reason,
+                      at: Date.now(),
+                    },
+                  ];
+                }
+                const realIdx = prev.length - 1 - idx;
+                const next = [...prev];
+                next[realIdx] = { ...next[realIdx], outcome, reason };
+                return next;
+              });
+            }
+            break;
+          }
+          case "pairing_attack_warning":
+            // Surface as an error banner so the user sees it. Don't
+            // change status — pair-host keeps serving; an attacker
+            // failing is good news for honest receivers.
+            setPairHostError(
+              "Possible brute-force attack: multiple receivers have failed the handshake recently. The code is still safe (Argon2id makes each attempt slow) — but you may want to Stop and reshare a fresh code if this wasn't expected."
+            );
+            break;
+          case "pairing_offer_sent":
+            setPairHostStatus("serving");
+            break;
+          case "pairing_session_ready":
+            // Receiver acknowledged offer; download will begin
+            // shortly via the standard upload_started events.
+            setPairHostStatus("serving");
+            break;
+          case "upload_complete":
+            // Reuse classic Send semantics: at least one receiver
+            // finished — flip to "complete" but keep serving.
+            setPairHostStatus("complete");
+            break;
+        }
+      })
+    );
+
+    unlisteners.push(
+      win.listen<string>("pair-host:stderr", (e) => {
+        setPairHostLogs((prev) => [...prev, "[stderr] " + e.payload]);
+      })
+    );
+
+    unlisteners.push(
+      win.listen<number | null>("pair-host:exit", (e) => {
+        setPairHostLogs((prev) => [...prev, `[exit] code=${e.payload}`]);
+        // If pair-host died before producing a code, surface as error.
+        setPairHostStatus((curr) =>
+          curr === "hashing" || curr === "idle" ? "error" : curr
+        );
+        setPairHostError((prev) =>
+          prev ??
+          (e.payload !== 0 && e.payload !== null
+            ? `Pair-host process exited with code ${e.payload}.`
+            : null)
+        );
+      })
+    );
+
+    unlisteners.push(
+      win.listen<string>("pair-join:stdout", (e) => {
+        const line = e.payload;
+        setPairJoinLogs((prev) => [...prev, line]);
+        const parsed = parseOxEvent(line);
+        if (!parsed) return;
+        // Pair-specific events first. After pair-join hands off to
+        // run_receive internally, the standard recv events (download_*,
+        // export_*) appear here too — they update the same recvProgress
+        // / recvCurrentFile / etc. state the classic flow uses, so the
+        // existing progress UI just works.
+        switch (parsed.type) {
+          case "pairing_lookup_started":
+            setPairJoinStatus("looking_up");
+            break;
+          case "pairing_handshake_started":
+            setPairJoinStatus("handshaking");
+            break;
+          case "pairing_handshake_succeeded":
+            setPairJoinStatus("handshaking");
+            break;
+          case "pairing_handshake_failed":
+          case "pairing_lookup_failed":
+            setPairJoinStatus("error");
+            setPairJoinError(
+              typeof parsed.hint === "string"
+                ? (parsed.hint as string)
+                : typeof parsed.reason === "string"
+                ? `Pairing failed: ${parsed.reason}`
+                : "Pairing failed (wrong code or sender offline)."
+            );
+            break;
+          case "pairing_offer_received":
+            setPairJoinStatus("offer_received");
+            if (
+              typeof parsed.name === "string" &&
+              typeof parsed.size === "number" &&
+              typeof parsed.is_folder === "boolean"
+            ) {
+              setPairOffer({
+                name: parsed.name as string,
+                size: parsed.size as number,
+                isFolder: parsed.is_folder as boolean,
+              });
+              // Seed recvProgress so the progress UI's denominator is
+              // correct from the very first byte (mirrors the way the
+              // classic Receive seeds from `# size=<N>` in the ticket).
+              setRecvProgress({
+                bytes: 0,
+                total: parsed.size as number,
+                phase: "download",
+              });
+            }
+            break;
+          case "pairing_download_started":
+            setPairJoinStatus("downloading");
+            // Reset recv state to match — the existing download_*
+            // listeners reuse setRecvProgress / setRecvCurrentFile.
+            setRecvStatus("downloading");
+            break;
+          case "pairing_download_complete":
+            setPairJoinStatus("complete");
+            break;
+          // ------ Inherited from run_receive (pair-join phase 2): ------
+          case "download_started":
+          case "download_attempt":
+          case "download_provider_try":
+          case "connect_success":
+            // Already covered by setting "downloading" above.
+            break;
+          case "download_progress": {
+            const bytes = typeof parsed.bytes === "number" ? parsed.bytes : null;
+            const total = typeof parsed.total === "number" ? parsed.total : null;
+            setRecvProgress((prev) => ({
+              bytes: bytes ?? prev?.bytes ?? 0,
+              total: total ?? prev?.total ?? null,
+              phase: "download",
+            }));
+            break;
+          }
+          case "download_complete":
+            setRecvStatus("exporting");
+            break;
+          case "export_started":
+          case "export_size":
+          case "export_file_start":
+          case "export_file_done": {
+            const bytes = typeof parsed.bytes === "number" ? parsed.bytes : null;
+            const total = typeof parsed.total === "number" ? parsed.total : null;
+            setRecvProgress((prev) => ({
+              bytes: bytes ?? prev?.bytes ?? 0,
+              total: total ?? prev?.total ?? null,
+              phase: "export",
+            }));
+            break;
+          }
+          case "export_complete":
+            // pair_download_complete will follow and flip pairJoinStatus.
+            setRecvStatus("complete");
+            break;
+        }
+      })
+    );
+
+    unlisteners.push(
+      win.listen<string>("pair-join:stderr", (e) => {
+        setPairJoinLogs((prev) => [...prev, "[stderr] " + e.payload]);
+      })
+    );
+
+    unlisteners.push(
+      win.listen<number | null>("pair-join:exit", (e) => {
+        setPairJoinLogs((prev) => [...prev, `[exit] code=${e.payload}`]);
+        setPairJoinStatus((curr) =>
+          curr === "looking_up" ||
+          curr === "handshaking" ||
+          curr === "offer_received" ||
+          curr === "downloading" ||
+          curr === "exporting"
+            ? "error"
+            : curr
+        );
+        setPairJoinError((prev) =>
+          prev ??
+          (e.payload !== 0 && e.payload !== null
+            ? `Pair-join process exited with code ${e.payload}.`
+            : null)
+        );
+      })
+    );
+
     return () => {
       unlisteners.forEach((p) => p.then((fn) => fn()));
     };
@@ -1360,6 +1717,110 @@ function App() {
     setRecvStatus("idle");
   }
 
+  // ---------- v0.1.84 — Pair (Shareable Code) actions ----------
+
+  /// Reset all pair-host UI state to a fresh "ready to share" baseline.
+  /// Run before starting a new pair-host or after a Stop so a second
+  /// share doesn't show stale code/hash/attempts from the previous one.
+  function resetPairHostState() {
+    setPairCode(null);
+    setPairHostStatus("idle");
+    setPairHostEndpointId(null);
+    setPairHostHash(null);
+    setPairHostFormat(null);
+    setPairHostError(null);
+    setPairHostLogs([]);
+    setPairAttempts([]);
+    setPairCodeCopied(false);
+  }
+
+  async function startPairHost() {
+    if (!filePath) return;
+    resetPairHostState();
+    setPairHostStatus("hashing");
+    try {
+      await invoke("start_pair_host", { filePath });
+    } catch (err) {
+      setPairHostStatus("error");
+      setPairHostError(String(err));
+    }
+  }
+
+  async function stopPairHost() {
+    try {
+      await invoke("stop_pair_host");
+    } catch (err) {
+      console.error(err);
+    }
+    setPairHostStatus("idle");
+  }
+
+  /// Copy the code to the clipboard. Used by the prominent "Copy code"
+  /// button on the sender's share screen.
+  async function copyPairCode() {
+    if (!pairCode) return;
+    try {
+      await navigator.clipboard.writeText(pairCode);
+      setPairCodeCopied(true);
+      // Reset the "Copied!" affordance after a moment.
+      setTimeout(() => setPairCodeCopied(false), 1500);
+    } catch (err) {
+      console.error("copy failed:", err);
+    }
+  }
+
+  /// Normalize the receiver's code input: lowercase, hyphen-joined,
+  /// strip whitespace. Matches the CLI's normalize_code so spaces vs
+  /// hyphens vs mixed case all work. We accept any whitespace or
+  /// hyphen as a word separator on input.
+  function normalizeCodeInput(raw: string): string {
+    return raw
+      .toLowerCase()
+      .split(/[\s\-]+/)
+      .filter((w) => w.length > 0)
+      .join("-");
+  }
+
+  function resetPairJoinState() {
+    setPairJoinStatus("idle");
+    setPairJoinError(null);
+    setPairJoinLogs([]);
+    setPairOffer(null);
+    setRecvProgress(null);
+    setRecvStatus("idle");
+  }
+
+  async function startPairJoin() {
+    const code = normalizeCodeInput(codeInput);
+    if (!code || !outputPath) return;
+    resetPairJoinState();
+    setPairJoinStatus("looking_up");
+    // Forward the receiver label opt-in (same env var the classic
+    // receive uses, plumbed through the start_pair_join command's
+    // receiver_label arg).
+    const labelRaw = localStorage.getItem(LS_RECEIVER_LABEL) ?? "";
+    const label = labelRaw.trim();
+    try {
+      await invoke("start_pair_join", {
+        code,
+        outputPath,
+        receiverLabel: label.length > 0 ? label : null,
+      });
+    } catch (err) {
+      setPairJoinStatus("error");
+      setPairJoinError(String(err));
+    }
+  }
+
+  async function stopPairJoin() {
+    try {
+      await invoke("stop_pair_join");
+    } catch (err) {
+      console.error(err);
+    }
+    setPairJoinStatus("idle");
+  }
+
   // ---------- Render ----------
 
   const parsedReceive = parseReceiveInput(ticketInput);
@@ -1388,6 +1849,18 @@ function App() {
     sendStatus === "creating_ticket" ||
     sendStatus === "sharing" ||
     sendStatus === "complete";
+
+  // v0.1.84 — pair-host "anything in flight" gate. Mirrors sendActive:
+  // any state except idle / error means a sidecar is running and
+  // Pick File / mode toggles need to be disabled to avoid clobbering it.
+  const pairHostActive =
+    pairHostStatus !== "idle" && pairHostStatus !== "error";
+
+  // v0.1.84 — pair-join "anything in flight" gate. Mirrors recvBusy.
+  const pairJoinActive =
+    pairJoinStatus !== "idle" &&
+    pairJoinStatus !== "complete" &&
+    pairJoinStatus !== "error";
 
   // Pick which ticket variant to put in the share line based on the
   // selected connection mode. The CLI emits all three variants (full /
@@ -1495,6 +1968,36 @@ function App() {
       {mode === "send" && (
         <section className="panel">
           <h2>Send a file</h2>
+
+          {/* v0.1.84 — sub-mode toggle: classic ticket vs the new 4-word
+              pair code. Disabled while any transfer's in flight so the
+              user can't accidentally clobber a running sidecar. */}
+          <div
+            className="flow-switch"
+            role="tablist"
+            aria-label="Sharing method"
+          >
+            <button
+              role="tab"
+              aria-selected={sendFlow === "ticket"}
+              className={sendFlow === "ticket" ? "active" : ""}
+              onClick={() => setSendFlow("ticket")}
+              disabled={sendActive || pairHostActive}
+            >
+              Share by Ticket
+            </button>
+            <button
+              role="tab"
+              aria-selected={sendFlow === "code"}
+              className={sendFlow === "code" ? "active" : ""}
+              onClick={() => setSendFlow("code")}
+              disabled={sendActive || pairHostActive}
+            >
+              Share by Code
+            </button>
+          </div>
+
+          {sendFlow === "ticket" && (<>
           {lastSend && !sendActive && (
             <button
               className="resume-button"
@@ -1826,12 +2329,178 @@ function App() {
             <summary>Send logs ({sendLogs.length})</summary>
             <pre>{sendLogs.join("\n")}</pre>
           </details>
+          </>)}
+
+          {/* v0.1.84 — Share-by-Code flow. The receiver enters the 4-word
+              code in their Receive panel; no ticket changes hands. The
+              file picker is shared with the ticket flow above (same
+              filePath state, same Pick File / Pick Folder buttons), so
+              switching flows after picking doesn't lose the selection. */}
+          {sendFlow === "code" && (
+            <div className="pair-host">
+              <p className="hint">
+                The receiver types a 4-word code instead of pasting a
+                long ticket. The code derives both sides' identities,
+                so no ticket needs to travel — only the code does.
+              </p>
+
+              <div className="actions">
+                <button onClick={pickFile} disabled={pairHostActive}>
+                  Pick File…
+                </button>
+                <button onClick={pickFolder} disabled={pairHostActive}>
+                  Pick Folder…
+                </button>
+                <button
+                  onClick={startPairHost}
+                  disabled={!filePath || pairHostActive}
+                >
+                  Generate Code
+                </button>
+                <button onClick={stopPairHost} disabled={!pairHostActive}>
+                  Stop
+                </button>
+                <button
+                  className="ghost-button new-window-button"
+                  onClick={openNewTransferWindow}
+                >
+                  + New Transfer Window
+                </button>
+              </div>
+
+              {filePath && (
+                <p className="file-row">
+                  <strong>Picked:</strong>{" "}
+                  <code title={filePath}>{basename(filePath)}</code>
+                </p>
+              )}
+
+              {pairHostStatus === "hashing" && (
+                <p className="status">
+                  Hashing… (generating the code as soon as the file's
+                  ready)
+                </p>
+              )}
+
+              {pairCode !== null && (
+                <div className="pair-code-display">
+                  <p className="hint">Share this 4-word code:</p>
+                  <div className="pair-code">{pairCode}</div>
+                  <button onClick={copyPairCode} className="copy-code">
+                    {pairCodeCopied ? "Copied!" : "Copy code"}
+                  </button>
+                  <p className="hint">
+                    Anyone who knows the code can connect — but the
+                    Argon2id + CPace handshake makes a guess cost
+                    ≈1&nbsp;second, so brute-forcing 4 EFF words takes
+                    on the order of <em>74,000 years</em>.
+                  </p>
+
+                  <dl className="pair-details">
+                    <div>
+                      <dt>Status</dt>
+                      <dd className={`pair-status-${pairHostStatus}`}>
+                        {pairHostStatus === "awaiting_receiver" &&
+                          "Awaiting receiver…"}
+                        {pairHostStatus === "paired" &&
+                          "Receiver paired — preparing offer…"}
+                        {pairHostStatus === "serving" &&
+                          "Serving the blob…"}
+                        {pairHostStatus === "complete" &&
+                          "At least one receiver finished. Still serving — Stop to end."}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>NodeID (derived from code)</dt>
+                      <dd>
+                        <code className="endpoint-id">
+                          {pairHostEndpointId ?? "—"}
+                        </code>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>iroh-blobs hash</dt>
+                      <dd>
+                        <code className="endpoint-id">
+                          {pairHostHash ?? "—"}
+                        </code>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Format</dt>
+                      <dd>{pairHostFormat ?? "—"}</dd>
+                    </div>
+                  </dl>
+                </div>
+              )}
+
+              {pairAttempts.length > 0 && (
+                <div className="pair-attempts">
+                  <h3>Pair attempts ({pairAttempts.length})</h3>
+                  <ul>
+                    {pairAttempts.map((a, i) => (
+                      <li key={`${a.endpointId}-${i}`}>
+                        <code className="endpoint-id">
+                          {a.endpointId.slice(0, 16)}…
+                        </code>{" "}
+                        <span className={`pair-outcome-${a.outcome}`}>
+                          {a.outcome}
+                        </span>
+                        {a.reason && (
+                          <span className="hint"> — {a.reason}</span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {pairHostError && (
+                <p className="error" role="alert">
+                  {pairHostError}
+                </p>
+              )}
+
+              <details className="logs">
+                <summary>Pair-host logs ({pairHostLogs.length})</summary>
+                <pre>{pairHostLogs.join("\n")}</pre>
+              </details>
+            </div>
+          )}
         </section>
       )}
 
       {mode === "receive" && (
         <section className="panel">
           <h2>Receive a file</h2>
+
+          {/* v0.1.84 — same sub-mode toggle as Send. */}
+          <div
+            className="flow-switch"
+            role="tablist"
+            aria-label="Receiving method"
+          >
+            <button
+              role="tab"
+              aria-selected={recvFlow === "ticket"}
+              className={recvFlow === "ticket" ? "active" : ""}
+              onClick={() => setRecvFlow("ticket")}
+              disabled={recvBusy || pairJoinActive}
+            >
+              Receive by Ticket
+            </button>
+            <button
+              role="tab"
+              aria-selected={recvFlow === "code"}
+              className={recvFlow === "code" ? "active" : ""}
+              onClick={() => setRecvFlow("code")}
+              disabled={recvBusy || pairJoinActive}
+            >
+              Receive by Code
+            </button>
+          </div>
+
+          {recvFlow === "ticket" && (<>
           {lastRecv && !recvBusy && (
             <button
               className="resume-button"
@@ -2078,6 +2747,144 @@ function App() {
             <summary>Receive logs ({recvLogs.length})</summary>
             <pre>{recvLogs.join("\n")}</pre>
           </details>
+          </>)}
+
+          {/* v0.1.84 — Receive-by-Code flow. User types the 4-word code
+              from the sender; we run pair-join. After the PAKE
+              succeeds, the CLI's run_receive handoff drives the
+              standard download_* / export_* events, which the shared
+              recvProgress / recvStatus / etc. state and UI already
+              handle below for the ticket flow. */}
+          {recvFlow === "code" && (
+            <div className="pair-join">
+              <p className="hint">
+                Paste or type the 4-word code your sender shared. Any
+                separators (spaces, hyphens) and capitalization work —
+                we normalize before sending.
+              </p>
+
+              <label className="field">
+                <span>Pair code</span>
+                <input
+                  type="text"
+                  className="code-input"
+                  value={codeInput}
+                  onChange={(e) => setCodeInput(e.target.value)}
+                  placeholder="e.g. unhelpful jellied verse uncross"
+                  spellCheck={false}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  disabled={pairJoinActive}
+                />
+              </label>
+
+              {codeInput.trim().length > 0 && (
+                <p className="hint">
+                  Will send as:{" "}
+                  <code>{normalizeCodeInput(codeInput) || "—"}</code>
+                </p>
+              )}
+
+              <label className="field">
+                <span>Destination</span>
+                <input
+                  type="text"
+                  value={outputPath ?? ""}
+                  readOnly
+                  placeholder="Pick a file or folder destination…"
+                />
+              </label>
+
+              <div className="actions">
+                <button onClick={pickDestination} disabled={pairJoinActive}>
+                  Pick Destination…
+                </button>
+                <button
+                  onClick={startPairJoin}
+                  disabled={
+                    !codeInput.trim() || !outputPath || pairJoinActive
+                  }
+                >
+                  Receive
+                </button>
+                <button onClick={stopPairJoin} disabled={!pairJoinActive}>
+                  Stop
+                </button>
+                <button
+                  className="ghost-button new-window-button"
+                  onClick={openNewTransferWindow}
+                >
+                  + New Transfer Window
+                </button>
+              </div>
+
+              {pairJoinStatus !== "idle" && (
+                <dl className="pair-details">
+                  <div>
+                    <dt>Status</dt>
+                    <dd className={`pair-status-${pairJoinStatus}`}>
+                      {pairJoinStatus === "looking_up" &&
+                        "Looking up sender via iroh discovery…"}
+                      {pairJoinStatus === "handshaking" &&
+                        "Running the CPace handshake (this takes ~1 s for Argon2id)…"}
+                      {pairJoinStatus === "offer_received" &&
+                        "Sender's offer received. Starting download…"}
+                      {pairJoinStatus === "downloading" && "Downloading…"}
+                      {pairJoinStatus === "exporting" &&
+                        "Finalizing files into destination…"}
+                      {pairJoinStatus === "complete" && "Transfer complete."}
+                      {pairJoinStatus === "error" && "Error — see below."}
+                    </dd>
+                  </div>
+                  {pairOffer && (
+                    <>
+                      <div>
+                        <dt>Offered</dt>
+                        <dd>
+                          <code>{pairOffer.name}</code>{" "}
+                          {pairOffer.isFolder ? "(folder)" : "(file)"}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Size</dt>
+                        <dd>{formatBytes(pairOffer.size)}</dd>
+                      </div>
+                    </>
+                  )}
+                </dl>
+              )}
+
+              {recvProgress && (
+                <div className="progress">
+                  <progress
+                    value={recvProgress.bytes}
+                    max={recvProgress.total ?? undefined}
+                  />
+                  <p className="progress-text">
+                    {formatBytes(recvProgress.bytes)}
+                    {recvProgress.total
+                      ? ` / ${formatBytes(recvProgress.total)} (${(
+                          (recvProgress.bytes / recvProgress.total) *
+                          100
+                        ).toFixed(1)}%)`
+                      : ""}{" "}
+                    — {recvProgress.phase}
+                  </p>
+                </div>
+              )}
+
+              {pairJoinError && (
+                <p className="error" role="alert">
+                  {pairJoinError}
+                </p>
+              )}
+
+              <details className="logs">
+                <summary>Pair-join logs ({pairJoinLogs.length})</summary>
+                <pre>{pairJoinLogs.join("\n")}</pre>
+              </details>
+            </div>
+          )}
         </section>
       )}
     </main>
