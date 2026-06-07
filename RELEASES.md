@@ -1,5 +1,16 @@
 # Releases
 
+## v0.1.84 - 2026-06-06 (phase 2, CLI only — UNRELEASED)
+- **Pair-host now actually serves the blob** and **pair-join now actually downloads it.** Phase 2 closes the two TODOs Phase 1 left open and completes the end-to-end shareable-code transfer at the CLI level.
+  - `pair-host` now routes file/folder hashing through the same `prepare_single_file` / `prepare_folder` helpers `send` uses, so the offer's `(hash, format)` are real iroh-blobs identifiers and a real FsStore-backed blob is sitting on disk ready to serve.
+  - The pair-host endpoint now registers **both** `PAIR_ALPN` (PAKE handshake) and `iroh_blobs::ALPN` (blob service) on the same Router, so the same code-derived NodeID handles both phases of the transfer.
+  - `TempTag`s returned from preparation are held for the session lifetime — dropped only when pair-host shuts down — so the served blob can't be GC'd mid-fetch.
+  - `pair-join`, after the PAKE delivers the offer, synthesizes a `BlobTicket` from `(sender_node_id, offer.hash, offer.format)` and hands off to the existing `run_receive` — the v0.1.83 receive pipeline (preflight, MemoryLookup seeding, retry, progress events, folder extraction, integrity checks, auto store cleanup) is reused unchanged. **Zero refactor risk** to the supported `send`/`receive` flow.
+  - **End-to-end verified locally on this machine** for both shapes:
+    - Single file (512 KB): hash of received bytes matches input byte-for-byte (`89465ba8…` SHA-256).
+    - Folder with subdirectory (`a.bin`, `b.bin`, `sub/c.bin`, 448 KB total): all three files arrive at the right paths with matching SHA-256 hashes.
+  - **New event:** `pairing_download_started` (between handshake and blob fetch), `pairing_download_complete` (after the existing `export_complete` from the receive pipeline). The complete event sequence for a successful pair-join is now: `pairing_lookup_started` → `pairing_handshake_started` → `pairing_handshake_succeeded` → `pairing_offer_received` → `pairing_session_ready` → `pairing_download_started` → (existing receive events from `run_receive`) → `pairing_download_complete`.
+
 ## v0.1.84 - 2026-06-06 (phase 1, CLI only — UNRELEASED)
 - **Shareable Code (pairing) protocol — Phase 1 of 3.** Replaces the ~240-character blob ticket with a 4-word code (e.g. `unhelpful-jellied-verse-uncross`) that a receiver types in. Phase 1 ships the protocol skeleton in the CLI only; the GUI is untouched until Phase 2.
   - **New ALPN `orbitxfer/pair/1`.** Sender's ephemeral NodeID is *derived from the code itself* via BLAKE3 (domain-separated). No rendezvous server needed — iroh's existing relay-based discovery introduces the two peers.

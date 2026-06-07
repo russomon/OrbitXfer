@@ -20,7 +20,7 @@
 //! Phase 2 will join the pairing handshake to the existing send/
 //! receive code paths so the file actually moves after the handshake.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use blake3::Hasher;
 use chacha20poly1305::{
@@ -33,6 +33,12 @@ use iroh::{
     Endpoint, EndpointAddr,
 };
 use iroh_base::SecretKey;
+use iroh_blobs::{
+    api::TempTag,
+    store::fs::FsStore,
+    ticket::BlobTicket,
+    BlobFormat, BlobsProtocol, Hash,
+};
 use pake_cpace::{CPace, Step1Out, STEP1_PACKET_BYTES, STEP2_PACKET_BYTES};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -563,40 +569,76 @@ impl PairProtocol {
 // Subcommand entry points
 // ----------------------------------------------------------------
 
-/// `orbitxfer-iroh-cli pair-host <file>`
+/// Convert iroh-blobs' `BlobFormat` to/from the single byte we carry on
+/// the wire. Keeping the wire format compact means we can change the
+/// Rust type later without bumping `PROTO_VERSION`.
+fn format_to_byte(format: BlobFormat) -> u8 {
+    match format {
+        BlobFormat::Raw => 0,
+        BlobFormat::HashSeq => 1,
+    }
+}
+
+fn byte_to_format(b: u8) -> Result<BlobFormat> {
+    match b {
+        0 => Ok(BlobFormat::Raw),
+        1 => Ok(BlobFormat::HashSeq),
+        _ => bail!("unknown blob format byte: {}", b),
+    }
+}
+
+/// `orbitxfer-iroh-cli pair-host <file-or-folder>`
 ///
-/// Phase 1: hash the file (raw BLAKE3, not yet stored in iroh-blobs),
-/// generate a code, derive the ephemeral identity, stand up an
-/// endpoint with PairProtocol registered, wait for Ctrl-C. After the
-/// handshake completes with a receiver, the pairing flow ends — Phase
-/// 2 will hand off to the actual blob transfer here.
+/// Phase 2: hash the file or folder via the same `prepare_single_file`
+/// / `prepare_folder` helpers `send` uses, generate a code, derive the
+/// ephemeral identity, register BOTH `PAIR_ALPN` *and*
+/// `iroh_blobs::ALPN` on the Router so the same NodeID handles the
+/// PAKE handshake AND serves the blob, hold TempTags for the session
+/// lifetime, wait for Ctrl-C.
+///
+/// After the PAKE+offer handshake completes, the receiver opens a
+/// separate connection on `iroh_blobs::ALPN` to the same NodeID and
+/// downloads the blob via the normal iroh-blobs path — Phase 1's
+/// `pairing_session_ready` event is now followed by the blob serving
+/// that the receiver triggers autonomously.
 pub async fn run_pair_host(file_path: PathBuf) -> Result<()> {
     let abs_path = crate::abs_path(&file_path)?;
-    let meta = std::fs::metadata(&abs_path).context("stat file")?;
 
-    let mut hasher = blake3::Hasher::new();
-    if meta.is_file() {
-        let mut file = std::fs::File::open(&abs_path).context("open file")?;
-        std::io::copy(&mut file, &mut hasher).context("hash file")?;
-    } else {
-        // Folder placeholder hash: BLAKE3 of the absolute path. Phase 2
-        // will replace this with the iroh-blobs HashSeq root hash.
-        hasher.update(abs_path.to_string_lossy().as_bytes());
-    }
-    let hash = *hasher.finalize().as_bytes();
+    // Re-use the exact preparation pipeline send/send-folder uses, so
+    // the blob is added to a real FsStore and is dialable via the
+    // standard iroh-blobs ALPN with the canonical root hash. The
+    // returned temp tags must outlive the serving loop or the blobs
+    // they protect can be garbage-collected mid-fetch — they're held
+    // in `_keep_tags` and only dropped when `run_pair_host` returns.
+    crate::emit_line("Hashing (this can take a while for large files).");
+    crate::emit_event(json!({ "type": "ticket_hashing_start" }));
+    let store_dir = crate::store_root()?;
+    std::fs::create_dir_all(&store_dir)?;
+    let store = FsStore::load(store_dir.clone()).await?;
+    let blobs = BlobsProtocol::new(&store, None);
+
+    let (hash, format, total_size, _keep_tags): (Hash, BlobFormat, Option<u64>, Vec<TempTag>) =
+        if abs_path.is_dir() {
+            crate::prepare_folder(&store, &abs_path).await?
+        } else {
+            crate::prepare_single_file(&store, &abs_path).await?
+        };
 
     let name = abs_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("file")
         .to_string();
-    let is_folder = meta.is_dir();
+    let is_folder = abs_path.is_dir();
     let offer = TransferOffer {
-        hash,
-        format: if is_folder { 1 } else { 0 },
-        size: if is_folder { 0 } else { meta.len() },
+        hash: *hash.as_bytes(),
+        format: format_to_byte(format),
+        size: total_size.unwrap_or(0),
         name: name.clone(),
         is_folder,
+        // file_count is populated for HashSeq sends. Phase 2 keeps it
+        // None for simplicity; the receiver gets the canonical list by
+        // pulling the collection's metadata blob (existing code path).
         file_count: None,
     };
 
@@ -615,6 +657,8 @@ pub async fn run_pair_host(file_path: PathBuf) -> Result<()> {
         "file_name": name,
         "total_size": offer.size,
         "is_folder": is_folder,
+        "hash": hash.to_string(),
+        "format": match format { BlobFormat::Raw => "raw", BlobFormat::HashSeq => "hashseq" },
     }));
 
     let endpoint = Endpoint::builder().secret_key(secret).bind().await?;
@@ -623,14 +667,23 @@ pub async fn run_pair_host(file_path: PathBuf) -> Result<()> {
     let session = Arc::new(PairSession::new(code.clone(), offer));
     let pair_proto = PairProtocol::new(session);
 
+    // Two ALPNs on the same endpoint / NodeID:
+    //   - PAIR_ALPN: receiver runs the PAKE handshake here.
+    //   - iroh_blobs::ALPN: receiver pulls the actual blob here, *after*
+    //     the PAKE succeeds. The receiver knows our NodeID because they
+    //     derived it from the code; they get the hash+format from the
+    //     sealed TransferOffer.
     let router = Router::builder(endpoint)
         .accept(PAIR_ALPN, pair_proto)
+        .accept(iroh_blobs::ALPN, blobs)
         .spawn();
 
-    crate::emit_line("Pair-host running. Press Ctrl+C to stop.");
+    crate::emit_line("Pair-host running (serving blob). Press Ctrl+C to stop.");
     tokio::signal::ctrl_c().await?;
     crate::emit_line("Shutting down.");
     router.shutdown().await?;
+    // `_keep_tags` drops here, releasing the temp tags that kept the
+    // served blob alive for the session.
     Ok(())
 }
 
@@ -766,11 +819,41 @@ pub async fn run_pair_join(code: String, output_path: PathBuf) -> Result<()> {
         "output_path": output_path.to_string_lossy(),
     }));
 
-    // Phase 1 stops here. Phase 2 will continue with the actual blob
-    // download using `offer.hash`, `offer.format`, etc., dialing the
-    // same sender NodeID on iroh_blobs::ALPN.
-
+    // ---- Phase 2: hand off to the existing blob download path. ----
+    //
+    // After the PAKE has authenticated the offer, we drop the pairing
+    // connection and synthesize a BlobTicket from the offer's
+    // (hash, format) plus the sender's already-known NodeID. The
+    // sender's Router is serving `iroh_blobs::ALPN` on the same
+    // endpoint, so the receiver just dials that ALPN like any other
+    // blob fetch — which is exactly what `run_receive` does.
+    //
+    // We bind a *fresh* endpoint for the download instead of reusing
+    // the pair endpoint: `run_receive` does its own endpoint setup
+    // including `MemoryLookup` seeding, preflight, and a download-
+    // specific store directory. The (~200 ms) re-bind cost is
+    // dwarfed by the actual transfer, and the existing receive
+    // pipeline — including resume, progress events, folder
+    // extraction, and integrity checks — works without modification.
     drop(conn);
+    drop(endpoint);
+
+    let download_hash = Hash::from_bytes(offer.hash);
+    let download_format = byte_to_format(offer.format)?;
+    let addr = EndpointAddr::new(sender_node_id);
+    let ticket = BlobTicket::new(addr, download_hash, download_format).to_string();
+
+    crate::emit_event(json!({
+        "type": "pairing_download_started",
+        "hash": download_hash.to_string(),
+        "format": offer.format,
+        "size": offer.size,
+        "output_path": output_path.to_string_lossy(),
+    }));
+
+    crate::run_receive(ticket, output_path).await?;
+
+    crate::emit_event(json!({ "type": "pairing_download_complete" }));
     Ok(())
 }
 
