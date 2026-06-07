@@ -28,10 +28,20 @@ const MENU_ID_WINDOW_PREFIX: &str = "ox-window-";
 
 /// Each transfer window has its own isolated send/receive process slot.
 /// Without this, a second window starting a send would clobber the first.
+///
+/// v0.1.84 adds two more slots for the Shareable Code (pair) flow:
+/// `pair_host` (sender side, publishes a code) and `pair_join`
+/// (receiver side, dials a code). They're kept separate from
+/// `sender`/`receiver` so a window in pair mode can still have a
+/// classic Send or Receive running alongside if a future UI lets you,
+/// and so the existing stop_send / stop_receive commands can't
+/// accidentally kill the wrong process.
 #[derive(Default)]
 struct WindowState {
     sender: Option<CommandChild>,
     receiver: Option<CommandChild>,
+    pair_host: Option<CommandChild>,
+    pair_join: Option<CommandChild>,
 }
 
 #[derive(Default)]
@@ -55,6 +65,17 @@ struct AppState {
 enum Slot {
     Send,
     Recv,
+    /// v0.1.84 — Shareable-Code sender side. Spawns
+    /// `orbitxfer-iroh-cli pair-host <path>`. Behaves like Send for
+    /// store-isolation purposes (needs its own ORBITXFER_STORE_DIR)
+    /// but does NOT use the per-file identity dir — pair-host derives
+    /// its NodeID from the user-visible code, not from a key file.
+    PairHost,
+    /// v0.1.84 — Shareable-Code receiver side. Spawns
+    /// `orbitxfer-iroh-cli pair-join <code> <output-path>`. Behaves
+    /// like Recv: relies on the CLI's default per-destination store
+    /// and auto-cleanup.
+    PairJoin,
 }
 
 impl Slot {
@@ -62,6 +83,8 @@ impl Slot {
         match self {
             Slot::Send => &mut ws.sender,
             Slot::Recv => &mut ws.receiver,
+            Slot::PairHost => &mut ws.pair_host,
+            Slot::PairJoin => &mut ws.pair_join,
         }
     }
 }
@@ -609,6 +632,19 @@ fn run_sidecar(
         if let Some(mode) = ticket_mode {
             sidecar = sidecar.env("ORBITXFER_TICKET_MODE", mode);
         }
+    } else if matches!(slot, Slot::PairHost) {
+        // pair-host needs the same per-window FsStore isolation as
+        // Send (it's also a provider) but it deliberately does NOT
+        // use the per-file identity dir — its NodeID is derived
+        // from the 4-word pairing code, so feeding it a key file
+        // would just be ignored. We also skip ORBITXFER_TICKET_MODE
+        // because the pair flow doesn't expose connection-mode
+        // knobs to the user yet.
+        let store_dir = store_dir_for(app, &label)?;
+        sidecar = sidecar.env(
+            "ORBITXFER_STORE_DIR",
+            store_dir.to_string_lossy().as_ref(),
+        );
     } else {
         // Receive sidecar. Only set env vars when the frontend explicitly
         // asked us to — the CLI defaults handle the fresh-receive case:
@@ -766,6 +802,92 @@ async fn stop_receive(
         .map_err(|e| format!("state poisoned: {e}"))?
         .get_mut(window.label())
         .and_then(|ws| ws.receiver.take());
+    if let Some(child) = child {
+        child.kill().map_err(|e| format!("kill failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// v0.1.84 — start the sender side of the Shareable Code flow.
+/// Spawns `orbitxfer-iroh-cli pair-host <file_path>`. The CLI emits
+/// a `pairing_code_ready` OX_EVENT containing the 4-word code, which
+/// the frontend reads from the `pair-host:stdout` stream and displays.
+/// pair-host then keeps running (serving both PAIR_ALPN and
+/// iroh_blobs::ALPN) until stop_pair_host is invoked.
+#[tauri::command]
+async fn start_pair_host(
+    app: AppHandle,
+    window: WebviewWindow,
+    file_path: String,
+) -> Result<(), String> {
+    run_sidecar(
+        &app,
+        window.label().to_string(),
+        &["pair-host", &file_path],
+        "pair-host",
+        Slot::PairHost,
+        None,
+        ReceiveOverrides::default(),
+    )
+}
+
+#[tauri::command]
+async fn stop_pair_host(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let child = state
+        .windows
+        .lock()
+        .map_err(|e| format!("state poisoned: {e}"))?
+        .get_mut(window.label())
+        .and_then(|ws| ws.pair_host.take());
+    if let Some(child) = child {
+        child.kill().map_err(|e| format!("kill failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// v0.1.84 — start the receiver side of the Shareable Code flow.
+/// Spawns `orbitxfer-iroh-cli pair-join <code> <output_path>`. The
+/// CLI runs the PAKE handshake, then hands off internally to
+/// run_receive so the same `recv:*`-style download events the
+/// classic Receive panel handles all fire here too.
+#[tauri::command]
+async fn start_pair_join(
+    app: AppHandle,
+    window: WebviewWindow,
+    code: String,
+    output_path: String,
+    expected_size: Option<u64>,
+    receiver_label: Option<String>,
+) -> Result<(), String> {
+    run_sidecar(
+        &app,
+        window.label().to_string(),
+        &["pair-join", &code, &output_path],
+        "pair-join",
+        Slot::PairJoin,
+        None,
+        ReceiveOverrides {
+            expected_size,
+            store_dir: None,
+            receiver_label,
+        },
+    )
+}
+
+#[tauri::command]
+async fn stop_pair_join(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let child = state
+        .windows
+        .lock()
+        .map_err(|e| format!("state poisoned: {e}"))?
+        .get_mut(window.label())
+        .and_then(|ws| ws.pair_join.take());
     if let Some(child) = child {
         child.kill().map_err(|e| format!("kill failed: {e}"))?;
     }
@@ -978,6 +1100,11 @@ pub fn run() {
             stop_send,
             start_receive,
             stop_receive,
+            // v0.1.84 — Shareable Code (pair) flow.
+            start_pair_host,
+            stop_pair_host,
+            start_pair_join,
+            stop_pair_join,
             open_new_window
         ])
         .run(tauri::generate_context!())
