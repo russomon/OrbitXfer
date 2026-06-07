@@ -185,6 +185,35 @@ interface LastReceive {
   savedAt: number;
 }
 
+// v0.1.84 Phase 4 — Resume-last for the pair flow.
+//
+// LastPairHost: just remembers what file we last shared by code. The
+// CODE itself isn't reusable (every pair-host generates a fresh one),
+// but the SOURCE file is — so "Resume last pair-host" re-shares the
+// same file with a brand new code.
+//
+// LastPairJoin: remembers the code + destination. Pair-host codes are
+// one-shot from the sender's POV (their pair-host might still be
+// running, or they might have re-shared with the same code if they
+// stopped + restarted with the same file — actually no, the code is
+// always fresh). So "Resume last pair-join" only succeeds if the
+// sender's pair-host is still running with that same code. Useful for
+// retrying after a hiccup, useless after the sender has stopped.
+const LS_LAST_PAIR_HOST = "orbitxfer.lastPairHost.v1";
+const LS_LAST_PAIR_JOIN = "orbitxfer.lastPairJoin.v1";
+
+interface LastPairHost {
+  filePath: string;
+  isFolder?: boolean;
+  savedAt: number;
+}
+
+interface LastPairJoin {
+  code: string;
+  outputPath: string;
+  savedAt: number;
+}
+
 function loadJson<T>(key: string): T | null {
   try {
     const raw = localStorage.getItem(key);
@@ -466,6 +495,18 @@ function App() {
   const [pairHostLogs, setPairHostLogs] = useState<string[]>([]);
   const [pairAttempts, setPairAttempts] = useState<PairAttempt[]>([]);
   const [pairCodeCopied, setPairCodeCopied] = useState(false);
+  // Phase 4 — timing for the pair-host completion summary. Started
+  // when the receiver opens the upload (first `upload_started`),
+  // completed when at least one receiver finishes (`upload_complete`).
+  // Mirrors sendStartedAt/sendCompletedAt for the classic Send flow.
+  const [pairHostStartedAt, setPairHostStartedAt] = useState<number | null>(null);
+  const [pairHostCompletedAt, setPairHostCompletedAt] = useState<number | null>(null);
+  // Phase 4 — canonical payload size from the host's hashing events.
+  // Used by the summary card's Size + Speed rows.
+  const [pairHostTotalSize, setPairHostTotalSize] = useState<number | null>(null);
+  // True when the current pair-host is sharing a folder.
+  const [pairHostIsFolder, setPairHostIsFolder] = useState(false);
+  const [pairHostFileCount, setPairHostFileCount] = useState<number | null>(null);
 
   // v0.1.84 — pair-join state (Receive-side, sub-mode = code).
   const [codeInput, setCodeInput] = useState("");
@@ -480,6 +521,22 @@ function App() {
     size: number;
     isFolder: boolean;
   } | null>(null);
+  // Phase 4 — timing for the pair-join completion summary. Started at
+  // `pairing_download_started`, completed at `pairing_download_complete`.
+  // We use dedicated pair-join timestamps (not recvStartedAt/Completed)
+  // so the summary captures ONLY the data-transfer window, not the
+  // preceding ~1 s Argon2id+CPace handshake.
+  const [pairJoinStartedAt, setPairJoinStartedAt] = useState<number | null>(null);
+  const [pairJoinCompletedAt, setPairJoinCompletedAt] = useState<number | null>(null);
+
+  // Phase 4 — Resume-last for the pair flows. Same localStorage pattern
+  // the classic Send/Receive uses.
+  const [lastPairHost, setLastPairHost] = useState<LastPairHost | null>(() =>
+    loadJson<LastPairHost>(LS_LAST_PAIR_HOST)
+  );
+  const [lastPairJoin, setLastPairJoin] = useState<LastPairJoin | null>(() =>
+    loadJson<LastPairJoin>(LS_LAST_PAIR_JOIN)
+  );
 
   // Send state
   const [filePath, setFilePath] = useState<string | null>(null);
@@ -576,6 +633,10 @@ function App() {
       if (e.key === LS_LAST_SEND) setLastSend(loadJson<LastSend>(LS_LAST_SEND));
       else if (e.key === LS_LAST_RECV)
         setLastRecv(loadJson<LastReceive>(LS_LAST_RECV));
+      else if (e.key === LS_LAST_PAIR_HOST)
+        setLastPairHost(loadJson<LastPairHost>(LS_LAST_PAIR_HOST));
+      else if (e.key === LS_LAST_PAIR_JOIN)
+        setLastPairJoin(loadJson<LastPairJoin>(LS_LAST_PAIR_JOIN));
     }
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
@@ -1219,17 +1280,31 @@ function App() {
         setPairHostLogs((prev) => [...prev, line]);
         const parsed = parseOxEvent(line);
         if (!parsed) return;
+        // Phase 4 — folder file count for the summary card.
+        if (typeof parsed.files === "number") {
+          setPairHostFileCount(parsed.files);
+        }
         switch (parsed.type) {
           case "ticket_hashing_start":
             setPairHostStatus("hashing");
             break;
-          case "ticket_hashing_complete":
-            // wait — pairing_code_ready arrives next and is more
-            // specific (it carries the code). Stay in "hashing"
-            // until the code is ready.
+          case "ticket_hashing_size":
+            // Capture canonical total for the summary card's Size +
+            // Speed rows. Mirrors how the classic Send flow uses
+            // sendTotalSize.
+            if (typeof parsed.total === "number") {
+              setPairHostTotalSize(parsed.total);
+            }
             break;
-          case "pairing_code_ready":
-            setPairCode(typeof parsed.code === "string" ? parsed.code : null);
+          case "ticket_hashing_complete":
+            if (typeof parsed.total === "number") {
+              setPairHostTotalSize(parsed.total);
+            }
+            break;
+          case "pairing_code_ready": {
+            const code =
+              typeof parsed.code === "string" ? (parsed.code as string) : null;
+            setPairCode(code);
             setPairHostEndpointId(
               typeof parsed.endpoint_id === "string" ? parsed.endpoint_id : null
             );
@@ -1237,8 +1312,27 @@ function App() {
             setPairHostFormat(
               typeof parsed.format === "string" ? parsed.format : null
             );
+            const isFolder =
+              typeof parsed.is_folder === "boolean"
+                ? (parsed.is_folder as boolean)
+                : false;
+            setPairHostIsFolder(isFolder);
+            if (typeof parsed.total_size === "number") {
+              setPairHostTotalSize(parsed.total_size);
+            }
             setPairHostStatus("awaiting_receiver");
             setPairCodeCopied(false);
+            // Phase 4 — Resume-last persistence happens in
+            // startPairHost (which has access to the current
+            // filePath without stale-closure risk), not here.
+            break;
+          }
+          case "upload_started":
+            // Phase 4 — start the pair-host transfer clock the moment
+            // a receiver opens the upload, so the summary card's Time
+            // row reflects actual data-transfer duration (not the
+            // wait-for-receiver window before that).
+            setPairHostStartedAt((prev) => prev ?? Date.now());
             break;
           case "pairing_attempt_started":
             if (typeof parsed.endpoint_id === "string") {
@@ -1323,6 +1417,9 @@ function App() {
             // Reuse classic Send semantics: at least one receiver
             // finished — flip to "complete" but keep serving.
             setPairHostStatus("complete");
+            // Phase 4 — stop the clock the first time a receiver
+            // finishes. Matches how the classic Send summary works.
+            setPairHostCompletedAt((prev) => prev ?? Date.now());
             break;
         }
       })
@@ -1409,9 +1506,17 @@ function App() {
             // Reset recv state to match — the existing download_*
             // listeners reuse setRecvProgress / setRecvCurrentFile.
             setRecvStatus("downloading");
+            // Phase 4 — start the pair-join clock NOW (after the
+            // handshake), so the summary's Time / Speed reflect
+            // only the data-transfer window.
+            setPairJoinStartedAt((prev) => prev ?? Date.now());
             break;
           case "pairing_download_complete":
             setPairJoinStatus("complete");
+            setPairJoinCompletedAt((prev) => prev ?? Date.now());
+            // Phase 4 — Resume-last persistence happens in
+            // startPairJoin (which has access to the current code +
+            // outputPath without stale-closure risk), not here.
             break;
           // ------ Inherited from run_receive (pair-join phase 2): ------
           case "download_started":
@@ -1732,18 +1837,45 @@ function App() {
     setPairHostLogs([]);
     setPairAttempts([]);
     setPairCodeCopied(false);
+    // Phase 4 — clear timing + size so the summary card shows the
+    // CURRENT share's stats, not the previous one's.
+    setPairHostStartedAt(null);
+    setPairHostCompletedAt(null);
+    setPairHostTotalSize(null);
+    setPairHostIsFolder(false);
+    setPairHostFileCount(null);
   }
 
-  async function startPairHost() {
-    if (!filePath) return;
+  async function startPairHost(pathOverride?: string) {
+    const path = pathOverride ?? filePath;
+    if (!path) return;
     resetPairHostState();
     setPairHostStatus("hashing");
+    // Phase 4 — persist for Resume-last NOW, while we still have
+    // access to the chosen file path directly (no listener closure).
+    // We commit even before the code arrives so a quick crash still
+    // remembers what the user was trying to share.
+    const entry: LastPairHost = {
+      filePath: path,
+      savedAt: Date.now(),
+    };
+    saveJson(LS_LAST_PAIR_HOST, entry);
+    setLastPairHost(entry);
     try {
-      await invoke("start_pair_host", { filePath });
+      await invoke("start_pair_host", { filePath: path });
     } catch (err) {
       setPairHostStatus("error");
       setPairHostError(String(err));
     }
+  }
+
+  /// Phase 4 — re-share the last file that was pair-hosted. The CODE
+  /// itself is single-use, so this generates a NEW code; only the
+  /// file path is restored.
+  async function resumeLastPairHost() {
+    if (!lastPairHost) return;
+    setFilePath(lastPairHost.filePath);
+    await startPairHost(lastPairHost.filePath);
   }
 
   async function stopPairHost() {
@@ -1788,13 +1920,29 @@ function App() {
     setPairOffer(null);
     setRecvProgress(null);
     setRecvStatus("idle");
+    // Phase 4 — clear timing for a fresh download.
+    setPairJoinStartedAt(null);
+    setPairJoinCompletedAt(null);
   }
 
-  async function startPairJoin() {
-    const code = normalizeCodeInput(codeInput);
-    if (!code || !outputPath) return;
+  async function startPairJoin(
+    codeOverride?: string,
+    destOverride?: string
+  ) {
+    const codeRaw = codeOverride ?? codeInput;
+    const dest = destOverride ?? outputPath;
+    const code = normalizeCodeInput(codeRaw);
+    if (!code || !dest) return;
     resetPairJoinState();
     setPairJoinStatus("looking_up");
+    // Phase 4 — persist for Resume-last upfront.
+    const entry: LastPairJoin = {
+      code,
+      outputPath: dest,
+      savedAt: Date.now(),
+    };
+    saveJson(LS_LAST_PAIR_JOIN, entry);
+    setLastPairJoin(entry);
     // Forward the receiver label opt-in (same env var the classic
     // receive uses, plumbed through the start_pair_join command's
     // receiver_label arg).
@@ -1803,13 +1951,26 @@ function App() {
     try {
       await invoke("start_pair_join", {
         code,
-        outputPath,
+        outputPath: dest,
         receiverLabel: label.length > 0 ? label : null,
       });
     } catch (err) {
       setPairJoinStatus("error");
       setPairJoinError(String(err));
     }
+  }
+
+  /// Phase 4 — retry the last pair-join. Only useful if the sender's
+  /// pair-host is STILL running with the same code (codes are
+  /// single-use from the sender's POV — a fresh pair-host generates
+  /// a fresh code). After a hiccup mid-transfer this lets the user
+  /// click once instead of re-pasting the code.
+  async function resumeLastPairJoin() {
+    if (!lastPairJoin) return;
+    setCodeInput(lastPairJoin.code);
+    setOutputPath(lastPairJoin.outputPath);
+    userPickedDest.current = true;
+    await startPairJoin(lastPairJoin.code, lastPairJoin.outputPath);
   }
 
   async function stopPairJoin() {
@@ -1908,6 +2069,43 @@ function App() {
     recvElapsedSec > 0
       ? recvTotalForSummary / recvElapsedSec
       : null;
+
+  // ---- Phase 4 — Pair flow completion-summary stats ----
+  const pairHostElapsedSec =
+    pairHostStartedAt !== null && pairHostCompletedAt !== null
+      ? Math.max(0, (pairHostCompletedAt - pairHostStartedAt) / 1000)
+      : null;
+  const pairHostAvgSpeed =
+    pairHostTotalSize !== null &&
+    pairHostElapsedSec !== null &&
+    pairHostElapsedSec > 0
+      ? pairHostTotalSize / pairHostElapsedSec
+      : null;
+
+  const pairJoinElapsedSec =
+    pairJoinStartedAt !== null && pairJoinCompletedAt !== null
+      ? Math.max(0, (pairJoinCompletedAt - pairJoinStartedAt) / 1000)
+      : null;
+  const pairJoinTotalForSummary =
+    pairOffer?.size ?? recvProgress?.total ?? null;
+  const pairJoinAvgSpeed =
+    pairJoinTotalForSummary !== null &&
+    pairJoinElapsedSec !== null &&
+    pairJoinElapsedSec > 0
+      ? pairJoinTotalForSummary / pairJoinElapsedSec
+      : null;
+
+  // ---- Phase 4 — live code-input validation ----
+  // We count words after the same normalization the CLI uses. We
+  // can't validate against the EFF wordlist in the frontend (would
+  // bundle 7,776 words), but counting catches the overwhelmingly
+  // common typing mistakes — wrong word count.
+  const codeWordCount = (() => {
+    const norm = normalizeCodeInput(codeInput);
+    if (!norm) return 0;
+    return norm.split("-").length;
+  })();
+  const codeIsLikelyValid = codeWordCount === 4;
 
   return (
     <main className="container">
@@ -2344,6 +2542,20 @@ function App() {
                 so no ticket needs to travel — only the code does.
               </p>
 
+              {/* Phase 4 — Resume-last for pair-host. Re-shares the
+                  SAME file with a NEW code (the previous code is
+                  always single-use). */}
+              {lastPairHost && !pairHostActive && (
+                <button
+                  className="resume-button"
+                  onClick={resumeLastPairHost}
+                  title={lastPairHost.filePath}
+                >
+                  ↻ Re-share by code:{" "}
+                  <code>{basename(lastPairHost.filePath)}</code>
+                </button>
+              )}
+
               <div className="actions">
                 <button onClick={pickFile} disabled={pairHostActive}>
                   Pick File…
@@ -2352,7 +2564,7 @@ function App() {
                   Pick Folder…
                 </button>
                 <button
-                  onClick={startPairHost}
+                  onClick={() => startPairHost()}
                   disabled={!filePath || pairHostActive}
                 >
                   Generate Code
@@ -2459,6 +2671,58 @@ function App() {
                 <p className="error" role="alert">
                   {pairHostError}
                 </p>
+              )}
+
+              {/* Phase 4 — pair-host completion summary. Same layout
+                  as the classic Send summary so the eye knows where
+                  to look for Name / Size / Speed / Time. */}
+              {pairHostStatus === "complete" && (
+                <div className="completion-summary">
+                  <h3>✓ Transfer Complete</h3>
+                  <dl>
+                    <div>
+                      <dt>Name</dt>
+                      <dd>
+                        <code>
+                          {filePath ? basename(filePath) : "—"}
+                          {pairHostIsFolder ? "/" : ""}
+                        </code>
+                        {pairHostIsFolder &&
+                          pairHostFileCount !== null && (
+                            <span className="summary-meta">
+                              {" "}
+                              ({pairHostFileCount} file
+                              {pairHostFileCount === 1 ? "" : "s"})
+                            </span>
+                          )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Size</dt>
+                      <dd>
+                        {pairHostTotalSize !== null
+                          ? formatBytes(pairHostTotalSize)
+                          : "—"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Speed</dt>
+                      <dd>
+                        {pairHostAvgSpeed !== null
+                          ? `${formatSpeed(pairHostAvgSpeed)} (avg)`
+                          : "—"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Time</dt>
+                      <dd>
+                        {pairHostElapsedSec !== null
+                          ? formatDuration(pairHostElapsedSec)
+                          : "—"}
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
               )}
 
               <details className="logs">
@@ -2763,6 +3027,20 @@ function App() {
                 we normalize before sending.
               </p>
 
+              {/* Phase 4 — Resume-last for pair-join. Only useful if
+                  the sender's pair-host is still running with the
+                  SAME code; otherwise it'll fail at iroh lookup. */}
+              {lastPairJoin && !pairJoinActive && (
+                <button
+                  className="resume-button"
+                  onClick={resumeLastPairJoin}
+                  title={`${lastPairJoin.code} → ${lastPairJoin.outputPath}`}
+                >
+                  ↻ Resume last code receive:{" "}
+                  <code>{lastPairJoin.code}</code>
+                </button>
+              )}
+
               <label className="field">
                 <span>Pair code</span>
                 <input
@@ -2778,9 +3056,24 @@ function App() {
                 />
               </label>
 
+              {/* Phase 4 — live word-count validation. Catches the
+                  most common typo: wrong number of words. We can't
+                  validate dictionary membership here without
+                  bundling all 7,776 EFF words, but a wrong word's
+                  worst case is a clean iroh-discovery miss
+                  (different NodeID) — no info leakage. */}
               {codeInput.trim().length > 0 && (
-                <p className="hint">
-                  Will send as:{" "}
+                <p
+                  className={`code-validity ${
+                    codeIsLikelyValid
+                      ? "code-validity-ok"
+                      : "code-validity-warn"
+                  }`}
+                >
+                  {codeIsLikelyValid
+                    ? "✓ 4 words"
+                    : `${codeWordCount} of 4 words`}
+                  {" — will send as: "}
                   <code>{normalizeCodeInput(codeInput) || "—"}</code>
                 </p>
               )}
@@ -2800,9 +3093,9 @@ function App() {
                   Pick Destination…
                 </button>
                 <button
-                  onClick={startPairJoin}
+                  onClick={() => startPairJoin()}
                   disabled={
-                    !codeInput.trim() || !outputPath || pairJoinActive
+                    !codeIsLikelyValid || !outputPath || pairJoinActive
                   }
                 >
                   Receive
@@ -2877,6 +3170,59 @@ function App() {
                 <p className="error" role="alert">
                   {pairJoinError}
                 </p>
+              )}
+
+              {/* Phase 4 — pair-join completion summary. Mirrors the
+                  classic Receive summary; pulls totals from the
+                  AEAD-sealed offer so they match exactly what the
+                  sender shared. */}
+              {pairJoinStatus === "complete" && (
+                <div className="completion-summary">
+                  <h3>✓ Transfer Complete</h3>
+                  <dl>
+                    <div>
+                      <dt>Name</dt>
+                      <dd>
+                        <code>
+                          {pairOffer?.name ?? "—"}
+                          {pairOffer?.isFolder ? "/" : ""}
+                        </code>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Size</dt>
+                      <dd>
+                        {pairJoinTotalForSummary !== null
+                          ? formatBytes(pairJoinTotalForSummary)
+                          : "—"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Speed</dt>
+                      <dd>
+                        {pairJoinAvgSpeed !== null
+                          ? `${formatSpeed(pairJoinAvgSpeed)} (avg)`
+                          : "—"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Time</dt>
+                      <dd>
+                        {pairJoinElapsedSec !== null
+                          ? formatDuration(pairJoinElapsedSec)
+                          : "—"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Saved to</dt>
+                      <dd>
+                        <code title={outputPath ?? undefined}>
+                          {outputPath ?? "—"}
+                        </code>
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
               )}
 
               <details className="logs">

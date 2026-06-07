@@ -959,3 +959,22 @@ button:disabled {
   font-size: 1.05rem;
   letter-spacing: 0.01em;
 }
+
+/* Phase 4 — live word-count validity indicator. Green when 4 words
+   are present, muted-warn while the user is still typing. */
+.code-validity {
+  font-size: 0.85rem;
+  margin: 6px 0 12px 0;
+}
+
+.code-validity-ok {
+  color: var(--success);
+}
+
+.code-validity-warn {
+  color: var(--text-muted);
+}
+
+.code-validity code {
+  color: var(--text);
+}
