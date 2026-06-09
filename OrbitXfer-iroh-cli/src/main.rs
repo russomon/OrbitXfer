@@ -1,7 +1,7 @@
-// v0.1.84 — pairing-code (shareable-code) feature lives in its own module.
-// Wired into the subcommand dispatch in `main()` as `pair-host` and
-// `pair-join`. Phase 1 is CLI-only; no frontend changes yet.
-mod pair;
+// v0.1.85 — chat ALPN module. Holds the orbitxfer/chat/1 protocol
+// (ChatProtocol, ChatMessage, run_chat_session) and the stdin command
+// parser shared by run_send and run_receive.
+mod chat;
 
 use anyhow::{anyhow, bail, Context, Result};
 use fs2::available_space;
@@ -43,7 +43,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.84";
+const CLI_VERSION: &str = "0.1.85";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -99,8 +99,6 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  orbitxfer-iroh-cli send <path-to-file>");
     eprintln!("  orbitxfer-iroh-cli receive <ticket> <output-path>");
-    eprintln!("  orbitxfer-iroh-cli pair-host <path-to-file>");
-    eprintln!("  orbitxfer-iroh-cli pair-join <code> <output-path>");
 }
 
 fn abs_path(path: &Path) -> Result<PathBuf> {
@@ -329,54 +327,19 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Watch stdin for EOF (or read error) on a background thread and exit
-/// the process if it arrives.
-///
-/// Why: when this CLI is spawned as a child by Electron, Tauri, or any
-/// other parent that pipes stdin, the parent dying breaks the pipe. Our
-/// send/receive commands don't read stdin themselves, so we never notice
-/// — the process keeps running, holds an exclusive flock on
-/// FsStore::blobs.db, and every subsequent CLI run hangs at
-/// ticket_hashing_start until the orphan is killed manually.
-///
-/// Watching stdin is the cleanest cross-platform parent-death signal:
-/// - Pipe parents (Electron/Tauri): pipe closes on parent exit → read 0.
-/// - Terminal parents: closing the terminal severs the controlling tty
-///   → read returns error or 0.
-/// - Interactive use: read blocks waiting for input, never triggers exit
-///   unless user explicitly closes stdin (Ctrl+D or terminal close).
-fn watch_parent_via_stdin() {
-    std::thread::spawn(|| {
-        let stdin = std::io::stdin();
-        let mut handle = stdin.lock();
-        let mut buf = [0u8; 1024];
-        loop {
-            match handle.read(&mut buf) {
-                Ok(0) => {
-                    eprintln!(
-                        "[orbitxfer-iroh-cli] stdin closed (parent or terminal gone); exiting."
-                    );
-                    std::process::exit(0);
-                }
-                Ok(_) => {
-                    // CLI doesn't use stdin for input — discard and keep
-                    // watching for the eventual close.
-                    continue;
-                }
-                Err(_) => {
-                    eprintln!(
-                        "[orbitxfer-iroh-cli] stdin read failed; exiting."
-                    );
-                    std::process::exit(0);
-                }
-            }
-        }
-    });
-}
+// v0.1.85 — the original watch_parent_via_stdin (a thread that
+// read-then-discarded stdin to detect parent-death) is replaced by
+// `chat::spawn_stdin_command_reader`, which preserves the EOF→exit
+// behavior AND parses OX_CMD lines into CliCommands. The
+// subcommands take the receiver end of the command channel.
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    watch_parent_via_stdin();
+    // Stdin command bus: parent → sidecar control commands. The
+    // sender half is owned by the stdin reader task; the receiver
+    // half is moved into whichever subcommand runs below.
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<chat::CliCommand>();
+    chat::spawn_stdin_command_reader(cmd_tx);
 
     let mut args = env::args().skip(1);
     let cmd = args.next().unwrap_or_default();
@@ -388,7 +351,7 @@ async fn main() -> Result<()> {
             if args.next().is_some() {
                 bail!("send takes exactly one argument");
             }
-            run_send(PathBuf::from(file)).await?;
+            run_send(PathBuf::from(file), cmd_rx).await?;
         }
         "receive" => {
             emit_line(&format!("OrbitXfer CLI {} (receive)", CLI_VERSION));
@@ -397,31 +360,7 @@ async fn main() -> Result<()> {
             if args.next().is_some() {
                 bail!("receive takes exactly two arguments");
             }
-            run_receive(ticket, PathBuf::from(output)).await?;
-        }
-        // v0.1.84 phase 1: pair-host stands up the sender side of the
-        // shareable-code flow. Phase 1 stops after the receiver
-        // completes the PAKE handshake and acknowledges the offer;
-        // phase 2 will continue with the actual blob serving.
-        "pair-host" => {
-            emit_line(&format!("OrbitXfer CLI {} (pair-host)", CLI_VERSION));
-            let file = args.next().context("missing file path")?;
-            if args.next().is_some() {
-                bail!("pair-host takes exactly one argument");
-            }
-            pair::run_pair_host(PathBuf::from(file)).await?;
-        }
-        // v0.1.84 phase 1: pair-join is the receiver side. Phase 1
-        // ends after the handshake + offer exchange; phase 2 will
-        // continue with the blob download.
-        "pair-join" => {
-            emit_line(&format!("OrbitXfer CLI {} (pair-join)", CLI_VERSION));
-            let code = args.next().context("missing pairing code")?;
-            let output = args.next().context("missing output path")?;
-            if args.next().is_some() {
-                bail!("pair-join takes exactly two arguments");
-            }
-            pair::run_pair_join(code, PathBuf::from(output)).await?;
+            run_receive(ticket, PathBuf::from(output), cmd_rx).await?;
         }
         _ => {
             print_usage();
@@ -654,7 +593,10 @@ fn safe_relative_path(name: &str) -> Option<PathBuf> {
     }
 }
 
-async fn run_send(file_path: PathBuf) -> Result<()> {
+async fn run_send(
+    file_path: PathBuf,
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<chat::CliCommand>,
+) -> Result<()> {
     let abs_path = abs_path(&file_path)?;
 
     emit_line("Hashing file (this can take a while for large files).");
@@ -1119,7 +1061,11 @@ async fn send_receiver_label(
     Ok(())
 }
 
-async fn run_receive(ticket_str: String, output_path: PathBuf) -> Result<()> {
+async fn run_receive(
+    ticket_str: String,
+    output_path: PathBuf,
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<chat::CliCommand>,
+) -> Result<()> {
     let ticket: BlobTicket = ticket_str.parse().context("invalid ticket")?;
     let ticket_addr = ticket.addr().clone();
     emit_line(&format!("Ticket addr: {}", describe_addr(&ticket_addr)));
