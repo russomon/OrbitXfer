@@ -160,6 +160,13 @@ interface LastSend {
   filePath: string;
   savedAt: number;
   isFolder?: boolean;
+  // v0.1.85 — preserved ticket variants from the first session. The
+  // NodeID is the same across Stop→Resume cycles (per-file identity),
+  // but the encoded IP/port section drifts between sessions because
+  // ports are randomly assigned. Saving and re-displaying the
+  // original ticket on Resume keeps the share line stable for
+  // anyone who already received it.
+  tickets?: Tickets;
 }
 
 interface LastReceive {
@@ -500,6 +507,21 @@ function App() {
   const [recvStartedAt, setRecvStartedAt] = useState<number | null>(null);
   const [recvCompletedAt, setRecvCompletedAt] = useState<number | null>(null);
 
+  // v0.1.85 — When the user clicks "Resume last send", we want to
+  // show the SAME ticket the first session showed (the NodeID is
+  // preserved by per-file identity, but encoded IP/port info drifts
+  // between sessions and would otherwise cause the displayed ticket
+  // string to subtly change). Setting this ref BEFORE the next
+  // ticket_variants event fires tells the handler to keep showing
+  // the preserved variants instead of overwriting with the new
+  // sidecar's variants. The ref is reset to false after one use so
+  // a subsequent fresh Pick File / Pick Folder works normally.
+  const preserveTicketsOnNextSession = useRef(false);
+  // Visible UI flag: when true, render a small "Same ticket as
+  // before" hint above the share-line box so the user understands
+  // the preserved-ticket behavior.
+  const [isPreservedTicket, setIsPreservedTicket] = useState(false);
+
   // v0.1.85 — chat-while-you-transfer state. One chat per window:
   // for a Send-mode window it tracks the chat with the first
   // receiver who dials; for a Receive-mode window it's the chat
@@ -818,12 +840,44 @@ function App() {
             sendSpeedRef.current = [];
             setSendSpeed(null);
             break;
-          case "ticket_variants":
-            setTickets({
+          case "ticket_variants": {
+            const newTickets: Tickets = {
               direct: parsed.direct ?? null,
               relay: parsed.relay ?? null,
               full: parsed.full,
-            });
+            };
+            if (preserveTicketsOnNextSession.current) {
+              // v0.1.85 — Resume Last Send is in progress. The CLI
+              // emitted a fresh ticket (same NodeID + hash, but with
+              // updated IP/port encoding), and we deliberately DON'T
+              // overwrite the displayed tickets — we keep showing
+              // the originals so anyone holding the previous share
+              // line stays correct. We still update sendStatus etc.
+              // so the rest of the UI behaves normally.
+              preserveTicketsOnNextSession.current = false;
+              setIsPreservedTicket(true);
+            } else {
+              setTickets(newTickets);
+              setIsPreservedTicket(false);
+              // Save tickets into LastSend so a future Resume can
+              // re-display them. We update the existing localStorage
+              // entry (which already has filePath) with the tickets
+              // field. This is the FIRST time tickets are saved for
+              // this share — subsequent ticket_variants events in
+              // the same session (e.g. if iroh's address set
+              // changes) do NOT overwrite the saved tickets, so
+              // the saved version always matches what the user
+              // originally saw and possibly shared.
+              const existing = loadJson<LastSend>(LS_LAST_SEND);
+              if (existing && existing.filePath && !existing.tickets) {
+                const updated: LastSend = {
+                  ...existing,
+                  tickets: newTickets,
+                };
+                saveJson(LS_LAST_SEND, updated);
+                setLastSend(updated);
+              }
+            }
             // Confirm the canonical total. `ticket_hashing_size` already
             // set it once; we refresh here in case the source of truth
             // (e.g. a slightly different store-reported size) shifted.
@@ -833,6 +887,7 @@ function App() {
             // main signal now.
             setSendProgress(null);
             break;
+          }
           case "receiver_connected":
             if (connId !== null) {
               const endpointId =
@@ -1369,6 +1424,11 @@ function App() {
     const result = await open({ multiple: false, directory: false });
     if (typeof result === "string") {
       // One-step send: picking a file immediately kicks off the transfer.
+      // v0.1.85 — a fresh Pick File implies a fresh ticket; clear any
+      // preserved tickets from a previous Resume so the user sees the
+      // new sidecar's actual ticket variants.
+      preserveTicketsOnNextSession.current = false;
+      setIsPreservedTicket(false);
       setFilePath(result);
       await startSendWith(result, false);
     }
@@ -1378,6 +1438,8 @@ function App() {
     const result = await open({ multiple: false, directory: true });
     if (typeof result === "string") {
       // One-step folder send: the whole folder becomes a HashSeq collection.
+      preserveTicketsOnNextSession.current = false;
+      setIsPreservedTicket(false);
       setFilePath(result);
       await startSendWith(result, true);
     }
@@ -1392,7 +1454,13 @@ function App() {
     labelsByEndpointRef.current.clear();
     setSendStartedAt(null);
     setSendCompletedAt(null);
-    setTickets(null);
+    // v0.1.85 — only clear tickets when NOT in preserve mode. When
+    // preserve mode is on (we're inside resumeLastSend), the
+    // tickets state is intentionally pre-populated below and we
+    // want to keep showing it through the new sidecar's startup.
+    if (!preserveTicketsOnNextSession.current) {
+      setTickets(null);
+    }
     setSendError(null);
     setSendLogs([]);
     setSendProgress(null);
@@ -1406,11 +1474,22 @@ function App() {
       });
       // Persist the path on successful spawn — even if the transfer is later
       // interrupted, the user can resume with one click. isFolder is kept so
-      // the resumed share line gets the right folder hint.
+      // the resumed share line gets the right folder hint. Tickets are
+      // saved later, in the ticket_variants handler, so a fresh-Pick-File
+      // path doesn't carry over stale tickets from a prior session.
+      const existing = loadJson<LastSend>(LS_LAST_SEND);
       const entry: LastSend = {
         filePath: targetPath,
         savedAt: Date.now(),
         isFolder: asFolder,
+        // Preserve the ALREADY-SAVED tickets ONLY when we're resuming the
+        // same file — otherwise drop them so a fresh share doesn't display
+        // stale variants.
+        tickets:
+          preserveTicketsOnNextSession.current &&
+          existing?.filePath === targetPath
+            ? existing?.tickets
+            : undefined,
       };
       saveJson(LS_LAST_SEND, entry);
       setLastSend(entry);
@@ -1423,6 +1502,19 @@ function App() {
   async function resumeLastSend() {
     if (!lastSend) return;
     setFilePath(lastSend.filePath);
+    // v0.1.85 — pre-populate the displayed tickets with the saved
+    // variants from the original session. The NodeID portion of
+    // these tickets is still valid because per-file identity gives
+    // the resumed sidecar the same ephemeral key; only the encoded
+    // IP/port section drifts. Receivers holding the original share
+    // line will still reach the sender via iroh discovery on the
+    // unchanged NodeID. The hint banner below
+    // (`isPreservedTicket`) tells the user that's what's happening.
+    if (lastSend.tickets) {
+      setTickets(lastSend.tickets);
+      preserveTicketsOnNextSession.current = true;
+      setIsPreservedTicket(true);
+    }
     await startSendWith(lastSend.filePath, lastSend.isFolder ?? false);
   }
 
@@ -1941,6 +2033,14 @@ function App() {
           {tickets && selectedTicket && (
             <div className="ticket-box">
               <h3>Your Share Ticket:</h3>
+              {isPreservedTicket && (
+                <p className="preserved-ticket-hint" role="status">
+                  ↻ Same ticket as before — anyone you already shared
+                  this with can keep using it. (The sender's identity
+                  is preserved across Stop → Resume; the share line you
+                  see here is the original one.)
+                </p>
+              )}
               <p className="hint">
                 Share this Ticket with the recipient to start the file
                 transfer. They just need to paste it into Receive and click

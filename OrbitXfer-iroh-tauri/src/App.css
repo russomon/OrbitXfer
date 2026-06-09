@@ -931,3 +931,18 @@ button:disabled {
   outline: none;
   border-color: var(--accent);
 }
+
+/* v0.1.85 — Resume Last Send preserves the original ticket. This
+   banner appears above the share-line textarea to make it explicit
+   that the user is looking at the SAME ticket their previous
+   recipient(s) saw, not a freshly minted one. */
+.preserved-ticket-hint {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  color: var(--accent);
+  border-radius: 6px;
+}
