@@ -217,6 +217,35 @@ fn store_root_for_receive(output_path: &Path) -> Result<(PathBuf, bool)> {
     Ok((store_dir, true))
 }
 
+/// v0.1.85 — recursively sum the size of every file under
+/// `store_dir`. Used at the start of `run_receive` to compute a
+/// resume baseline: how many bytes are already cached locally from a
+/// previous interrupted receive.
+///
+/// This is an over-estimate (includes blobs.db's bookkeeping
+/// overhead and per-blob outboard/sizes metadata), but the overhead
+/// is single-digit MB even for multi-GB transfers, so the bar's
+/// accuracy is within a fraction of a percent — much better than
+/// always-from-zero.
+fn estimate_cached_bytes(store_dir: &Path) -> u64 {
+    fn walk(p: &Path, total: &mut u64) {
+        let Ok(entries) = std::fs::read_dir(p) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                walk(&entry.path(), total);
+            } else if meta.is_file() {
+                *total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    let mut total: u64 = 0;
+    walk(store_dir, &mut total);
+    total
+}
+
 fn import_mode_from_env() -> ImportMode {
     match env::var("ORBITXFER_IMPORT_MODE") {
         Ok(val) if val.eq_ignore_ascii_case("copy") => ImportMode::Copy,
@@ -332,6 +361,63 @@ fn format_bytes(bytes: u64) -> String {
 // `chat::spawn_stdin_command_reader`, which preserves the EOF→exit
 // behavior AND parses OX_CMD lines into CliCommands. The
 // subcommands take the receiver end of the command channel.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn estimate_cached_bytes_empty_dir() {
+        let tmp = tempdir_path();
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(estimate_cached_bytes(&tmp), 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn estimate_cached_bytes_nonexistent_dir() {
+        let tmp = tempdir_path().join("does-not-exist");
+        assert_eq!(estimate_cached_bytes(&tmp), 0);
+    }
+
+    #[test]
+    fn estimate_cached_bytes_sums_top_level_files() {
+        let tmp = tempdir_path();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut f1 = std::fs::File::create(tmp.join("a.dat")).unwrap();
+        f1.write_all(&vec![0u8; 1024]).unwrap();
+        let mut f2 = std::fs::File::create(tmp.join("b.dat")).unwrap();
+        f2.write_all(&vec![0u8; 2048]).unwrap();
+        assert_eq!(estimate_cached_bytes(&tmp), 3072);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn estimate_cached_bytes_recurses_into_subdirs() {
+        let tmp = tempdir_path();
+        std::fs::create_dir_all(tmp.join("data")).unwrap();
+        let mut f1 = std::fs::File::create(tmp.join("blobs.db")).unwrap();
+        f1.write_all(&vec![0u8; 100]).unwrap();
+        let mut f2 = std::fs::File::create(tmp.join("data").join("blob1.obao4"))
+            .unwrap();
+        f2.write_all(&vec![0u8; 4096]).unwrap();
+        let mut f3 = std::fs::File::create(tmp.join("data").join("blob1.sizes4"))
+            .unwrap();
+        f3.write_all(&vec![0u8; 64]).unwrap();
+        assert_eq!(estimate_cached_bytes(&tmp), 100 + 4096 + 64);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn tempdir_path() -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("orbitxfer-test-{}", nanos))
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1176,6 +1262,45 @@ async fn run_receive(
 
     let (store_dir, auto_store_cleanup) = store_root_for_receive(&abs_path)?;
     std::fs::create_dir_all(&store_dir)?;
+
+    // v0.1.85 — Resume baseline. If the user stopped a previous
+    // receive (Stop button, sidecar kill, etc.) the `.orbitxfer-
+    // pieces/` store directory may already contain partial blob
+    // data for this hash. iroh-blobs IS resuming at the store
+    // level (we don't wipe the store between sessions), but the
+    // download_progress events from the downloader stream report
+    // ONLY this session's network bytes — they don't know about
+    // the bytes already on disk. Result: the progress bar starts
+    // at 0% even though a chunk of the file is already there.
+    //
+    // The fix: walk the store dir, sum the file sizes as a
+    // baseline, emit it as a `download_resume_baseline` event,
+    // and add it to every subsequent `download_progress.bytes`
+    // value so the bar reflects cumulative completion.
+    //
+    // CRITICAL ordering: we walk BEFORE `FsStore::load`. The load
+    // step reorganizes / compacts the on-disk format (partial
+    // data moves into blobs.db's internal layout), and by the
+    // time `load` returns the simple "sum directory file sizes"
+    // estimate undercounts wildly — first attempt at this had
+    // 597 MB on disk pre-load reporting as 1.1 MB after load.
+    //
+    // The walk is an over-estimate (includes blobs.db's
+    // SQLite-style overhead + per-blob .obao4/.sizes4 metadata),
+    // but the metadata overhead is single-digit MB for a multi-GB
+    // transfer. Good enough to make the bar honest.
+    let baseline_bytes = estimate_cached_bytes(&store_dir);
+    if baseline_bytes > 0 {
+        emit_line(&format!(
+            "Resuming with {} already cached.",
+            format_bytes(baseline_bytes)
+        ));
+        emit_event(json!({
+            "type": "download_resume_baseline",
+            "bytes": baseline_bytes,
+        }));
+    }
+
     let store = FsStore::load(store_dir.clone()).await?;
 
     emit_line("Checking provider connectivity...");
@@ -1447,9 +1572,12 @@ async fn run_receive(
                         emit_event(json!({ "type": "connect_success" }));
                     }
                     if throttle.should_emit(bytes) {
+                        // v0.1.85 — `bytes` is session-local; add the
+                        // resume baseline so the bar shows cumulative
+                        // file completion (cached + just-transferred).
                         emit_event(json!({
                             "type": "download_progress",
-                            "bytes": bytes,
+                            "bytes": baseline_bytes.saturating_add(bytes),
                             "total": total_size
                         }));
                     }
@@ -1555,9 +1683,14 @@ async fn run_receive(
                         emit_event(json!({ "type": "connect_success" }));
                     }
                     if downloader_throttle.should_emit(bytes) {
+                        // v0.1.85 — see `download_resume_baseline`
+                        // comment above. Same cumulative-bytes
+                        // adjustment applied to the downloader path
+                        // (used when the direct GET falls back to the
+                        // multi-provider downloader).
                         emit_event(json!({
                             "type": "download_progress",
-                            "bytes": bytes,
+                            "bytes": baseline_bytes.saturating_add(bytes),
                             "total": total_size
                         }));
                     }

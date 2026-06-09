@@ -858,11 +858,44 @@ function App() {
               typeof parsed.label === "string" ? parsed.label : null;
             if (endpointId && label) {
               labelsByEndpointRef.current.set(endpointId, label);
-              setReceivers((prev) =>
-                prev.map((r) =>
-                  r.endpointId === endpointId ? { ...r, label } : r
-                )
-              );
+              setReceivers((prev) => {
+                // v0.1.85 — dedup by label. When the same person
+                // hits Stop → Resume on the receiver side, they
+                // reconnect with a fresh ephemeral iroh NodeID and
+                // the prior receiver-row's disconnect event may not
+                // have propagated yet (the SIGKILL takes up to 5 s).
+                // Without this, a single user's three retries
+                // showed up as three Receivers rows (`russo recieve`
+                // ×3) all looking active.
+                //
+                // Strategy: when a new label arrives, any OTHER row
+                // with the same label that ISN'T already
+                // successfully completed gets removed. The newest
+                // labeled connection supersedes any in-flight or
+                // disconnected predecessors with the same label.
+                // Completed rows are preserved as a per-session
+                // history.
+                //
+                // Trade-offs:
+                //  - Two real machines with the same label
+                //    downloading concurrently → only the most
+                //    recent shows. Labels are user-typed and not
+                //    unique; this is an acceptable cost for the
+                //    common "I stopped and resumed" case.
+                //  - Completed rows stay visible so the user can
+                //    see "russo recieve finished" alongside any new
+                //    "russo recieve (retry)" attempt.
+                return prev
+                  .filter(
+                    (r) =>
+                      r.label !== label ||
+                      r.endpointId === endpointId ||
+                      r.status === "complete"
+                  )
+                  .map((r) =>
+                    r.endpointId === endpointId ? { ...r, label } : r
+                  );
+              });
             }
             break;
           }
@@ -1120,6 +1153,28 @@ function App() {
           case "download_size":
             setRecvProgress({ bytes: 0, total, phase: "download" });
             break;
+          case "download_resume_baseline": {
+            // v0.1.85 — the CLI walked the .orbitxfer-pieces/
+            // store dir at session start and found cached bytes
+            // from a previous interrupted receive. Seed the
+            // progress bar with the baseline so users see e.g.
+            // "3.4 GB / 4.58 GB" the moment the receive starts,
+            // instead of "0 MB / 4.58 GB" ticking up from scratch
+            // when 75% of the file already lives on disk. The
+            // CLI also adds this baseline to every subsequent
+            // download_progress.bytes value, so the percentage
+            // and ETA reflect cumulative completion correctly.
+            const baseline =
+              typeof parsed.bytes === "number" ? parsed.bytes : 0;
+            if (baseline > 0) {
+              setRecvProgress((prev) => ({
+                bytes: baseline,
+                total: prev?.total ?? null,
+                phase: "download",
+              }));
+            }
+            break;
+          }
           case "download_started":
             setRecvStatus("downloading");
             // Start the receive clock when bytes actually begin flowing.
