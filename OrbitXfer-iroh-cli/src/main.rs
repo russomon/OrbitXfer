@@ -1258,6 +1258,60 @@ async fn run_receive(
         }
     };
 
+    // v0.1.85 — spawn the stdin command dispatcher NOW, in parallel
+    // with the download, so receiver-side ChatSend commands flow to
+    // the peer immediately instead of queuing in cmd_rx until the
+    // download finishes. The dispatcher pushes ChatSend onto
+    // chat_outbox_tx and signals StopReceive via a oneshot so the
+    // outer flow can drop out of its post-download wait.
+    //
+    // We give the dispatcher its OWN clone of chat_outbox_tx so the
+    // main flow's chat_outbox_tx can be dropped after the download
+    // without prematurely closing the outbox (the dispatcher's clone
+    // keeps it alive for the chat session's lifetime).
+    let chat_outbox_tx_for_dispatch = chat_outbox_tx.clone();
+    let (stop_receive_tx, mut stop_receive_rx) = tokio::sync::oneshot::channel::<()>();
+    let cmd_dispatch_task = tokio::spawn(async move {
+        let mut cmd_rx = cmd_rx;
+        let mut stop_sender = Some(stop_receive_tx);
+        while let Some(cmd) = cmd_rx.recv().await {
+            match cmd {
+                chat::CliCommand::ChatSend { body } => {
+                    let msg = chat::ChatMessage::Text {
+                        body,
+                        sent_at_unix_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0),
+                    };
+                    if let Err(e) = chat_outbox_tx_for_dispatch.send(msg).await {
+                        emit_event(json!({
+                            "type": "chat_send_failed",
+                            "error": format!("{}", e),
+                        }));
+                    }
+                }
+                chat::CliCommand::ChatStop => {
+                    let _ = chat_outbox_tx_for_dispatch
+                        .send(chat::ChatMessage::Bye)
+                        .await;
+                }
+                chat::CliCommand::StopReceive => {
+                    let _ = chat_outbox_tx_for_dispatch
+                        .send(chat::ChatMessage::Bye)
+                        .await;
+                    if let Some(tx) = stop_sender.take() {
+                        let _ = tx.send(());
+                    }
+                    return;
+                }
+                chat::CliCommand::StopSend => {
+                    // Not applicable on the receive side.
+                }
+            }
+        }
+    });
+
     let expected_size = expected_size_from_env();
     let mut total_size: Option<u64> = expected_size;
     if let Some(size) = expected_size {
@@ -1622,86 +1676,35 @@ async fn run_receive(
         }
     }
 
-    // v0.1.85 — if the chat connection was established, keep the
-    // receiver process alive until either:
-    //   - the chat session task ends (peer sent Bye, stream closed)
-    //   - the GUI issues StopReceive or ChatStop
-    //   - ctrl-c arrives
-    //   - stdin EOF (handled inside spawn_stdin_command_reader)
-    //
-    // ChatSend commands are forwarded to the chat outbox so the user
-    // can keep typing while the post-transfer window is open.
-    let mut cmd_rx = cmd_rx;
+    // v0.1.85 — drop our copy of chat_outbox_tx so its lifetime is
+    // pinned to the cmd_dispatch_task's clone (which holds the chat
+    // open as long as commands can still arrive).
+    drop(chat_outbox_tx);
+
+    // If chat was established, keep the receiver process alive until
+    // either the chat session ends (peer Bye, stream closed) or the
+    // GUI issues StopReceive (which also closes the chat via the
+    // dispatcher). The cmd_dispatch_task is already running in the
+    // background forwarding ChatSend → chat_outbox.
     if let Some(chat_handle) = chat_handle {
         emit_event(json!({ "type": "chat_keepalive_started" }));
-        let mut chat_handle = chat_handle;
-        loop {
-            tokio::select! {
-                cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(chat::CliCommand::ChatSend { body }) => {
-                            let msg = chat::ChatMessage::Text {
-                                body,
-                                sent_at_unix_ms: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0),
-                            };
-                            if let Err(e) = chat_outbox_tx.send(msg).await {
-                                emit_event(json!({
-                                    "type": "chat_send_failed",
-                                    "error": format!("{}", e),
-                                }));
-                            }
-                        }
-                        Some(chat::CliCommand::ChatStop) => {
-                            let _ = chat_outbox_tx
-                                .send(chat::ChatMessage::Bye)
-                                .await;
-                            // Drop the sender so the writer half of
-                            // the chat session sees the channel close
-                            // after the Bye it just consumed.
-                            drop(chat_outbox_tx);
-                            let _ = chat_handle.await;
-                            break;
-                        }
-                        Some(chat::CliCommand::StopReceive) => {
-                            let _ = chat_outbox_tx
-                                .send(chat::ChatMessage::Bye)
-                                .await;
-                            drop(chat_outbox_tx);
-                            let _ = chat_handle.await;
-                            break;
-                        }
-                        Some(chat::CliCommand::StopSend) => {
-                            // not applicable on the receive side
-                        }
-                        None => break,
-                    }
-                }
-                join_result = &mut chat_handle => {
-                    // Chat session ended (peer Bye, stream closed, etc.)
-                    let _ = join_result;
-                    break;
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    let _ = chat_outbox_tx
-                        .send(chat::ChatMessage::Bye)
-                        .await;
-                    drop(chat_outbox_tx);
-                    let _ = chat_handle.await;
-                    break;
-                }
+        tokio::select! {
+            join_result = chat_handle => {
+                let _ = join_result;
+            }
+            _ = &mut stop_receive_rx => {
+                // Dispatcher already pushed Bye + signaled. Drop
+                // through to shutdown.
+            }
+            _ = tokio::signal::ctrl_c() => {
+                // ctrl-c — the dispatcher is still running; abort it.
             }
         }
         emit_event(json!({ "type": "chat_keepalive_ended" }));
-    } else {
-        // No chat was established — exit immediately, same as
-        // pre-v0.1.85 behavior.
-        drop(chat_outbox_tx);
-        // Drain any pending commands silently so they don't block.
-        cmd_rx.close();
     }
+
+    // Stop the dispatcher and shut down cleanly.
+    cmd_dispatch_task.abort();
 
     emit_line("Shutting down.");
     endpoint.close().await;
