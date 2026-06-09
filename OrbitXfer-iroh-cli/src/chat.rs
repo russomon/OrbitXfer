@@ -308,70 +308,88 @@ pub async fn run_chat_session(
     crate::emit_event(json!({
         "type": "chat_connected",
         "label": peer_label,
-        "endpoint_id": remote_id,
+        "endpoint_id": remote_id.clone(),
     }));
 
-    // Reader task — pulls inbound frames from the peer and emits
-    // OX_EVENTs. Exits on Bye, stream error, or peer hangup.
-    let reader_task = tokio::spawn(async move {
-        loop {
-            match recv_frame(&mut recv).await {
-                Ok(ChatMessage::Text {
-                    body,
-                    sent_at_unix_ms,
-                }) => {
-                    let body = sanitize_text(&body);
-                    crate::emit_event(json!({
-                        "type": "chat_message_received",
-                        "body": body,
-                        "sent_at_unix_ms": sent_at_unix_ms,
-                    }));
-                }
-                Ok(ChatMessage::Hello { .. }) => {
-                    // unexpected post-handshake; log and continue
-                    eprintln!("[chat] unexpected Hello after handshake");
-                }
-                Ok(ChatMessage::Bye) => {
-                    return PeerCloseReason::Bye;
-                }
-                Err(e) => {
-                    let msg = format!("{}", e);
-                    // EOF on the stream is a normal close, not an error
-                    if msg.contains("UnexpectedEof") || msg.contains("ConnectionLost") {
-                        return PeerCloseReason::StreamClosed;
+    // v0.1.85 — single-loop reader+writer using tokio::select!. The
+    // earlier two-task design deadlocked on graceful close: if one
+    // side sent Bye, the other side's reader exited but its writer
+    // kept waiting for outbox input forever. Co-locating both
+    // directions lets us close the loop the moment Bye flows in
+    // either direction.
+    let mut we_sent_bye = false;
+    loop {
+        tokio::select! {
+            // Outbound: pull from the GUI-driven outbox.
+            outbound = outbox_rx.recv() => {
+                match outbound {
+                    Some(msg) => {
+                        let is_bye = matches!(msg, ChatMessage::Bye);
+                        if let Err(e) = send_frame(&mut send, &msg).await {
+                            crate::emit_event(json!({
+                                "type": "chat_send_failed",
+                                "error": format!("{}", e),
+                            }));
+                            break;
+                        }
+                        if is_bye {
+                            we_sent_bye = true;
+                            break;
+                        }
                     }
-                    crate::emit_event(json!({
-                        "type": "chat_read_error",
-                        "error": msg,
-                    }));
-                    return PeerCloseReason::Error;
+                    None => {
+                        // Outbox closed externally (e.g. ChatProtocol::close
+                        // taking the sender). Treat as an implicit Bye if
+                        // we haven't already sent one.
+                        if !we_sent_bye {
+                            let _ = send_frame(&mut send, &ChatMessage::Bye).await;
+                        }
+                        break;
+                    }
+                }
+            }
+            // Inbound: read one frame from the peer.
+            inbound = recv_frame(&mut recv) => {
+                match inbound {
+                    Ok(ChatMessage::Text { body, sent_at_unix_ms }) => {
+                        let body = sanitize_text(&body);
+                        crate::emit_event(json!({
+                            "type": "chat_message_received",
+                            "body": body,
+                            "sent_at_unix_ms": sent_at_unix_ms,
+                        }));
+                    }
+                    Ok(ChatMessage::Hello { .. }) => {
+                        eprintln!("[chat] unexpected Hello after handshake");
+                    }
+                    Ok(ChatMessage::Bye) => {
+                        // Peer initiated close. Echo a Bye so the
+                        // peer's loop also breaks cleanly, then exit.
+                        if !we_sent_bye {
+                            let _ = send_frame(&mut send, &ChatMessage::Bye).await;
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = format!("{}", e);
+                        // EOF on the stream is a normal close, not an error.
+                        if !msg.contains("UnexpectedEof")
+                            && !msg.contains("ConnectionLost")
+                        {
+                            crate::emit_event(json!({
+                                "type": "chat_read_error",
+                                "error": msg,
+                            }));
+                        }
+                        break;
+                    }
                 }
             }
         }
-    });
-
-    // Writer half — pull outbound messages until the outbox is
-    // closed (Bye sent, or ChatProtocol::close() called).
-    while let Some(msg) = outbox_rx.recv().await {
-        let is_bye = matches!(msg, ChatMessage::Bye);
-        if let Err(e) = send_frame(&mut send, &msg).await {
-            crate::emit_event(json!({
-                "type": "chat_send_failed",
-                "error": format!("{}", e),
-            }));
-            break;
-        }
-        if is_bye {
-            break;
-        }
     }
 
-    // Close our write side cleanly so the peer's reader sees EOF.
+    // Close our write side so the peer's stream read returns EOF.
     let _ = send.finish();
-
-    // Wait for the reader task to finish so we know the peer has
-    // wound down too (or timed out trying).
-    let _ = reader_task.await;
 
     crate::emit_event(json!({
         "type": "chat_disconnected",
@@ -379,16 +397,6 @@ pub async fn run_chat_session(
     }));
 
     Ok(())
-}
-
-/// Outcome of the reader task — informational only for now, but the
-/// shape leaves room for differentiating "peer hung up gracefully"
-/// vs "stream errored" in future UI surfacing.
-#[derive(Debug)]
-enum PeerCloseReason {
-    Bye,
-    StreamClosed,
-    Error,
 }
 
 // ----------------------------------------------------------------

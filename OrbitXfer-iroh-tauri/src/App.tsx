@@ -38,6 +38,33 @@ type RecvStatus =
   | "complete"
   | "error";
 
+// v0.1.85 — chat-while-you-transfer.
+//
+// ChatStatus state machine:
+//   idle        — no chat connection has been attempted yet
+//   connecting  — the chat ALPN is opening in parallel with the
+//                 blob ALPN; on the sender side this is the
+//                 "waiting for receiver to dial" state
+//   connected   — both sides have exchanged Hello; messages flow
+//   disconnected — peer hung up or stream closed
+//   unavailable — the chat ALPN failed to connect (timeout, network
+//                 issue, peer not running v0.1.85+)
+type ChatStatus =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "disconnected"
+  | "unavailable";
+
+// One entry in the chat scrollback. `kind: "you"` is what the local
+// user typed, `"peer"` is what the other side sent, `"system"` is a
+// status line we render distinctly (Connected / Disconnected / etc.).
+interface ChatMessageItem {
+  kind: "you" | "peer" | "system";
+  body: string;
+  at: number; // unix ms
+}
+
 interface Tickets {
   direct: string | null;
   relay: string | null;
@@ -472,6 +499,19 @@ function App() {
   // local write phase, matching the user's perceived total wait).
   const [recvStartedAt, setRecvStartedAt] = useState<number | null>(null);
   const [recvCompletedAt, setRecvCompletedAt] = useState<number | null>(null);
+
+  // v0.1.85 — chat-while-you-transfer state. One chat per window:
+  // for a Send-mode window it tracks the chat with the first
+  // receiver who dials; for a Receive-mode window it's the chat
+  // with that sender. Status walks idle → connecting → connected →
+  // disconnected (peer Bye / stream closed) OR unavailable
+  // (couldn't open the chat ALPN at all). Chat outlives the
+  // transfer — `recvStatus === "complete"` does NOT close the chat
+  // panel.
+  const [chatStatus, setChatStatus] = useState<ChatStatus>("idle");
+  const [chatPeerLabel, setChatPeerLabel] = useState<string | null>(null);
+  const [chatMessages, setChatMessages] = useState<ChatMessageItem[]>([]);
+  const [chatInput, setChatInput] = useState("");
   // Opt-in nickname the receiver volunteers so the sender sees who's
   // downloading. Empty = don't send any label. Persisted across launches.
   const [receiverLabel, setReceiverLabel] = useState<string>(loadReceiverLabel);
@@ -935,6 +975,75 @@ function App() {
             setSendError(`${parsed.stage}: ${parsed.message}`);
             setSendStatus("error");
             break;
+          // v0.1.85 — chat events. Same set fires on the receive side
+          // listener below; the handler logic is identical, just
+          // scoped to whichever sidecar this window is running.
+          case "chat_connected": {
+            const label =
+              typeof parsed.label === "string" ? parsed.label : "Receiver";
+            setChatPeerLabel(label);
+            setChatStatus("connected");
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                kind: "system",
+                body: `Connected to ${label}`,
+                at: Date.now(),
+              },
+            ]);
+            break;
+          }
+          case "chat_message_received": {
+            const body =
+              typeof parsed.body === "string" ? parsed.body : "";
+            const at =
+              typeof parsed.sent_at_unix_ms === "number"
+                ? parsed.sent_at_unix_ms
+                : Date.now();
+            setChatMessages((prev) => [
+              ...prev,
+              { kind: "peer", body, at },
+            ]);
+            break;
+          }
+          case "chat_disconnected":
+            setChatStatus("disconnected");
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                kind: "system",
+                body: `${chatPeerLabel ?? "Peer"} disconnected`,
+                at: Date.now(),
+              },
+            ]);
+            break;
+          case "chat_unavailable":
+            setChatStatus("unavailable");
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                kind: "system",
+                body: `Chat unavailable (${
+                  typeof parsed.reason === "string"
+                    ? parsed.reason
+                    : "no chat connection"
+                })`,
+                at: Date.now(),
+              },
+            ]);
+            break;
+          case "chat_send_failed":
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                kind: "system",
+                body: `Send failed: ${
+                  typeof parsed.error === "string" ? parsed.error : "unknown"
+                }`,
+                at: Date.now(),
+              },
+            ]);
+            break;
         }
       })
     );
@@ -1094,6 +1203,75 @@ function App() {
           case "connect_check_failed":
           case "connect_failed":
             // Not fatal on its own; CLI may retry. Surface in logs only.
+            break;
+          // v0.1.85 — chat events (receive side). Identical structure
+          // to the send-side handler above; could be extracted into a
+          // shared helper, but inlined here keeps the switch readable.
+          case "chat_connected": {
+            const label =
+              typeof parsed.label === "string" ? parsed.label : "Sender";
+            setChatPeerLabel(label);
+            setChatStatus("connected");
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                kind: "system",
+                body: `Connected to ${label}`,
+                at: Date.now(),
+              },
+            ]);
+            break;
+          }
+          case "chat_message_received": {
+            const body =
+              typeof parsed.body === "string" ? parsed.body : "";
+            const at =
+              typeof parsed.sent_at_unix_ms === "number"
+                ? parsed.sent_at_unix_ms
+                : Date.now();
+            setChatMessages((prev) => [
+              ...prev,
+              { kind: "peer", body, at },
+            ]);
+            break;
+          }
+          case "chat_disconnected":
+            setChatStatus("disconnected");
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                kind: "system",
+                body: `${chatPeerLabel ?? "Peer"} disconnected`,
+                at: Date.now(),
+              },
+            ]);
+            break;
+          case "chat_unavailable":
+            setChatStatus("unavailable");
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                kind: "system",
+                body: `Chat unavailable (${
+                  typeof parsed.reason === "string"
+                    ? parsed.reason
+                    : "no chat connection"
+                })`,
+                at: Date.now(),
+              },
+            ]);
+            break;
+          case "chat_send_failed":
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                kind: "system",
+                body: `Send failed: ${
+                  typeof parsed.error === "string" ? parsed.error : "unknown"
+                }`,
+                at: Date.now(),
+              },
+            ]);
             break;
         }
       })
@@ -1359,6 +1537,50 @@ function App() {
       console.error(err);
     }
     setRecvStatus("idle");
+  }
+
+  // ---------- v0.1.85 — Chat actions ----------
+
+  /// Append a local message and ship it across the chat ALPN. Empty
+  /// strings are dropped (no point sending zero-length frames). The
+  /// optimistic local append happens BEFORE the invoke so the user
+  /// sees their text in the scrollback instantly; if the CLI
+  /// responds with `chat_send_failed`, the system line surfaces it.
+  async function sendChatMessage() {
+    const body = chatInput.trim();
+    if (!body) return;
+    if (chatStatus !== "connected") return;
+    setChatMessages((prev) => [
+      ...prev,
+      { kind: "you", body, at: Date.now() },
+    ]);
+    setChatInput("");
+    try {
+      await invoke("send_chat_message", { body });
+    } catch (err) {
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          kind: "system",
+          body: `Send failed: ${err}`,
+          at: Date.now(),
+        },
+      ]);
+    }
+  }
+
+  /// Close the chat with a Bye. Goes through the active sidecar's
+  /// stdin; the sidecar writes Bye and closes the chat stream
+  /// (without affecting the transfer).
+  async function stopChat() {
+    try {
+      await invoke("stop_chat");
+    } catch (err) {
+      console.error(err);
+    }
+    // Optimistically reflect the close locally; the sidecar will also
+    // emit `chat_disconnected` which will overwrite this.
+    setChatStatus("disconnected");
   }
 
   // ---------- Render ----------
@@ -2083,8 +2305,95 @@ function App() {
             <summary>Receive logs ({recvLogs.length})</summary>
             <pre>{recvLogs.join("\n")}</pre>
           </details>
-          
 
+
+        </section>
+      )}
+
+      {/* v0.1.85 — chat panel. Lives below whichever transfer panel
+          is active. Visible only after the chat ALPN has produced an
+          event (connecting / connected / unavailable / etc.) so
+          windows that haven't started a transfer yet stay clean. */}
+      {chatStatus !== "idle" && (
+        <section className="panel chat-panel">
+          <header className="chat-header">
+            <h2>
+              {chatPeerLabel
+                ? `Chat with ${chatPeerLabel}`
+                : "Chat"}
+            </h2>
+            <div className="chat-status">
+              <span
+                className={`chat-status-dot chat-status-${chatStatus}`}
+                aria-hidden="true"
+              />
+              <span className="chat-status-label">
+                {chatStatus === "connecting" && "Connecting…"}
+                {chatStatus === "connected" && "Connected"}
+                {chatStatus === "disconnected" && "Disconnected"}
+                {chatStatus === "unavailable" && "Unavailable"}
+              </span>
+              <button
+                onClick={stopChat}
+                disabled={chatStatus !== "connected"}
+                className="ghost-button"
+              >
+                Stop Chat
+              </button>
+            </div>
+          </header>
+
+          <div className="chat-scrollback" role="log" aria-live="polite">
+            {chatMessages.length === 0 ? (
+              <p className="chat-empty hint">
+                No messages yet — say hi.
+              </p>
+            ) : (
+              chatMessages.map((m, i) => (
+                <div key={i} className={`chat-msg chat-msg-${m.kind}`}>
+                  {m.kind === "system" ? (
+                    <p className="chat-system-line">— {m.body} —</p>
+                  ) : (
+                    <>
+                      <span className="chat-msg-author">
+                        {m.kind === "you" ? "You" : chatPeerLabel ?? "Peer"}
+                      </span>
+                      <span className="chat-msg-body">{m.body}</span>
+                    </>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+
+          <form
+            className="chat-input-row"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void sendChatMessage();
+            }}
+          >
+            <input
+              type="text"
+              className="chat-input"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              placeholder={
+                chatStatus === "connected"
+                  ? "type a message…"
+                  : "(chat not connected)"
+              }
+              disabled={chatStatus !== "connected"}
+              maxLength={4096}
+              autoComplete="off"
+            />
+            <button
+              type="submit"
+              disabled={chatStatus !== "connected" || !chatInput.trim()}
+            >
+              Send
+            </button>
+          </form>
         </section>
       )}
     </main>

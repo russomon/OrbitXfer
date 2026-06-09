@@ -34,7 +34,7 @@ use serde_json::json;
 use getrandom::getrandom;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::sync::{
@@ -909,9 +909,15 @@ async fn run_send(
         }
     });
 
+    // v0.1.85 — register the chat ALPN alongside the blob and label
+    // ALPNs on the same router. The first receiver who dials chat
+    // wins; subsequent dialers are rejected by ChatProtocol (see
+    // chat.rs).
+    let chat_proto = chat::ChatProtocol::new("Sender".to_string());
     let router = Router::builder(endpoint)
         .accept(iroh_blobs::ALPN, blobs)
         .accept(ORBITXFER_LABEL_ALPN, LabelProtocol)
+        .accept(chat::CHAT_ALPN, chat_proto.clone())
         .spawn();
 
     emit_line("Hashing complete.");
@@ -922,7 +928,49 @@ async fn run_send(
     ));
     emit_line("Press Ctrl+C to stop serving.");
 
-    tokio::signal::ctrl_c().await?;
+    // v0.1.85 — command-dispatch loop. The sender process stays alive
+    // until one of:
+    //   - StopSend command from the GUI (or ctrl-c) → graceful exit
+    //   - stdin EOF → process::exit(0) in spawn_stdin_command_reader
+    // While the loop runs we also service ChatSend / ChatStop commands.
+    let mut cmd_rx = cmd_rx;
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(chat::CliCommand::ChatSend { body }) => {
+                        if let Err(e) = chat_proto.send_text(body).await {
+                            emit_event(json!({
+                                "type": "chat_send_failed",
+                                "error": format!("{}", e),
+                            }));
+                        }
+                    }
+                    Some(chat::CliCommand::ChatStop) => {
+                        let _ = chat_proto.close().await;
+                    }
+                    Some(chat::CliCommand::StopSend) => {
+                        // Graceful shutdown requested from the GUI. Close
+                        // the chat first (so the peer sees Bye before the
+                        // router drops), then break out and clean up.
+                        let _ = chat_proto.close().await;
+                        break;
+                    }
+                    Some(chat::CliCommand::StopReceive) => {
+                        // Not applicable to a send sidecar; ignore.
+                    }
+                    None => {
+                        // Command bus closed — fall through to shutdown.
+                        break;
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                let _ = chat_proto.close().await;
+                break;
+            }
+        }
+    }
 
     emit_line("Shutting down.");
     router.shutdown().await?;
@@ -1156,6 +1204,59 @@ async fn run_receive(
             }));
         }
     }
+
+    // v0.1.85 — open a separate connection on the chat ALPN. This is
+    // best-effort: a chat failure does NOT block the transfer. The
+    // chat runs as its own task; the receiver process exits when
+    // BOTH the transfer is done AND the chat has closed (or
+    // ctrl-c/StopReceive arrives).
+    let chat_self_label = std::env::var("ORBITXFER_RECEIVER_LABEL")
+        .ok()
+        .map(|s| sanitize_label_text(&s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Receiver".to_string());
+    let (chat_outbox_tx, chat_outbox_rx) =
+        tokio::sync::mpsc::channel::<chat::ChatMessage>(64);
+    let chat_handle: Option<tokio::task::JoinHandle<()>> = match timeout(
+        Duration::from_secs(8),
+        endpoint.connect(ticket_addr.clone(), chat::CHAT_ALPN),
+    )
+    .await
+    {
+        Ok(Ok(chat_conn)) => {
+            emit_line("Chat ALPN connected.");
+            let label = chat_self_label.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = chat::run_chat_session(
+                    chat_conn,
+                    chat::ChatSide::Receiver,
+                    label,
+                    chat_outbox_rx,
+                )
+                .await
+                {
+                    emit_event(json!({
+                        "type": "chat_session_error",
+                        "error": format!("{}", e),
+                    }));
+                }
+            }))
+        }
+        Ok(Err(err)) => {
+            emit_event(json!({
+                "type": "chat_unavailable",
+                "reason": format!("{}", err),
+            }));
+            None
+        }
+        Err(_) => {
+            emit_event(json!({
+                "type": "chat_unavailable",
+                "reason": "timeout",
+            }));
+            None
+        }
+    };
 
     let expected_size = expected_size_from_env();
     let mut total_size: Option<u64> = expected_size;
@@ -1506,13 +1607,103 @@ async fn run_receive(
     }
 
     emit_line("Finished finalizing destination file.");
-    emit_line("Shutting down.");
-    endpoint.close().await;
+
+    // v0.1.85 — clean up the store BEFORE the chat-keepalive loop, so
+    // the file appears in the destination immediately and the disk
+    // footprint is gone. The chat keeps the iroh endpoint alive on
+    // its own connection.
     store.shutdown().await?;
     if auto_store_cleanup {
         if let Err(err) = std::fs::remove_dir_all(&store_dir) {
-            emit_line(&format!("Warning: failed to remove temp store {}: {err}", store_dir.display()));
+            emit_line(&format!(
+                "Warning: failed to remove temp store {}: {err}",
+                store_dir.display()
+            ));
         }
     }
+
+    // v0.1.85 — if the chat connection was established, keep the
+    // receiver process alive until either:
+    //   - the chat session task ends (peer sent Bye, stream closed)
+    //   - the GUI issues StopReceive or ChatStop
+    //   - ctrl-c arrives
+    //   - stdin EOF (handled inside spawn_stdin_command_reader)
+    //
+    // ChatSend commands are forwarded to the chat outbox so the user
+    // can keep typing while the post-transfer window is open.
+    let mut cmd_rx = cmd_rx;
+    if let Some(chat_handle) = chat_handle {
+        emit_event(json!({ "type": "chat_keepalive_started" }));
+        let mut chat_handle = chat_handle;
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(chat::CliCommand::ChatSend { body }) => {
+                            let msg = chat::ChatMessage::Text {
+                                body,
+                                sent_at_unix_ms: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0),
+                            };
+                            if let Err(e) = chat_outbox_tx.send(msg).await {
+                                emit_event(json!({
+                                    "type": "chat_send_failed",
+                                    "error": format!("{}", e),
+                                }));
+                            }
+                        }
+                        Some(chat::CliCommand::ChatStop) => {
+                            let _ = chat_outbox_tx
+                                .send(chat::ChatMessage::Bye)
+                                .await;
+                            // Drop the sender so the writer half of
+                            // the chat session sees the channel close
+                            // after the Bye it just consumed.
+                            drop(chat_outbox_tx);
+                            let _ = chat_handle.await;
+                            break;
+                        }
+                        Some(chat::CliCommand::StopReceive) => {
+                            let _ = chat_outbox_tx
+                                .send(chat::ChatMessage::Bye)
+                                .await;
+                            drop(chat_outbox_tx);
+                            let _ = chat_handle.await;
+                            break;
+                        }
+                        Some(chat::CliCommand::StopSend) => {
+                            // not applicable on the receive side
+                        }
+                        None => break,
+                    }
+                }
+                join_result = &mut chat_handle => {
+                    // Chat session ended (peer Bye, stream closed, etc.)
+                    let _ = join_result;
+                    break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    let _ = chat_outbox_tx
+                        .send(chat::ChatMessage::Bye)
+                        .await;
+                    drop(chat_outbox_tx);
+                    let _ = chat_handle.await;
+                    break;
+                }
+            }
+        }
+        emit_event(json!({ "type": "chat_keepalive_ended" }));
+    } else {
+        // No chat was established — exit immediately, same as
+        // pre-v0.1.85 behavior.
+        drop(chat_outbox_tx);
+        // Drain any pending commands silently so they don't block.
+        cmd_rx.close();
+    }
+
+    emit_line("Shutting down.");
+    endpoint.close().await;
     Ok(())
 }

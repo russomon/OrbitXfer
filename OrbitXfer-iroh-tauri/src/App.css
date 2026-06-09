@@ -776,3 +776,158 @@ button:disabled {
   opacity: 0.5;
 }
 
+
+/* ============================================================
+   v0.1.85 — Chat panel
+   ============================================================
+   The chat-while-you-transfer panel renders below the active
+   Send / Receive panel. It has its own header (with peer label
+   + connection-status pill + Stop Chat button), a scrollback
+   region, and an input row. Visually a sibling of the main
+   transfer panel, with the same surface color and rounded
+   corners so the eye reads them as two stacked cards. */
+
+.chat-panel {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.chat-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.chat-header h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.chat-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.chat-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  display: inline-block;
+}
+
+.chat-status-connecting .chat-status-dot,
+.chat-status-dot.chat-status-connecting {
+  background: var(--accent);
+  animation: chat-pulse 1.2s ease-in-out infinite;
+}
+
+.chat-status-connected .chat-status-dot,
+.chat-status-dot.chat-status-connected {
+  background: var(--success);
+}
+
+.chat-status-disconnected .chat-status-dot,
+.chat-status-dot.chat-status-disconnected {
+  background: var(--text-muted);
+}
+
+.chat-status-unavailable .chat-status-dot,
+.chat-status-dot.chat-status-unavailable {
+  background: var(--danger);
+}
+
+@keyframes chat-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.chat-scrollback {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  min-height: 160px;
+  max-height: 360px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 0.92rem;
+  line-height: 1.4;
+}
+
+.chat-empty {
+  margin: 0;
+  text-align: center;
+  align-self: center;
+}
+
+.chat-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-msg-author {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.chat-msg-you .chat-msg-author {
+  color: var(--accent);
+}
+
+.chat-msg-peer .chat-msg-author {
+  color: var(--success);
+}
+
+.chat-msg-body {
+  color: var(--text);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.chat-msg-system {
+  align-items: center;
+}
+
+.chat-system-line {
+  margin: 4px 0;
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.chat-input-row {
+  display: flex;
+  gap: 8px;
+}
+
+.chat-input {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.95rem;
+}
+
+.chat-input:disabled {
+  opacity: 0.5;
+}
+
+.chat-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
