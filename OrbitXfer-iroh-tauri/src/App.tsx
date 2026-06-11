@@ -2,7 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { open, save, ask } from "@tauri-apps/plugin-dialog";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  getCurrentWindow,
+  currentMonitor,
+  LogicalSize,
+} from "@tauri-apps/api/window";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { downloadDir } from "@tauri-apps/api/path";
 import { platform } from "@tauri-apps/plugin-os";
@@ -29,6 +33,14 @@ const CONNECTION_MODE_DESCRIPTIONS: Record<ConnectionMode, string> = {
     "Routes through iroh's relay to get connected, with a direct upgrade happening in the background whenever the network allows it. The most firewall- and NAT-friendly choice, and your IP addresses stay out of the ticket.",
   direct_only:
     "True peer-to-peer with zero relay involvement. Same direct attempt as the recommended mode, but with no safety net: a blocked path means a failed transfer. Great on a shared/local network.",
+};
+
+// v0.1.87 — short labels for the collapsed connection-mode disclosure
+// summary, so the user sees their current choice without expanding.
+const CONNECTION_MODE_LABELS: Record<ConnectionMode, string> = {
+  full: "Direct + Relay (recommended)",
+  relay_only: "Relay only",
+  direct_only: "Direct only",
 };
 type RecvStatus =
   | "idle"
@@ -415,6 +427,68 @@ function App() {
     return () => mq.removeEventListener("change", handler);
   }, [themePref]);
 
+  // v0.1.87 — auto-fit the window to its content height (see the
+  // containerRef comment above). The ResizeObserver fires whenever
+  // the content's rendered height changes — which is exactly the
+  // major transitions we care about (ticket appears, chat opens,
+  // mode switch, retry panel). We debounce briefly so a burst of
+  // layout changes coalesces into one resize, and clamp to a
+  // minimum and an approximate monitor work-area maximum.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const MIN_HEIGHT = 420;
+    let timer: number | undefined;
+
+    const apply = () => {
+      const contentHeight = Math.ceil(el.getBoundingClientRect().height);
+      void (async () => {
+        let maxHeight = 2400;
+        try {
+          const mon = await currentMonitor();
+          if (mon) {
+            const logicalMonitorHeight = mon.size.height / mon.scaleFactor;
+            // Leave headroom for the menu bar + Dock so the window
+            // doesn't get pushed under either.
+            maxHeight = Math.floor(logicalMonitorHeight - 120);
+          }
+        } catch {
+          // currentMonitor can fail in odd window states; fall back
+          // to the generous default and let the OS clamp if needed.
+        }
+        const target = Math.max(
+          MIN_HEIGHT,
+          Math.min(contentHeight, maxHeight)
+        );
+        try {
+          // Keep the current width (window.innerWidth is the webview
+          // viewport width in CSS/logical px); only adjust height.
+          await getCurrentWindow().setSize(
+            new LogicalSize(window.innerWidth, target)
+          );
+        } catch (e) {
+          console.warn("auto-resize failed:", e);
+        }
+      })();
+    };
+
+    const debounced = () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(apply, 90);
+    };
+
+    const ro = new ResizeObserver(debounced);
+    ro.observe(el);
+    // Run once on mount to fit the initial idle layout.
+    debounced();
+
+    return () => {
+      ro.disconnect();
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, []);
+
   // Cross-window sync: when one window changes the theme, every other
   // open window picks it up via the storage event.
   useEffect(() => {
@@ -454,6 +528,17 @@ function App() {
   // but only if the user hasn't already chosen one — we don't want to clobber
   // a manual selection just because they edited the ticket textarea.
   const userPickedDest = useRef(false);
+
+  // v0.1.87 — auto-fit the window height to its content. A
+  // ResizeObserver on the main container measures the natural
+  // content height and resizes the window so everything fits
+  // without scrolling. Width is left untouched. Bounded below by a
+  // minimum and above by the monitor's (approximate) work area, so
+  // even with the ticket + receivers + chat all open at once the
+  // window grows to fit rather than showing a scrollbar — unless
+  // the content genuinely exceeds the screen, in which case
+  // scrolling remains as a fallback.
+  const containerRef = useRef<HTMLElement | null>(null);
 
   // Persisted "last send" / "last receive" so the user can resume an
   // interrupted transfer (or just redo their last one) after a window close,
@@ -1975,7 +2060,7 @@ function App() {
       : null;
 
   return (
-    <main className="container">
+    <main className="container" ref={containerRef}>
       <header className="app-header">
         <div>
           <h1>OrbitXfer</h1>
@@ -1990,8 +2075,8 @@ function App() {
               <span aria-hidden="true">☕</span> Keeping {platformLabel} awake
             </span>
           )}
-          {/* "+ New Transfer Window" lives in each panel's actions row
-              (right-justified) from v0.1.83 on. The header slot stays as
+          {/* v0.1.87 — "+ New Transfer Window" lives in the mode-row
+              beside the Send/Receive tabs. The header slot stays as
               the home for the keep-awake badge. */}
         </div>
       </header>
@@ -2045,24 +2130,36 @@ function App() {
           </div>
         )}
 
-      <div className="mode-switch" role="tablist" aria-label="Window mode">
+      {/* v0.1.87 — the "+ New Transfer Window" button moves up here,
+          to the right of the Send/Receive tabs (it used to live in
+          each panel's actions row). A single shared button instead
+          of one per panel. */}
+      <div className="mode-row">
+        <div className="mode-switch" role="tablist" aria-label="Window mode">
+          <button
+            role="tab"
+            aria-selected={mode === "send"}
+            className={mode === "send" ? "active" : ""}
+            onClick={() => setMode("send")}
+            disabled={sendActive || recvBusy}
+          >
+            Send
+          </button>
+          <button
+            role="tab"
+            aria-selected={mode === "receive"}
+            className={mode === "receive" ? "active" : ""}
+            onClick={() => setMode("receive")}
+            disabled={sendActive || recvBusy}
+          >
+            Receive
+          </button>
+        </div>
         <button
-          role="tab"
-          aria-selected={mode === "send"}
-          className={mode === "send" ? "active" : ""}
-          onClick={() => setMode("send")}
-          disabled={sendActive || recvBusy}
+          className="ghost-button new-window-button"
+          onClick={openNewTransferWindow}
         >
-          Send
-        </button>
-        <button
-          role="tab"
-          aria-selected={mode === "receive"}
-          className={mode === "receive" ? "active" : ""}
-          onClick={() => setMode("receive")}
-          disabled={sendActive || recvBusy}
-        >
-          Receive
+          + New Transfer Window
         </button>
       </div>
 
@@ -2070,74 +2167,72 @@ function App() {
         <section className="panel">
           <h2>Send a file</h2>
 
-          {lastSend && !sendActive && (
-            <button
-              className="resume-button"
-              onClick={resumeLastSend}
-              title={lastSend.filePath}
-            >
-              ↻ Resume last send:{" "}
-              <code>{basename(lastSend.filePath)}</code>
-            </button>
-          )}
+          {/* v0.1.87 — connection mode is collapsed by default to keep
+              the panel compact. The summary shows the current choice
+              inline so it's discoverable without expanding. */}
+          <details className="connection-disclosure">
+            <summary>
+              Connection:{" "}
+              <span className="connection-current">
+                {CONNECTION_MODE_LABELS[connectionMode]}
+              </span>
+            </summary>
+            <fieldset className="connection-mode" disabled={sendBusy}>
+              <label>
+                <input
+                  type="radio"
+                  name={`conn-${win.label}`}
+                  value="full"
+                  checked={connectionMode === "full"}
+                  onChange={() => setConnectionMode("full")}
+                />
+                Direct + Relay fallback{" "}
+                <span className="recommended">(recommended)</span>
+              </label>
+              {connectionMode === "full" && (
+                <p className="hint connection-desc">
+                  {CONNECTION_MODE_DESCRIPTIONS.full}
+                </p>
+              )}
 
-          <fieldset className="connection-mode" disabled={sendBusy}>
-            <legend>Connection mode</legend>
+              <label>
+                <input
+                  type="radio"
+                  name={`conn-${win.label}`}
+                  value="relay_only"
+                  checked={connectionMode === "relay_only"}
+                  onChange={() => setConnectionMode("relay_only")}
+                />
+                Relay only (no direct IPs)
+              </label>
+              {connectionMode === "relay_only" && (
+                <p className="hint connection-desc">
+                  {CONNECTION_MODE_DESCRIPTIONS.relay_only}
+                </p>
+              )}
 
-            <label>
-              <input
-                type="radio"
-                name={`conn-${win.label}`}
-                value="full"
-                checked={connectionMode === "full"}
-                onChange={() => setConnectionMode("full")}
-              />
-              Direct + Relay fallback{" "}
-              <span className="recommended">(recommended)</span>
-            </label>
-            {connectionMode === "full" && (
-              <p className="hint connection-desc">
-                {CONNECTION_MODE_DESCRIPTIONS.full}
+              <label>
+                <input
+                  type="radio"
+                  name={`conn-${win.label}`}
+                  value="direct_only"
+                  checked={connectionMode === "direct_only"}
+                  onChange={() => setConnectionMode("direct_only")}
+                />
+                Direct only (no relay)
+              </label>
+              {connectionMode === "direct_only" && (
+                <p className="hint connection-desc">
+                  {CONNECTION_MODE_DESCRIPTIONS.direct_only}
+                </p>
+              )}
+
+              <p className="hint">
+                All three modes are end-to-end encrypted — the relay can never
+                read your files, it only helps route the connection.
               </p>
-            )}
-
-            <label>
-              <input
-                type="radio"
-                name={`conn-${win.label}`}
-                value="relay_only"
-                checked={connectionMode === "relay_only"}
-                onChange={() => setConnectionMode("relay_only")}
-              />
-              Relay only (no direct IPs)
-            </label>
-            {connectionMode === "relay_only" && (
-              <p className="hint connection-desc">
-                {CONNECTION_MODE_DESCRIPTIONS.relay_only}
-              </p>
-            )}
-
-            <label>
-              <input
-                type="radio"
-                name={`conn-${win.label}`}
-                value="direct_only"
-                checked={connectionMode === "direct_only"}
-                onChange={() => setConnectionMode("direct_only")}
-              />
-              Direct only (no relay)
-            </label>
-            {connectionMode === "direct_only" && (
-              <p className="hint connection-desc">
-                {CONNECTION_MODE_DESCRIPTIONS.direct_only}
-              </p>
-            )}
-
-            <p className="hint">
-              All three modes are end-to-end encrypted — the relay can never
-              read your files, it only helps route the connection.
-            </p>
-          </fieldset>
+            </fieldset>
+          </details>
 
           <div className="actions">
             <button onClick={pickFile} disabled={sendActive}>
@@ -2149,12 +2244,17 @@ function App() {
             <button onClick={stopSend} disabled={!sendActive}>
               Stop
             </button>
-            <button
-              className="ghost-button new-window-button"
-              onClick={openNewTransferWindow}
-            >
-              + New Transfer Window
-            </button>
+            {/* v0.1.87 — Resume Last Send moved into the actions row,
+                right-justified, taking the slot New Window vacated. */}
+            {lastSend && !sendActive && (
+              <button
+                className="resume-button actions-resume"
+                onClick={resumeLastSend}
+                title={lastSend.filePath}
+              >
+                ↻ Resume: <code>{basename(lastSend.filePath)}</code>
+              </button>
+            )}
           </div>
 
           {filePath && (
@@ -2264,7 +2364,7 @@ function App() {
                     : selectedTicket
                 }
                 onClick={(e) => (e.target as HTMLTextAreaElement).select()}
-                rows={3}
+                rows={2}
               />
               <p className="keep-open-warning" role="status">
                 ⚠ Don't close this window. The file is only available to
@@ -2418,17 +2518,6 @@ function App() {
         <section className="panel">
           <h2>Receive a file</h2>
 
-          {lastRecv && !recvBusy && (
-            <button
-              className="resume-button"
-              onClick={resumeLastReceive}
-              title={`${lastRecv.outputPath}`}
-            >
-              ↻ Resume last receive:{" "}
-              <code>{basename(lastRecv.outputPath)}</code>
-            </button>
-          )}
-
           <label className="field">
             <span>Ticket</span>
             <textarea
@@ -2436,7 +2525,7 @@ function App() {
               onChange={(e) => setTicketInput(e.target.value)}
               placeholder="Paste the share ticket here — surrounding text is okay, we'll extract it."
               disabled={recvBusy}
-              rows={3}
+              rows={2}
             />
             {ticketInput.trim() && (
               <p className="diagnostic">
@@ -2482,24 +2571,44 @@ function App() {
           </label>
 
           <div className="actions">
-            <button onClick={pickDestination} disabled={recvBusy}>
+            {/* v0.1.87 — Pick Destination is disabled until a valid
+                ticket is present, so the user can't pick a save
+                location before they have something to receive. */}
+            <button
+              onClick={pickDestination}
+              disabled={!parsedTicket || recvBusy}
+            >
               {isFolderReceive ? "Pick Destination Folder…" : "Pick Destination…"}
             </button>
+            {/* v0.1.87 — Start Receive flashes for attention once a
+                valid ticket AND a destination are both present and
+                we're idle, signalling it's the obvious next step. */}
             <button
               onClick={startReceive}
               disabled={!parsedTicket || !outputPath || recvBusy}
+              className={
+                parsedTicket && outputPath && !recvBusy && recvStatus === "idle"
+                  ? "attention"
+                  : ""
+              }
             >
               Start Receive
             </button>
             <button onClick={stopReceive} disabled={!recvBusy}>
               Stop
             </button>
-            <button
-              className="ghost-button new-window-button"
-              onClick={openNewTransferWindow}
-            >
-              + New Transfer Window
-            </button>
+            {/* v0.1.87 — Resume Last Receive moved into the actions
+                row, right-justified, taking the slot New Window
+                vacated. */}
+            {lastRecv && !recvBusy && (
+              <button
+                className="resume-button actions-resume"
+                onClick={resumeLastReceive}
+                title={`${lastRecv.outputPath}`}
+              >
+                ↻ Resume: <code>{basename(lastRecv.outputPath)}</code>
+              </button>
+            )}
           </div>
 
           {outputPath && <p className="filepath">{outputPath}</p>}

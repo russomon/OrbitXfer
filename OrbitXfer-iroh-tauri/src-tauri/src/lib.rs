@@ -185,10 +185,32 @@ fn create_transfer_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let suffix = ((rand_bytes[0] as u16) << 8) | (rand_bytes[1] as u16);
     let label = format!("window-{nanos}-{suffix}");
 
-    let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
-        .title("OrbitXfer")
-        .inner_size(900.0, 700.0)
-        .build()?;
+    let mut builder =
+        WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+            .title("OrbitXfer")
+            .inner_size(900.0, 580.0)
+            .min_inner_size(680.0, 420.0);
+
+    // v0.1.87 — Cascade new windows down-and-right of the currently
+    // focused window, the way most desktop apps do, so a new window
+    // doesn't land exactly on top of its parent. We read the focused
+    // window's OUTER position (screen coords incl. titlebar) and
+    // offset by a fixed step. If there's no focused window (first
+    // launch), fall back to the platform default placement.
+    const CASCADE_OFFSET: f64 = 28.0;
+    if let Some(parent) = focused_window(app) {
+        if let Ok(pos) = parent.outer_position() {
+            // outer_position is physical pixels; convert to logical
+            // using the parent's scale factor so the offset is a
+            // consistent on-screen distance across Retina / non-Retina.
+            let scale = parent.scale_factor().unwrap_or(1.0);
+            let logical_x = pos.x as f64 / scale + CASCADE_OFFSET;
+            let logical_y = pos.y as f64 / scale + CASCADE_OFFSET;
+            builder = builder.position(logical_x, logical_y);
+        }
+    }
+
+    let window = builder.build()?;
 
     // Rebuild menu so the new window appears in the Window submenu's list.
     if let Ok(menu) = build_menu(app) {

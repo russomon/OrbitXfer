@@ -1,6 +1,6 @@
 [package]
 name = "orbitxfer-iroh-cli"
-version = "0.1.86"
+version = "0.1.87"
 edition = "2021"
 
 # Aggressive size-optimized release profile (v0.1.81+). Trades compile
