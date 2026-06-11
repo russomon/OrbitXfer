@@ -946,3 +946,126 @@ button:disabled {
   color: var(--accent);
   border-radius: 6px;
 }
+
+/* ============================================================
+   v0.1.86 — Option A: "Waiting for sender" retry panel
+   ============================================================ */
+
+.waiting-for-sender {
+  margin: 16px 0;
+  padding: 16px 20px;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-radius: 10px;
+  color: var(--warn-text);
+}
+
+.waiting-for-sender h3 {
+  margin: 0 0 12px 0;
+  font-size: 1rem;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.waiting-pulse {
+  color: var(--warn);
+  font-size: 1.1rem;
+  animation: waiting-pulse-fade 1.4s ease-in-out infinite;
+}
+
+@keyframes waiting-pulse-fade {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+.waiting-stats {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  margin: 8px 0 12px 0;
+  font-size: 0.9rem;
+}
+
+.waiting-stats > div {
+  display: contents;
+}
+
+.waiting-stats dt {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.waiting-stats dd {
+  margin: 0;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.waiting-for-sender .hint {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+/* ============================================================
+   v0.1.86 — Option B: cross-session "resume incomplete download"
+   banner. More prominent than the per-panel resume button: it
+   appears at the top of the window the moment the user opens the
+   app to an interrupted previous session.
+   ============================================================ */
+
+.resume-banner-prominent {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0 0 16px;
+  padding: 14px 18px;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 10px;
+  flex-wrap: wrap;
+}
+
+.resume-banner-text {
+  flex: 1;
+  min-width: 200px;
+}
+
+.resume-banner-text strong {
+  color: var(--accent);
+  display: block;
+  margin-bottom: 4px;
+}
+
+.resume-banner-text p {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--text);
+}
+
+.resume-banner-text code {
+  background: var(--code-bg-soft);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+
+.resume-banner-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.resume-banner-actions button.primary {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+  font-weight: 500;
+}
+
+.resume-banner-actions button.primary:hover:not(:disabled) {
+  background: var(--accent);
+  opacity: 0.92;
+}

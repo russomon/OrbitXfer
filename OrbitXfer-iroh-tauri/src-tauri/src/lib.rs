@@ -892,6 +892,34 @@ fn schedule_graceful_kill_fallback(app: AppHandle, label: String, slot: Slot) {
     });
 }
 
+/// v0.1.86 — Check the available disk space at a given path. Used by
+/// the receive-side preflight: before invoking `start_receive`, the
+/// frontend confirms there's enough free space for the incoming file
+/// (with a small safety margin) and warns the user if not. The path
+/// is resolved up the directory tree until an existing ancestor is
+/// found — the user may pass a destination file that doesn't exist
+/// yet, but its parent directory does.
+///
+/// Returns the free byte count, or `0` if the path can't be probed
+/// (which the frontend treats as "unknown, skip the warning").
+#[tauri::command]
+async fn check_disk_space(path: String) -> Result<u64, String> {
+    use fs2::available_space;
+    use std::path::Path;
+    let mut probe = PathBuf::from(&path);
+    // Walk up to the nearest existing ancestor; statvfs needs an
+    // extant path. For a Save-As target like
+    // /Users/x/Downloads/new.dmg, we want the free space at
+    // /Users/x/Downloads/.
+    while !probe.exists() {
+        match probe.parent() {
+            Some(p) if p != Path::new("") => probe = p.to_path_buf(),
+            _ => return Ok(0),
+        }
+    }
+    available_space(&probe).map_err(|e| format!("available_space: {e}"))
+}
+
 /// Open a new transfer window. The frontend's "+ New Window" button
 /// invokes this so window creation happens in Rust (where we can also
 /// rebuild the menu to include the new window in the Window submenu).
@@ -1101,6 +1129,8 @@ pub fn run() {
             // v0.1.85 — chat-while-you-transfer.
             send_chat_message,
             stop_chat,
+            // v0.1.86 — disk-space preflight on receive.
+            check_disk_space,
             open_new_window
         ])
         .run(tauri::generate_context!())

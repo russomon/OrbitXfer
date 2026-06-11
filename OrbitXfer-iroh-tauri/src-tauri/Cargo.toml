@@ -40,4 +40,9 @@ tokio = { version = "1", features = ["sync"] }
 # Linux uses systemd-logind's Inhibit("sleep:idle"). One handle, three
 # OSes — released when dropped.
 keepawake = "0.5"
+# v0.1.86 — used by the `check_disk_space` Tauri command for the
+# receive-side disk-space preflight check. Cross-platform free-byte
+# query (statvfs on Unix, GetDiskFreeSpaceEx on Windows). Same crate
+# the CLI already uses for the same purpose.
+fs2 = "0.4"
 

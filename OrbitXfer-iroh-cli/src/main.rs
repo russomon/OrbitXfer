@@ -43,7 +43,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.85";
+const CLI_VERSION: &str = "0.1.86";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -52,6 +52,19 @@ const CLI_VERSION: &str = "0.1.85";
 /// that doesn't register it just refuses the connection and the receiver
 /// proceeds with the download anyway.
 const ORBITXFER_LABEL_ALPN: &[u8] = b"orbitxfer/label/0";
+
+// v0.1.86 — Receive-side retry strategy (Option A).
+//
+// PHASE 1 = the existing fast 3-attempt download loop, catches
+// transient network blips. After it fails, we enter PHASE 2:
+// slow polling with exponential backoff, designed to handle the
+// common "sender clicked Stop and is about to click Resume" case
+// where a human-paced delay (seconds to several minutes) separates
+// the disconnect from the reconnect.
+const PHASE2_INITIAL_BACKOFF_SECS: u64 = 10;
+const PHASE2_MAX_BACKOFF_SECS: u64 = 60;
+const PHASE2_BUDGET_SECS: u64 = 600; // 10 minutes
+const PHASE2_BACKOFF_MULTIPLIER: u32 = 2;
 
 /// Clamp an attacker-controlled label to something safe to display: drop
 /// control characters, trim, cap at 64 chars.
@@ -1395,10 +1408,19 @@ async fn run_receive(
     // without prematurely closing the outbox (the dispatcher's clone
     // keeps it alive for the chat session's lifetime).
     let chat_outbox_tx_for_dispatch = chat_outbox_tx.clone();
-    let (stop_receive_tx, mut stop_receive_rx) = tokio::sync::oneshot::channel::<()>();
+    // v0.1.86 — replace v0.1.85's oneshot with a Notify + AtomicBool
+    // pair. The retry state machine's Phase 2 sleep AND the
+    // post-export keepalive both need to react to StopReceive, and
+    // a oneshot's "single consumer" semantics don't support that.
+    // Notify::notify_waiters wakes all current awaiters; the
+    // AtomicBool catches the case where StopReceive fires while no
+    // one is waiting (e.g. during the in-flight download itself).
+    let stop_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+    let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_signal_for_dispatch = stop_signal.clone();
+    let stop_requested_for_dispatch = stop_requested.clone();
     let cmd_dispatch_task = tokio::spawn(async move {
         let mut cmd_rx = cmd_rx;
-        let mut stop_sender = Some(stop_receive_tx);
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 chat::CliCommand::ChatSend { body } => {
@@ -1425,9 +1447,9 @@ async fn run_receive(
                     let _ = chat_outbox_tx_for_dispatch
                         .send(chat::ChatMessage::Bye)
                         .await;
-                    if let Some(tx) = stop_sender.take() {
-                        let _ = tx.send(());
-                    }
+                    stop_requested_for_dispatch
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    stop_signal_for_dispatch.notify_waiters();
                     return;
                 }
                 chat::CliCommand::StopSend => {
@@ -1554,7 +1576,26 @@ async fn run_receive(
         .unwrap_or(3);
     let mut last_err: Option<anyhow::Error> = None;
 
+    // v0.1.86 — Phase 2 retry budget. The outer loop below wraps the
+    // existing direct-fetch + 3-attempt download logic (Phase 1).
+    // After Phase 1 exhausts without success, we sleep with
+    // exponential backoff (capped at PHASE2_MAX_BACKOFF_SECS) and
+    // retry until either success or PHASE2_BUDGET_SECS elapses.
+    // StopReceive interrupts the sleep via the Notify signal.
+    let phase2_deadline =
+        Instant::now() + Duration::from_secs(PHASE2_BUDGET_SECS);
+    let mut phase2_attempt: u32 = 0;
+    let mut current_backoff = Duration::from_secs(PHASE2_INITIAL_BACKOFF_SECS);
+    let mut overall_succeeded = false;
+
     let mut direct_completed = false;
+    'phase2: loop {
+        // Reset per-Phase-1-cycle state. `direct_completed` from a
+        // prior iteration stays false (preflight_conn was consumed
+        // on the first iteration); the downloader inner loop handles
+        // its own connect attempts.
+        last_err = None;
+        direct_completed = false;
     if let Some(conn) = preflight_conn.take() {
         emit_line("Attempting direct fetch over preflight connection...");
         emit_event(json!({ "type": "download_direct_start" }));
@@ -1738,9 +1779,81 @@ async fn run_receive(
     }
     }
 
-    if let Some(err) = last_err {
-        emit_error("download", &err);
-        return Err(err);
+    // v0.1.86 — Phase 1 cycle is done. Decide whether to retry.
+    if last_err.is_none() {
+        // Phase 1 succeeded (or direct fetch did) — exit the
+        // outer retry loop.
+        overall_succeeded = true;
+        break 'phase2;
+    }
+
+    // Phase 1 exhausted without success. Decide on Phase 2.
+    if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        emit_event(json!({ "type": "download_retry_cancelled" }));
+        emit_line("Retry loop cancelled by user.");
+        break 'phase2;
+    }
+    let remaining = phase2_deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        emit_event(json!({
+            "type": "download_giving_up",
+            "phase2_attempts": phase2_attempt,
+            "budget_ms": PHASE2_BUDGET_SECS * 1000,
+        }));
+        emit_line(&format!(
+            "Sender unreachable after Phase 2 retry budget ({} s). Giving up.",
+            PHASE2_BUDGET_SECS
+        ));
+        break 'phase2;
+    }
+
+    phase2_attempt += 1;
+    let sleep_for = current_backoff.min(remaining);
+    emit_event(json!({
+        "type": "download_waiting_for_sender",
+        "phase2_attempt": phase2_attempt,
+        "next_retry_in_ms": sleep_for.as_millis() as u64,
+        "time_remaining_ms": remaining.as_millis() as u64,
+        "budget_ms": PHASE2_BUDGET_SECS * 1000,
+    }));
+    emit_line(&format!(
+        "Sender unreachable. Retry #{} in {} s (Phase 2 budget remaining: {} s).",
+        phase2_attempt,
+        sleep_for.as_secs(),
+        remaining.as_secs()
+    ));
+
+    // Sleep until either the backoff elapses OR a StopReceive
+    // command arrives. The Notify is woken by the dispatcher.
+    let signal = stop_signal.clone();
+    tokio::select! {
+        _ = tokio::time::sleep(sleep_for) => {}
+        _ = signal.notified() => {
+            emit_event(json!({ "type": "download_retry_cancelled" }));
+            emit_line("Retry sleep cancelled by user.");
+            break 'phase2;
+        }
+    }
+
+    // Grow backoff for the next iteration, capped at the max.
+    current_backoff = (current_backoff
+        * PHASE2_BACKOFF_MULTIPLIER)
+        .min(Duration::from_secs(PHASE2_MAX_BACKOFF_SECS));
+
+    }
+    // End of 'phase2 loop.
+
+    if !overall_succeeded {
+        if let Some(err) = last_err {
+            emit_error("download", &err);
+            return Err(err);
+        }
+        // No error was captured but we also didn't succeed — this
+        // happens on user-cancelled retry. Return a clean error so
+        // the GUI shows the right state.
+        let cancelled = anyhow!("download cancelled or budget exhausted");
+        emit_error("download", &cancelled);
+        return Err(cancelled);
     }
 
     if !direct_completed {
@@ -1821,16 +1934,24 @@ async fn run_receive(
     // background forwarding ChatSend → chat_outbox.
     if let Some(chat_handle) = chat_handle {
         emit_event(json!({ "type": "chat_keepalive_started" }));
-        tokio::select! {
-            join_result = chat_handle => {
-                let _ = join_result;
-            }
-            _ = &mut stop_receive_rx => {
-                // Dispatcher already pushed Bye + signaled. Drop
-                // through to shutdown.
-            }
-            _ = tokio::signal::ctrl_c() => {
-                // ctrl-c — the dispatcher is still running; abort it.
+        // v0.1.86 — use the Notify signal (replaces v0.1.85's
+        // oneshot). Check the flag first in case StopReceive fired
+        // before we got here.
+        let signal = stop_signal.clone();
+        if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
+            // No need to wait — already cancelled.
+        } else {
+            tokio::select! {
+                join_result = chat_handle => {
+                    let _ = join_result;
+                }
+                _ = signal.notified() => {
+                    // Dispatcher already pushed Bye + signaled. Drop
+                    // through to shutdown.
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    // ctrl-c — the dispatcher is still running; abort it.
+                }
             }
         }
         emit_event(json!({ "type": "chat_keepalive_ended" }));

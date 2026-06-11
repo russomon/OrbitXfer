@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { downloadDir } from "@tauri-apps/api/path";
@@ -36,7 +36,26 @@ type RecvStatus =
   | "downloading"
   | "exporting"
   | "complete"
-  | "error";
+  | "error"
+  // v0.1.86 — Option A: bounded retry state machine. After Phase 1
+  // (3 fast attempts) exhausts without reaching the sender, we
+  // enter a 10-minute slow-poll loop with exponential backoff. The
+  // UI renders a prominent panel with a live countdown to the next
+  // retry. Status returns to "downloading" if Phase 2 succeeds, or
+  // transitions to "error" if the budget runs out.
+  | "waiting_for_sender";
+
+// v0.1.86 — Live state for the "waiting for sender" panel. nextRetryAt
+// is a wall-clock unix-ms so the React countdown effect can decrement
+// in real time; the other fields are set from each
+// download_waiting_for_sender event.
+interface RecvRetryInfo {
+  phase2Attempt: number;
+  budgetMs: number;
+  timeRemainingMs: number;
+  nextRetryInMs: number;
+  nextRetryAt: number;
+}
 
 // v0.1.85 — chat-while-you-transfer.
 //
@@ -173,6 +192,13 @@ interface LastReceive {
   ticketInput: string;
   outputPath: string;
   savedAt: number;
+  // v0.1.86 — Option B: cross-session resume. Set true when the
+  // receive successfully finishes (export_complete fires). Defaults
+  // to undefined/false on a freshly-started receive. On app open,
+  // if there's a LastReceive entry with completed != true, we show
+  // a prominent "Resume incomplete download?" banner so the user
+  // can pick up where a previous app session left off.
+  completed?: boolean;
 }
 
 function loadJson<T>(key: string): T | null {
@@ -506,6 +532,23 @@ function App() {
   // local write phase, matching the user's perceived total wait).
   const [recvStartedAt, setRecvStartedAt] = useState<number | null>(null);
   const [recvCompletedAt, setRecvCompletedAt] = useState<number | null>(null);
+
+  // v0.1.86 — Option B: cross-session resume banner state. True once
+  // the user clicks Dismiss on the banner for this session — keeps
+  // it from coming back every component re-render until the next
+  // app open. Per-window only; not persisted, since dismissing in
+  // one window shouldn't silence the prompt in another.
+  const [resumeBannerDismissed, setResumeBannerDismissed] = useState(false);
+
+  // v0.1.86 — Option A retry state. Null when not in
+  // waiting_for_sender mode; populated from each
+  // download_waiting_for_sender event so the panel can render the
+  // countdown + attempt count + total time remaining.
+  const [recvRetryInfo, setRecvRetryInfo] = useState<RecvRetryInfo | null>(null);
+  // Tick state: incremented every second while waiting so the
+  // countdown display updates in real time without re-firing the
+  // event handler.
+  const [retryCountdownTick, setRetryCountdownTick] = useState(0);
 
   // v0.1.85 — When the user clicks "Resume last send", we want to
   // show the SAME ticket the first session showed (the NodeID is
@@ -1242,6 +1285,9 @@ function App() {
             break;
           case "download_progress":
             setRecvStatus("downloading");
+            // v0.1.86 — if we just exited a Phase 2 retry cycle by
+            // succeeding, clear the retry panel.
+            setRecvRetryInfo(null);
             if (bytes !== null) {
               const samples = trackSpeed(recvSpeedRef.current, bytes);
               setRecvSpeed(speedFromSamples(samples));
@@ -1251,6 +1297,52 @@ function App() {
               total: total ?? prev?.total ?? null,
               phase: "download",
             }));
+            break;
+          // v0.1.86 — Option A retry events.
+          case "download_waiting_for_sender": {
+            const phase2Attempt =
+              typeof parsed.phase2_attempt === "number"
+                ? parsed.phase2_attempt
+                : 0;
+            const budgetMs =
+              typeof parsed.budget_ms === "number" ? parsed.budget_ms : 0;
+            const timeRemainingMs =
+              typeof parsed.time_remaining_ms === "number"
+                ? parsed.time_remaining_ms
+                : 0;
+            const nextRetryInMs =
+              typeof parsed.next_retry_in_ms === "number"
+                ? parsed.next_retry_in_ms
+                : 0;
+            setRecvStatus("waiting_for_sender");
+            setRecvRetryInfo({
+              phase2Attempt,
+              budgetMs,
+              timeRemainingMs,
+              nextRetryInMs,
+              nextRetryAt: Date.now() + nextRetryInMs,
+            });
+            // Pause the speed display — no bytes are flowing during
+            // the wait, and stale samples would mislead the ETA.
+            setRecvSpeed(null);
+            recvSpeedRef.current = [];
+            break;
+          }
+          case "download_retry_cancelled":
+            setRecvRetryInfo(null);
+            // recv:exit will set status to "error" shortly. We just
+            // make sure the retry panel stops rendering.
+            break;
+          case "download_giving_up":
+            setRecvRetryInfo(null);
+            setRecvStatus("error");
+            setRecvError(
+              `Sender did not come back online within ${
+                typeof parsed.budget_ms === "number"
+                  ? Math.round(parsed.budget_ms / 60000) + " min"
+                  : "the retry budget"
+              }.`
+            );
             break;
           case "download_complete":
             // Data has arrived. File is not yet written — that's the export
@@ -1305,6 +1397,20 @@ function App() {
               total: total ?? prev?.total ?? null,
               phase: "export",
             }));
+            // v0.1.86 — Option B: mark the LastReceive entry as
+            // completed. The cross-session resume banner only fires
+            // when the most recent saved receive lacks this flag.
+            {
+              const existing = loadJson<LastReceive>(LS_LAST_RECV);
+              if (existing) {
+                const updated: LastReceive = {
+                  ...existing,
+                  completed: true,
+                };
+                saveJson(LS_LAST_RECV, updated);
+                setLastRecv(updated);
+              }
+            }
             break;
           case "error":
             setRecvError(`${parsed.stage}: ${parsed.message}`);
@@ -1617,6 +1723,50 @@ function App() {
         setOutputPath(finalDest);
       }
     }
+    // v0.1.86 — disk-space preflight. If the ticket carries a
+    // canonical size (most do, via the `# size=…` annotation on the
+    // share line), ask the OS how much free space is at the
+    // destination, and confirm with the user if it's not enough.
+    // Safety margin: 64 MiB or 1% of file size, whichever's larger —
+    // covers filesystem metadata + small over-reports.
+    const seededTotalForCheck = parsed?.canonicalSize ?? null;
+    if (seededTotalForCheck !== null && seededTotalForCheck > 0) {
+      try {
+        const free = (await invoke<number>("check_disk_space", {
+          path: finalDest,
+        })) as number;
+        if (free > 0) {
+          const margin = Math.max(
+            64 * 1024 * 1024,
+            Math.floor(seededTotalForCheck * 0.01)
+          );
+          if (free < seededTotalForCheck + margin) {
+            const proceed = await ask(
+              `This download is ${formatBytes(
+                seededTotalForCheck
+              )}, but only ${formatBytes(
+                free
+              )} is free at the destination. Continuing anyway will likely run out of disk space partway through.\n\nContinue anyway?`,
+              {
+                title: "Not enough free disk space",
+                kind: "warning",
+                okLabel: "Continue anyway",
+                cancelLabel: "Cancel receive",
+              }
+            );
+            if (!proceed) {
+              setRecvStatus("idle");
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        // Can't probe — silently skip. The CLI will still log free
+        // space and fail informatively if the disk fills up.
+        console.warn("disk space check failed:", err);
+      }
+    }
+
     setRecvStatus("connecting");
     // Keep the size-seeded total if we have one. Reset bytes to 0 but
     // preserve the denominator so the bar doesn't jump to indeterminate
@@ -1730,6 +1880,20 @@ function App() {
     setChatStatus("disconnected");
   }
 
+  // v0.1.86 — Drive the "next retry in X s" countdown by ticking once
+  // per second while recvRetryInfo is set. We use a state increment
+  // rather than directly mutating recvRetryInfo so the existing
+  // event handler stays the single source of truth for the actual
+  // values; the tick is purely a re-render trigger that the render
+  // function uses to recompute `nextRetryAt - Date.now()`.
+  useEffect(() => {
+    if (recvRetryInfo === null) return;
+    const id = setInterval(() => {
+      setRetryCountdownTick((t) => t + 1);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [recvRetryInfo]);
+
   // ---------- Render ----------
 
   const parsedReceive = parseReceiveInput(ticketInput);
@@ -1745,7 +1909,11 @@ function App() {
   const recvBusy =
     recvStatus === "connecting" ||
     recvStatus === "downloading" ||
-    recvStatus === "exporting";
+    recvStatus === "exporting" ||
+    // v0.1.86 — the sidecar is still alive during Phase 2 wait,
+    // so the panel is "busy" from the user's POV. This also keeps
+    // Stop Receive enabled (it's the cancel-the-waiting affordance).
+    recvStatus === "waiting_for_sender";
 
   // Brief hashing window where the connection-mode fieldset is locked.
   const sendBusy = sendStatus === "creating_ticket";
@@ -1840,6 +2008,42 @@ function App() {
           {menuMessage}
         </div>
       )}
+
+      {/* v0.1.86 — Option B: cross-session resume banner. Renders
+          when the most recent saved receive was never marked as
+          completed (i.e., it was interrupted or the app was closed
+          mid-transfer) and the user hasn't dismissed it this
+          session. Hidden once they click Resume Last Receive (since
+          recvBusy goes true) or Dismiss. */}
+      {lastRecv &&
+        lastRecv.completed !== true &&
+        !resumeBannerDismissed &&
+        !recvBusy &&
+        mode === "receive" && (
+          <div className="resume-banner-prominent" role="status">
+            <div className="resume-banner-text">
+              <strong>↻ Incomplete download from a previous session</strong>
+              <p>
+                <code title={lastRecv.outputPath}>
+                  {basename(lastRecv.outputPath)}
+                </code>{" "}
+                was interrupted. You can resume from where it left off — the
+                partial data is still on disk.
+              </p>
+            </div>
+            <div className="resume-banner-actions">
+              <button onClick={resumeLastReceive} className="primary">
+                Resume Download
+              </button>
+              <button
+                onClick={() => setResumeBannerDismissed(true)}
+                className="ghost-button"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
 
       <div className="mode-switch" role="tablist" aria-label="Window mode">
         <button
@@ -2355,6 +2559,63 @@ function App() {
           )}
 
           {recvError && <p className="error">{recvError}</p>}
+
+          {/* v0.1.86 — Option A: prominent "waiting for sender"
+              panel. Renders during the Phase 2 slow-poll retry
+              loop. The progress bar above stays frozen at last
+              reported bytes so the user sees that partial state
+              isn't lost. */}
+          {recvStatus === "waiting_for_sender" && recvRetryInfo && (() => {
+            // Bind tick so React re-renders this block every second
+            // while the countdown is active (the useEffect above
+            // increments retryCountdownTick).
+            void retryCountdownTick;
+            const now = Date.now();
+            const nextRetrySecs = Math.max(
+              0,
+              Math.round((recvRetryInfo.nextRetryAt - now) / 1000)
+            );
+            const remainingSecs = Math.max(
+              0,
+              Math.round(
+                (recvRetryInfo.timeRemainingMs -
+                  (now - (recvRetryInfo.nextRetryAt - recvRetryInfo.nextRetryInMs))) /
+                  1000
+              )
+            );
+            return (
+              <div className="waiting-for-sender">
+                <h3>
+                  <span className="waiting-pulse" aria-hidden="true">
+                    ●
+                  </span>
+                  {"  "}Waiting for sender to come back online
+                </h3>
+                <dl className="waiting-stats">
+                  <div>
+                    <dt>Next retry in</dt>
+                    <dd>{nextRetrySecs}s</dd>
+                  </div>
+                  <div>
+                    <dt>Will keep trying for</dt>
+                    <dd>{formatDuration(remainingSecs)}</dd>
+                  </div>
+                  <div>
+                    <dt>Attempts so far</dt>
+                    <dd>
+                      {recvRetryInfo.phase2Attempt}{" "}
+                      (Phase 2)
+                    </dd>
+                  </div>
+                </dl>
+                <p className="hint">
+                  Your partial download is preserved. If the sender
+                  reconnects, the transfer resumes automatically.
+                  Click <em>Stop Receive</em> to give up now.
+                </p>
+              </div>
+            );
+          })()}
 
           {recvStatus !== "complete" && recvProgress && (() => {
             const remaining =
