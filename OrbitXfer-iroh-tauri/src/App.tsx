@@ -55,7 +55,13 @@ type RecvStatus =
   // UI renders a prominent panel with a live countdown to the next
   // retry. Status returns to "downloading" if Phase 2 succeeds, or
   // transitions to "error" if the budget runs out.
-  | "waiting_for_sender";
+  | "waiting_for_sender"
+  // v0.1.88 (#6) — transient state shown the instant the user clicks
+  // Stop, before the sidecar has actually exited. Replaces the old
+  // several-seconds-of-nothing-then-"error" experience.
+  | "stopping"
+  // v0.1.88 (#6) — clean user-initiated stop (distinct from "error").
+  | "stopped";
 
 // v0.1.86 — Live state for the "waiting for sender" panel. nextRetryAt
 // is a wall-clock unix-ms so the React countdown effect can decrement
@@ -198,6 +204,10 @@ interface LastSend {
   // original ticket on Resume keeps the share line stable for
   // anyone who already received it.
   tickets?: Tickets;
+  // v0.1.88 (#5) — canonical payload size, saved so Resume Last Send
+  // can pass it to the cached-blob fast path (and so the resumed
+  // share line keeps its `# size=` annotation without a re-hash).
+  totalSize?: number;
 }
 
 interface LastReceive {
@@ -630,6 +640,15 @@ function App() {
   // download_waiting_for_sender event so the panel can render the
   // countdown + attempt count + total time remaining.
   const [recvRetryInfo, setRecvRetryInfo] = useState<RecvRetryInfo | null>(null);
+
+  // v0.1.88 (#6) — set true while a user-initiated Stop is in flight,
+  // so the recv:exit handler renders "Stopped" rather than treating
+  // the exit as a crash. Cleared when a new receive starts.
+  const recvStoppingRef = useRef(false);
+  // v0.1.88 (#7) — the plain-English reason from the most recent
+  // download_waiting_for_sender / download_giving_up event, shown in
+  // the waiting panel so the user knows WHY it's retrying.
+  const [recvRetryReason, setRecvRetryReason] = useState<string | null>(null);
   // Tick state: incremented every second while waiting so the
   // countdown display updates in real time without re-firing the
   // event handler.
@@ -936,6 +955,17 @@ function App() {
             setSendSpeed(null);
             setSendProgress({ phase: "hashing", bytes: 0, total: null });
             break;
+          // v0.1.88 (#5) — Resume fast path: the CLI reused the cached
+          // blob instead of re-hashing. No hashing progress will
+          // follow; the ticket_variants event arrives next. Clear any
+          // stale hashing progress so the UI jumps straight to the
+          // share line.
+          case "ticket_reused":
+            setSendProgress(null);
+            sendSpeedRef.current = [];
+            setSendSpeed(null);
+            if (total !== null) setSendTotalSize(total);
+            break;
           case "ticket_hashing_size":
             // First authoritative reading of the file's payload size.
             // Cache it now so we can embed it in the share line even
@@ -1001,6 +1031,10 @@ function App() {
                 const updated: LastSend = {
                   ...existing,
                   tickets: newTickets,
+                  // v0.1.88 (#5) — capture the canonical size too, so
+                  // Resume can pass it to the cached-blob fast path.
+                  totalSize:
+                    typeof total === "number" ? total : existing.totalSize,
                 };
                 saveJson(LS_LAST_SEND, updated);
                 setLastSend(updated);
@@ -1260,6 +1294,28 @@ function App() {
               },
             ]);
             break;
+          // v0.1.88 (#8/#9) — Reconnect Chat lifecycle (receiver-side;
+          // harmless no-ops on the sender channel).
+          case "chat_reconnecting":
+            setChatStatus("connecting");
+            setChatMessages((prev) => [
+              ...prev,
+              { kind: "system", body: "Reconnecting chat…", at: Date.now() },
+            ]);
+            break;
+          case "chat_reconnect_failed":
+            setChatStatus("disconnected");
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                kind: "system",
+                body: `Couldn't reconnect chat (${
+                  typeof parsed.reason === "string" ? parsed.reason : "unknown"
+                }). The sender may still be offline.`,
+                at: Date.now(),
+              },
+            ]);
+            break;
         }
       })
     );
@@ -1407,6 +1463,10 @@ function App() {
               nextRetryInMs,
               nextRetryAt: Date.now() + nextRetryInMs,
             });
+            // v0.1.88 (#7) — capture the plain-English reason.
+            if (typeof parsed.reason === "string") {
+              setRecvRetryReason(parsed.reason);
+            }
             // Pause the speed display — no bytes are flowing during
             // the wait, and stale samples would mislead the ETA.
             setRecvSpeed(null);
@@ -1422,12 +1482,24 @@ function App() {
             setRecvRetryInfo(null);
             setRecvStatus("error");
             setRecvError(
-              `Sender did not come back online within ${
+              // v0.1.88 (#7) — lead with the categorized reason if we
+              // have one, then the budget note.
+              `${
+                typeof parsed.reason === "string" ? parsed.reason + " " : ""
+              }The sender didn't come back online within ${
                 typeof parsed.budget_ms === "number"
-                  ? Math.round(parsed.budget_ms / 60000) + " min"
+                  ? Math.round(parsed.budget_ms / 60000) + " minutes"
                   : "the retry budget"
-              }.`
+              }. Your partial download is saved — try Resume when they're back.`
             );
+            break;
+          // v0.1.88 (#6) — clean user-initiated stop. The CLI emits
+          // this right before exiting on a Stop, so we can show a
+          // calm "Stopped" instead of an error.
+          case "receive_stopped":
+            recvStoppingRef.current = false;
+            setRecvRetryInfo(null);
+            setRecvStatus("stopped");
             break;
           case "download_complete":
             // Data has arrived. File is not yet written — that's the export
@@ -1574,6 +1646,28 @@ function App() {
               },
             ]);
             break;
+          // v0.1.88 (#8/#9) — Reconnect Chat lifecycle (receiver-side;
+          // harmless no-ops on the sender channel).
+          case "chat_reconnecting":
+            setChatStatus("connecting");
+            setChatMessages((prev) => [
+              ...prev,
+              { kind: "system", body: "Reconnecting chat…", at: Date.now() },
+            ]);
+            break;
+          case "chat_reconnect_failed":
+            setChatStatus("disconnected");
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                kind: "system",
+                body: `Couldn't reconnect chat (${
+                  typeof parsed.reason === "string" ? parsed.reason : "unknown"
+                }). The sender may still be offline.`,
+                at: Date.now(),
+              },
+            ]);
+            break;
         }
       })
     );
@@ -1587,17 +1681,34 @@ function App() {
     unlisteners.push(
       win.listen<number | null>("recv:exit", (e) => {
         setRecvLogs((prev) => [...prev, `[exit] code=${e.payload}`]);
+        // v0.1.88 (#6) — if this exit was a user-initiated Stop, show
+        // "Stopped", not "error". The CLI emits `receive_stopped`
+        // before exiting on a clean stop, which already flips status
+        // to "stopped"; this is the belt-and-suspenders path for when
+        // only the exit arrives.
+        if (recvStoppingRef.current) {
+          recvStoppingRef.current = false;
+          setRecvStatus((curr) =>
+            curr === "complete" ? curr : "stopped"
+          );
+          return;
+        }
         // If the receive sidecar exited mid-flight, mark it as an error
         // instead of leaving the UI stuck on "connecting"/"downloading".
         setRecvStatus((curr) =>
-          curr === "connecting" || curr === "downloading" || curr === "exporting"
+          curr === "connecting" ||
+          curr === "downloading" ||
+          curr === "exporting" ||
+          curr === "waiting_for_sender"
             ? "error"
             : curr
         );
         setRecvError((prev) =>
           prev ??
-          (e.payload !== 0
-            ? `Receive process exited with code ${e.payload}.`
+          (e.payload !== 0 && e.payload !== null
+            ? `The receive ended unexpectedly (exit code ${e.payload}). The sender may have stopped sharing, or the connection dropped. Your partial download is saved — try Resume.`
+            : e.payload === null
+            ? "The receive ended unexpectedly. The sender may have stopped sharing, or the connection dropped. Your partial download is saved — try Resume."
             : null)
         );
       })
@@ -1636,7 +1747,14 @@ function App() {
     }
   }
 
-  async function startSendWith(targetPath: string, asFolder: boolean) {
+  async function startSendWith(
+    targetPath: string,
+    asFolder: boolean,
+    // v0.1.88 (#5) — on Resume, the prior ticket + size enable the
+    // cached-blob fast path (skips re-hashing). Undefined for a fresh
+    // send.
+    reuse?: { ticket: string; size?: number }
+  ) {
     setSendStatus("creating_ticket");
     setIsFolderSend(asFolder);
     setSendFileCount(null);
@@ -1662,6 +1780,9 @@ function App() {
       await invoke("start_send", {
         filePath: targetPath,
         connectionMode,
+        // v0.1.88 (#5) — fast-path reuse args (undefined for a fresh send).
+        reuseTicket: reuse?.ticket,
+        reuseSize: reuse?.size,
       });
       // Persist the path on successful spawn — even if the transfer is later
       // interrupted, the user can resume with one click. isFolder is kept so
@@ -1706,7 +1827,18 @@ function App() {
       preserveTicketsOnNextSession.current = true;
       setIsPreservedTicket(true);
     }
-    await startSendWith(lastSend.filePath, lastSend.isFolder ?? false);
+    // v0.1.88 (#5) — enable the cached-blob fast path. The CLI only
+    // reuses single Raw blobs, so folders harmlessly fall through to
+    // re-hash even when we pass the ticket.
+    const reuse =
+      lastSend.tickets?.full && !lastSend.isFolder
+        ? { ticket: lastSend.tickets.full, size: lastSend.totalSize }
+        : undefined;
+    await startSendWith(
+      lastSend.filePath,
+      lastSend.isFolder ?? false,
+      reuse
+    );
   }
 
   async function stopSend() {
@@ -1873,6 +2005,10 @@ function App() {
     setRecvCurrentFile(null);
     setRecvStartedAt(null);
     setRecvCompletedAt(null);
+    // v0.1.88 — clear stop/retry-reason state for the fresh receive.
+    recvStoppingRef.current = false;
+    setRecvRetryInfo(null);
+    setRecvRetryReason(null);
     try {
       // Pass expectedSize so the CLI seeds its own download total from
       // the same canonical value and emits `download_size` immediately —
@@ -1913,12 +2049,19 @@ function App() {
   }
 
   async function stopReceive() {
+    // v0.1.88 (#6) — show "Stopping…" immediately and flag that this
+    // exit is user-initiated, so the recv:exit handler shows
+    // "Stopped" instead of "error / exited with code null". The CLI
+    // now cancels the in-flight download promptly (no more waiting
+    // for the 5s SIGKILL), and emits `receive_stopped`.
+    recvStoppingRef.current = true;
+    setRecvStatus("stopping");
+    setRecvRetryInfo(null);
     try {
       await invoke("stop_receive");
     } catch (err) {
       console.error(err);
     }
-    setRecvStatus("idle");
   }
 
   // ---------- v0.1.85 — Chat actions ----------
@@ -1963,6 +2106,19 @@ function App() {
     // Optimistically reflect the close locally; the sidecar will also
     // emit `chat_disconnected` which will overwrite this.
     setChatStatus("disconnected");
+  }
+
+  // v0.1.88 (#8/#9) — re-dial a dropped chat. Works while the receive
+  // process is still alive (downloading / waiting_for_sender / the
+  // post-transfer keepalive). The CLI re-connects the chat ALPN to
+  // the same sender and emits chat_reconnecting → chat_connected (or
+  // chat_reconnect_failed).
+  async function reconnectChat() {
+    try {
+      await invoke("reconnect_chat");
+    } catch (err) {
+      console.error(err);
+    }
   }
 
   // v0.1.86 — Drive the "next retry in X s" countdown by ticking once
@@ -2615,7 +2771,19 @@ function App() {
 
           {recvStatus !== "complete" && (
             <p className="status">
-              Status: <code>{recvStatus}</code>
+              Status:{" "}
+              {/* v0.1.88 (#6) — friendly labels for the new transient
+                  states; everything else shows the raw status code. */}
+              {recvStatus === "stopping" ? (
+                <span className="status-stopping">Stopping…</span>
+              ) : recvStatus === "stopped" ? (
+                <span className="status-stopped">
+                  Stopped. Your partial download is saved — Resume to
+                  finish later.
+                </span>
+              ) : (
+                <code>{recvStatus}</code>
+              )}
             </p>
           )}
 
@@ -2700,6 +2868,10 @@ function App() {
                   </span>
                   {"  "}Waiting for sender to come back online
                 </h3>
+                {/* v0.1.88 (#7) — plain-English reason for the wait. */}
+                {recvRetryReason && (
+                  <p className="waiting-reason">{recvRetryReason}</p>
+                )}
                 <dl className="waiting-stats">
                   <div>
                     <dt>Next retry in</dt>
@@ -2858,6 +3030,22 @@ function App() {
                 {chatStatus === "disconnected" && "Disconnected"}
                 {chatStatus === "unavailable" && "Unavailable"}
               </span>
+              {/* v0.1.88 (#8/#9) — Reconnect Chat appears when the chat
+                  has dropped but the receive process is still alive
+                  (mid-download or waiting for the sender to return).
+                  One click re-dials the chat ALPN. */}
+              {(chatStatus === "disconnected" ||
+                chatStatus === "unavailable") &&
+                mode === "receive" &&
+                (recvStatus === "downloading" ||
+                  recvStatus === "waiting_for_sender") && (
+                  <button
+                    onClick={reconnectChat}
+                    className="ghost-button"
+                  >
+                    Reconnect Chat
+                  </button>
+                )}
               <button
                 onClick={stopChat}
                 disabled={chatStatus !== "connected"}

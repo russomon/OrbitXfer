@@ -589,6 +589,10 @@ fn run_sidecar(
     slot: Slot,
     ticket_mode: Option<&str>,
     recv_overrides: ReceiveOverrides,
+    // v0.1.88 (#5) — on "Resume Last Send", the GUI passes the prior
+    // session's ticket (+ size) so the CLI can reuse the cached blob
+    // and skip re-hashing. (ticket, size). None for a fresh send.
+    send_reuse: Option<(String, Option<u64>)>,
 ) -> Result<(), String> {
     let mut sidecar = app
         .shell()
@@ -630,6 +634,15 @@ fn run_sidecar(
         // CLI, so we only forward an explicit value.
         if let Some(mode) = ticket_mode {
             sidecar = sidecar.env("ORBITXFER_TICKET_MODE", mode);
+        }
+
+        // v0.1.88 (#5) — resume fast path. Forward the prior ticket so
+        // the CLI can reuse the cached blob instead of re-hashing.
+        if let Some((ticket, size)) = send_reuse.as_ref() {
+            sidecar = sidecar.env("ORBITXFER_REUSE_TICKET", ticket);
+            if let Some(sz) = size {
+                sidecar = sidecar.env("ORBITXFER_REUSE_SIZE", sz.to_string());
+            }
         }
     } else {
         // Receive sidecar. Only set env vars when the frontend explicitly
@@ -722,8 +735,13 @@ async fn start_send(
     window: WebviewWindow,
     file_path: String,
     connection_mode: Option<String>,
+    // v0.1.88 (#5) — set by Resume Last Send to enable the cached-blob
+    // fast path; None for a fresh send.
+    reuse_ticket: Option<String>,
+    reuse_size: Option<u64>,
 ) -> Result<(), String> {
     let mode_ref = connection_mode.as_deref();
+    let send_reuse = reuse_ticket.map(|t| (t, reuse_size));
     run_sidecar(
         &app,
         window.label().to_string(),
@@ -732,6 +750,7 @@ async fn start_send(
         Slot::Send,
         mode_ref,
         ReceiveOverrides::default(),
+        send_reuse,
     )
 }
 
@@ -774,6 +793,7 @@ async fn start_receive(
             store_dir,
             receiver_label,
         },
+        None,
     )
 }
 
@@ -817,6 +837,17 @@ async fn stop_chat(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     write_ox_cmd_to_active_chat_slot(&state, window.label(), r#"{"type":"chat_stop"}"#)
+}
+
+/// v0.1.88 — re-dial the chat ALPN when a chat dropped but the
+/// receive process is still alive. Writes OX_CMD reconnect_chat to
+/// the active sidecar's stdin.
+#[tauri::command]
+async fn reconnect_chat(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    write_ox_cmd_to_active_chat_slot(&state, window.label(), r#"{"type":"reconnect_chat"}"#)
 }
 
 /// Milliseconds the GUI waits for a graceful shutdown after writing
@@ -1153,6 +1184,8 @@ pub fn run() {
             stop_chat,
             // v0.1.86 — disk-space preflight on receive.
             check_disk_space,
+            // v0.1.88 — reconnect a dropped chat.
+            reconnect_chat,
             open_new_window
         ])
         .run(tauri::generate_context!())

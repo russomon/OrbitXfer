@@ -487,6 +487,11 @@ pub enum CliCommand {
     /// equivalent to ctrl-c.
     #[serde(rename = "stop_receive")]
     StopReceive,
+    /// v0.1.88 — re-dial the chat ALPN. Used when a chat connection
+    /// dropped (e.g. the sender bounced) but the receive process is
+    /// still alive. Starts a fresh chat session to the same sender.
+    #[serde(rename = "reconnect_chat")]
+    ReconnectChat,
 }
 
 /// Spawn the stdin watcher as a tokio task. Reads stdin line by

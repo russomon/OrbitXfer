@@ -1169,3 +1169,20 @@ button:disabled {
   background: var(--accent);
   opacity: 0.92;
 }
+
+/* v0.1.88 (#6) — friendly Stop states. */
+.status-stopping {
+  color: var(--warn-text);
+  font-weight: 500;
+}
+.status-stopped {
+  color: var(--text-muted);
+}
+
+/* v0.1.88 (#7) — plain-English reason inside the waiting panel. */
+.waiting-reason {
+  margin: 0 0 10px;
+  font-size: 0.9rem;
+  line-height: 1.45;
+  color: var(--warn-text);
+}

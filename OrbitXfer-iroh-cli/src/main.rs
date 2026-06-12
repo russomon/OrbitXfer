@@ -43,7 +43,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.87";
+const CLI_VERSION: &str = "0.1.88";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -469,6 +469,47 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// v0.1.88 (#5) — Resume fast path. If `ORBITXFER_REUSE_TICKET` is set
+/// (the GUI sets it on Resume Last Send) and the persistent store
+/// still holds that blob, return a protected handle to it so the
+/// caller can skip re-hashing the source file.
+///
+/// Limited to single Raw blobs in v0.1.88: for a HashSeq folder,
+/// `has(root)` only confirms the root metadata blob is present, not
+/// every child, so we'd risk serving an incomplete collection.
+/// Folders fall through to the normal re-hash path.
+///
+/// Returns None (→ caller re-hashes) when: the env var is unset, the
+/// ticket doesn't parse, the format isn't Raw, the blob isn't in the
+/// store (GC'd, app restarted, or a different window), or the temp
+/// tag can't be created.
+async fn try_reuse_cached_blob(
+    store: &FsStore,
+) -> Option<(Hash, BlobFormat, Option<u64>, Vec<TempTag>)> {
+    let ticket_str = env::var("ORBITXFER_REUSE_TICKET").ok()?;
+    let ticket: BlobTicket = ticket_str.parse().ok()?;
+    let hf = ticket.hash_and_format();
+    if !matches!(hf.format, BlobFormat::Raw) {
+        return None;
+    }
+    // Is the blob still complete in the persistent store?
+    match store.blobs().has(hf.hash).await {
+        Ok(true) => {}
+        _ => return None,
+    }
+    // Protect it with a fresh temp tag (the previous session's tag
+    // dropped when its sidecar exited; GC may not have run yet, but
+    // we re-protect to be safe for the new serving session). The
+    // tags() temp_tag is GLOBAL-scoped — it lives until dropped,
+    // which is exactly the lifetime we want (_keep_tags held until
+    // run_send returns).
+    let tag = store.tags().temp_tag(hf).await.ok()?;
+    let size = env::var("ORBITXFER_REUSE_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    Some((hf.hash, hf.format, size, vec![tag]))
+}
+
 /// Add a single file to the store as one Raw blob (the original send
 /// behavior). Emits the `ticket_hashing_*` progress events and returns the
 /// blob's hash, format, total size, and the (leaked) temp tag.
@@ -672,6 +713,94 @@ async fn prepare_folder(
     Ok((hf.hash, hf.format, total_size, tags))
 }
 
+/// v0.1.88 — Telemetry (#7). Classify a receive-side failure into a
+/// short machine code + a human-readable explanation, so the GUI can
+/// tell the user WHY a download is stuck retrying rather than just
+/// "failed". Best-effort string matching against the underlying
+/// iroh/quinn/DNS error text — imperfect, but covers the common cases
+/// we've seen in testing. Returns (code, human_message).
+fn categorize_receive_failure(err_text: &str) -> (&'static str, String) {
+    let lower = err_text.to_ascii_lowercase();
+    if lower.contains("no addressing information")
+        || lower.contains("failed to resolve")
+        || lower.contains("dns")
+        || lower.contains("no calls succeeded")
+    {
+        (
+            "sender_offline",
+            "The sender appears to be offline — we can't find any way to \
+             reach them right now. This usually means their Send window \
+             was closed or their computer went to sleep. We'll keep \
+             trying in case they come back."
+                .to_string(),
+        )
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        (
+            "timeout",
+            "The connection to the sender timed out. They may have a slow \
+             or interrupted network. Retrying."
+                .to_string(),
+        )
+    } else if lower.contains("refused") || lower.contains("reset") {
+        (
+            "refused",
+            "The sender's computer is reachable but refused the connection \
+             — their Send may have just stopped. Retrying in case it \
+             resumes."
+                .to_string(),
+        )
+    } else if lower.contains("connection lost") || lower.contains("closed") {
+        (
+            "connection_lost",
+            "The connection to the sender dropped mid-transfer. Retrying."
+                .to_string(),
+        )
+    } else {
+        (
+            "unknown",
+            format!("The transfer hit a snag and is retrying. ({err_text})"),
+        )
+    }
+}
+
+/// v0.1.88 (#8/#9) — launch a receiver-side chat session and track its
+/// liveness so Reconnect Chat can replace a dropped session and the
+/// post-transfer keepalive can tell whether any chat is still active.
+///
+/// Sets the shared `current_outbox` to the new session's sender (so
+/// the stdin dispatcher's ChatSend goes to the latest session),
+/// flips `chat_active` true, and spawns the session. When the session
+/// ends, flips `chat_active` false and fires `chat_ended` so the
+/// keepalive loop can re-evaluate.
+async fn launch_receiver_chat(
+    conn: iroh::endpoint::Connection,
+    label: String,
+    current_outbox: std::sync::Arc<
+        tokio::sync::Mutex<Option<tokio::sync::mpsc::Sender<chat::ChatMessage>>>,
+    >,
+    chat_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    chat_ended: std::sync::Arc<tokio::sync::Notify>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<chat::ChatMessage>(64);
+    {
+        let mut slot = current_outbox.lock().await;
+        *slot = Some(tx);
+    }
+    chat_active.store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::spawn(async move {
+        if let Err(e) =
+            chat::run_chat_session(conn, chat::ChatSide::Receiver, label, rx).await
+        {
+            emit_event(json!({
+                "type": "chat_session_error",
+                "error": format!("{}", e),
+            }));
+        }
+        chat_active.store(false, std::sync::atomic::Ordering::SeqCst);
+        chat_ended.notify_waiters();
+    });
+}
+
 /// Convert a collection entry name into a SAFE relative path under the
 /// destination directory. Rejects absolute paths and any `..` component to
 /// prevent a malicious sender from writing outside the chosen folder
@@ -698,8 +827,6 @@ async fn run_send(
 ) -> Result<()> {
     let abs_path = abs_path(&file_path)?;
 
-    emit_line("Hashing file (this can take a while for large files).");
-    emit_event(json!({ "type": "ticket_hashing_start" }));
     let store_dir = store_root()?;
     std::fs::create_dir_all(&store_dir)?;
     let store = FsStore::load(store_dir.clone()).await?;
@@ -711,17 +838,39 @@ async fn run_send(
     let (events_tx, mut events_rx) = EventSender::channel(32, event_mask);
     let blobs = BlobsProtocol::new(&store, Some(events_tx));
 
-    // Produce the root hash + format + total size. A single file becomes
-    // one Raw blob (unchanged behavior); a directory becomes a HashSeq
-    // collection of every file inside it. The returned temp tags must
-    // outlive the serving loop below so the blobs they protect aren't
-    // garbage-collected while a receiver is still fetching — they're held
-    // in `_keep_tags` and dropped only when run_send returns (after Ctrl-C).
+    // v0.1.88 (#5) — Resume fast path. On "Resume Last Send", the GUI
+    // passes the previous session's ticket via ORBITXFER_REUSE_TICKET.
+    // If the persistent per-window store still has that blob, we
+    // protect it with a fresh temp tag and skip re-hashing the file
+    // entirely — which for a multi-GB file turns a multi-second
+    // re-hash into an instant resume. This is also MORE correct for
+    // resume: serving the cached hash preserves the receiver's
+    // partial data and their original ticket. (v0.1.88 limits this
+    // to single Raw blobs; folders still re-hash, with messaging.)
+    let reuse = try_reuse_cached_blob(&store).await;
+
     let (hash, format, total_size, _keep_tags): (Hash, BlobFormat, Option<u64>, Vec<TempTag>) =
-        if abs_path.is_dir() {
-            prepare_folder(&store, &abs_path).await?
+        if let Some(reused) = reuse {
+            emit_line("Reusing cached file from a previous send (instant resume).");
+            emit_event(json!({
+                "type": "ticket_reused",
+                "hash": reused.0.to_string(),
+                "total": reused.2,
+            }));
+            reused
         } else {
-            prepare_single_file(&store, &abs_path).await?
+            // Normal path: hash the file/folder into the store.
+            if abs_path.is_dir() {
+                emit_line("Verifying folder contents (this can take a while).");
+            } else {
+                emit_line("Hashing file (this can take a while for large files).");
+            }
+            emit_event(json!({ "type": "ticket_hashing_start" }));
+            if abs_path.is_dir() {
+                prepare_folder(&store, &abs_path).await?
+            } else {
+                prepare_single_file(&store, &abs_path).await?
+            }
         };
 
     // Warmup/sanity check only applies to a single Raw blob. For a HashSeq
@@ -1058,6 +1207,11 @@ async fn run_send(
                     Some(chat::CliCommand::StopReceive) => {
                         // Not applicable to a send sidecar; ignore.
                     }
+                    Some(chat::CliCommand::ReconnectChat) => {
+                        // Reconnect is a receiver-side affordance; the
+                        // sender's chat ALPN is always listening, so
+                        // there's nothing to reconnect here. Ignore.
+                    }
                     None => {
                         // Command bus closed — fall through to shutdown.
                         break;
@@ -1343,19 +1497,33 @@ async fn run_receive(
         }
     }
 
-    // v0.1.85 — open a separate connection on the chat ALPN. This is
-    // best-effort: a chat failure does NOT block the transfer. The
-    // chat runs as its own task; the receiver process exits when
-    // BOTH the transfer is done AND the chat has closed (or
-    // ctrl-c/StopReceive arrives).
+    // v0.1.85/88 — open a separate connection on the chat ALPN. This
+    // is best-effort: a chat failure does NOT block the transfer.
+    //
+    // v0.1.88 (#8/#9) — the chat lifecycle is now DYNAMIC: the
+    // initial session can be replaced by a Reconnect Chat command if
+    // it drops (e.g. the sender bounced during a Phase 2 retry).
+    // Shared state:
+    //   - current_outbox: the active session's inbound sender, so
+    //     the stdin dispatcher's ChatSend always reaches the latest
+    //     session.
+    //   - chat_active: true while any chat session is live; the
+    //     post-transfer keepalive uses it to decide whether to
+    //     linger.
+    //   - chat_ended: pulsed when a session ends, to wake the
+    //     keepalive for re-evaluation.
     let chat_self_label = std::env::var("ORBITXFER_RECEIVER_LABEL")
         .ok()
         .map(|s| sanitize_label_text(&s))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Receiver".to_string());
-    let (chat_outbox_tx, chat_outbox_rx) =
-        tokio::sync::mpsc::channel::<chat::ChatMessage>(64);
-    let chat_handle: Option<tokio::task::JoinHandle<()>> = match timeout(
+    let current_outbox: std::sync::Arc<
+        tokio::sync::Mutex<Option<tokio::sync::mpsc::Sender<chat::ChatMessage>>>,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let chat_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let chat_ended = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    match timeout(
         Duration::from_secs(8),
         endpoint.connect(ticket_addr.clone(), chat::CHAT_ALPN),
     )
@@ -1363,62 +1531,45 @@ async fn run_receive(
     {
         Ok(Ok(chat_conn)) => {
             emit_line("Chat ALPN connected.");
-            let label = chat_self_label.clone();
-            Some(tokio::spawn(async move {
-                if let Err(e) = chat::run_chat_session(
-                    chat_conn,
-                    chat::ChatSide::Receiver,
-                    label,
-                    chat_outbox_rx,
-                )
-                .await
-                {
-                    emit_event(json!({
-                        "type": "chat_session_error",
-                        "error": format!("{}", e),
-                    }));
-                }
-            }))
+            launch_receiver_chat(
+                chat_conn,
+                chat_self_label.clone(),
+                current_outbox.clone(),
+                chat_active.clone(),
+                chat_ended.clone(),
+            )
+            .await;
         }
         Ok(Err(err)) => {
             emit_event(json!({
                 "type": "chat_unavailable",
                 "reason": format!("{}", err),
             }));
-            None
         }
         Err(_) => {
             emit_event(json!({
                 "type": "chat_unavailable",
                 "reason": "timeout",
             }));
-            None
         }
     };
 
-    // v0.1.85 — spawn the stdin command dispatcher NOW, in parallel
-    // with the download, so receiver-side ChatSend commands flow to
-    // the peer immediately instead of queuing in cmd_rx until the
-    // download finishes. The dispatcher pushes ChatSend onto
-    // chat_outbox_tx and signals StopReceive via a oneshot so the
-    // outer flow can drop out of its post-download wait.
-    //
-    // We give the dispatcher its OWN clone of chat_outbox_tx so the
-    // main flow's chat_outbox_tx can be dropped after the download
-    // without prematurely closing the outbox (the dispatcher's clone
-    // keeps it alive for the chat session's lifetime).
-    let chat_outbox_tx_for_dispatch = chat_outbox_tx.clone();
-    // v0.1.86 — replace v0.1.85's oneshot with a Notify + AtomicBool
-    // pair. The retry state machine's Phase 2 sleep AND the
-    // post-export keepalive both need to react to StopReceive, and
-    // a oneshot's "single consumer" semantics don't support that.
-    // Notify::notify_waiters wakes all current awaiters; the
-    // AtomicBool catches the case where StopReceive fires while no
-    // one is waiting (e.g. during the in-flight download itself).
+    // v0.1.85/86/88 — spawn the stdin command dispatcher. Runs in
+    // parallel with the download so ChatSend flows immediately. It
+    // owns the shared chat state so it can service ChatSend / ChatStop
+    // / ReconnectChat against the LATEST session, and signals
+    // StopReceive via the Notify + AtomicBool (which the cancellable
+    // download loops and the keepalive both watch).
     let stop_signal = std::sync::Arc::new(tokio::sync::Notify::new());
     let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_signal_for_dispatch = stop_signal.clone();
     let stop_requested_for_dispatch = stop_requested.clone();
+    let dispatch_endpoint = endpoint.clone();
+    let dispatch_addr = ticket_addr.clone();
+    let dispatch_label = chat_self_label.clone();
+    let dispatch_outbox = current_outbox.clone();
+    let dispatch_active = chat_active.clone();
+    let dispatch_ended = chat_ended.clone();
     let cmd_dispatch_task = tokio::spawn(async move {
         let mut cmd_rx = cmd_rx;
         while let Some(cmd) = cmd_rx.recv().await {
@@ -1431,22 +1582,75 @@ async fn run_receive(
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0),
                     };
-                    if let Err(e) = chat_outbox_tx_for_dispatch.send(msg).await {
-                        emit_event(json!({
-                            "type": "chat_send_failed",
-                            "error": format!("{}", e),
-                        }));
+                    let slot = dispatch_outbox.lock().await;
+                    match slot.as_ref() {
+                        Some(tx) => {
+                            if let Err(e) = tx.send(msg).await {
+                                emit_event(json!({
+                                    "type": "chat_send_failed",
+                                    "error": format!("{}", e),
+                                }));
+                            }
+                        }
+                        None => {
+                            emit_event(json!({
+                                "type": "chat_send_failed",
+                                "error": "no active chat session",
+                            }));
+                        }
                     }
                 }
                 chat::CliCommand::ChatStop => {
-                    let _ = chat_outbox_tx_for_dispatch
-                        .send(chat::ChatMessage::Bye)
-                        .await;
+                    let slot = dispatch_outbox.lock().await;
+                    if let Some(tx) = slot.as_ref() {
+                        let _ = tx.send(chat::ChatMessage::Bye).await;
+                    }
+                }
+                chat::CliCommand::ReconnectChat => {
+                    // v0.1.88 — re-dial the chat ALPN to the same
+                    // sender. Only meaningful while the process is
+                    // alive (download / waiting / keepalive).
+                    if dispatch_active.load(std::sync::atomic::Ordering::SeqCst) {
+                        // A chat is already live; nothing to do.
+                        continue;
+                    }
+                    emit_event(json!({ "type": "chat_reconnecting" }));
+                    match timeout(
+                        Duration::from_secs(8),
+                        dispatch_endpoint.connect(dispatch_addr.clone(), chat::CHAT_ALPN),
+                    )
+                    .await
+                    {
+                        Ok(Ok(conn)) => {
+                            launch_receiver_chat(
+                                conn,
+                                dispatch_label.clone(),
+                                dispatch_outbox.clone(),
+                                dispatch_active.clone(),
+                                dispatch_ended.clone(),
+                            )
+                            .await;
+                        }
+                        Ok(Err(err)) => {
+                            emit_event(json!({
+                                "type": "chat_reconnect_failed",
+                                "reason": format!("{}", err),
+                            }));
+                        }
+                        Err(_) => {
+                            emit_event(json!({
+                                "type": "chat_reconnect_failed",
+                                "reason": "timeout",
+                            }));
+                        }
+                    }
                 }
                 chat::CliCommand::StopReceive => {
-                    let _ = chat_outbox_tx_for_dispatch
-                        .send(chat::ChatMessage::Bye)
-                        .await;
+                    let slot = dispatch_outbox.lock().await;
+                    if let Some(tx) = slot.as_ref() {
+                        let _ = tx.send(chat::ChatMessage::Bye).await;
+                    }
+                    drop(slot);
                     stop_requested_for_dispatch
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                     stop_signal_for_dispatch.notify_waiters();
@@ -1587,6 +1791,13 @@ async fn run_receive(
     let mut phase2_attempt: u32 = 0;
     let mut current_backoff = Duration::from_secs(PHASE2_INITIAL_BACKOFF_SECS);
     let mut overall_succeeded = false;
+    // v0.1.88 — set when the user clicks Stop during the download.
+    // The download loops select on the stop signal so a Stop is
+    // near-instant instead of waiting for the GUI's 5s SIGKILL
+    // fallback. When set, we skip export and exit cleanly with a
+    // `receive_stopped` event (so the frontend shows "Stopped",
+    // not "error / exited with code null").
+    let mut user_stopped = false;
 
     let mut direct_completed = false;
     'phase2: loop {
@@ -1605,40 +1816,60 @@ async fn run_receive(
             .stream();
         let mut connected = false;
         let mut throttle = ProgressThrottle::new();
-        while let Some(item) = stream.next().await {
-            match item {
-                GetProgressItem::Progress(bytes) => {
-                    if !connected {
-                        connected = true;
-                        emit_event(json!({ "type": "connect_success" }));
-                    }
-                    if throttle.should_emit(bytes) {
-                        // v0.1.85 — `bytes` is session-local; add the
-                        // resume baseline so the bar shows cumulative
-                        // file completion (cached + just-transferred).
-                        emit_event(json!({
-                            "type": "download_progress",
-                            "bytes": baseline_bytes.saturating_add(bytes),
-                            "total": total_size
-                        }));
+        // v0.1.88 — cancellable: select stream progress against the
+        // stop signal so Stop interrupts a live fetch immediately.
+        let stop_notified = stop_signal.notified();
+        tokio::pin!(stop_notified);
+        loop {
+            if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                user_stopped = true;
+                break;
+            }
+            tokio::select! {
+                item = stream.next() => {
+                    match item {
+                        Some(GetProgressItem::Progress(bytes)) => {
+                            if !connected {
+                                connected = true;
+                                emit_event(json!({ "type": "connect_success" }));
+                            }
+                            if throttle.should_emit(bytes) {
+                                // v0.1.85 — `bytes` is session-local;
+                                // add the resume baseline so the bar
+                                // shows cumulative file completion.
+                                emit_event(json!({
+                                    "type": "download_progress",
+                                    "bytes": baseline_bytes.saturating_add(bytes),
+                                    "total": total_size
+                                }));
+                            }
+                        }
+                        Some(GetProgressItem::Done(_)) => {
+                            if !connected {
+                                emit_event(json!({ "type": "connect_success" }));
+                            }
+                            emit_line("Direct fetch complete.");
+                            emit_event(json!({ "type": "download_complete", "total": total_size }));
+                            direct_completed = true;
+                            last_err = None;
+                            break;
+                        }
+                        Some(GetProgressItem::Error(err)) => {
+                            emit_line(&format!("Direct fetch error: {err:?}"));
+                            last_err = Some(anyhow!(err));
+                            break;
+                        }
+                        None => break,
                     }
                 }
-                GetProgressItem::Done(_) => {
-                    if !connected {
-                        emit_event(json!({ "type": "connect_success" }));
-                    }
-                    emit_line("Direct fetch complete.");
-                    emit_event(json!({ "type": "download_complete", "total": total_size }));
-                    direct_completed = true;
-                    last_err = None;
-                    break;
-                }
-                GetProgressItem::Error(err) => {
-                    emit_line(&format!("Direct fetch error: {err:?}"));
-                    last_err = Some(anyhow!(err));
+                _ = &mut stop_notified => {
+                    user_stopped = true;
                     break;
                 }
             }
+        }
+        if user_stopped {
+            break 'phase2;
         }
         if direct_completed {
             emit_line("Finalizing into destination file.");
@@ -1688,7 +1919,23 @@ async fn run_receive(
         let mut providers_tried = 0u32;
         let mut providers_failed = 0u32;
         let mut downloader_throttle = ProgressThrottle::new();
-        while let Some(item) = stream.next().await {
+        // v0.1.88 — cancellable downloader loop (see the direct-fetch
+        // loop above for the pattern).
+        let stop_notified = stop_signal.notified();
+        tokio::pin!(stop_notified);
+        loop {
+            if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                user_stopped = true;
+                break;
+            }
+            let item = tokio::select! {
+                item = stream.next() => item,
+                _ = &mut stop_notified => {
+                    user_stopped = true;
+                    break;
+                }
+            };
+            let Some(item) = item else { break };
             match item {
                 DownloadProgressItem::TryProvider { id, .. } => {
                     providers_tried += 1;
@@ -1747,6 +1994,10 @@ async fn run_receive(
             }
         }
 
+        if user_stopped {
+            break;
+        }
+
         if let Some(err) = download_error {
             emit_line(&format!(
                 "Download attempt {attempt} failed after trying {} providers ({} failed).",
@@ -1779,6 +2030,15 @@ async fn run_receive(
     }
     }
 
+    // v0.1.88 — user clicked Stop during the download. Exit the
+    // retry loop immediately; `user_stopped` drives the clean-exit
+    // path below. Checked BEFORE the success check because a Stop
+    // mid-Progress leaves last_err == None, which would otherwise
+    // look like success.
+    if user_stopped {
+        break 'phase2;
+    }
+
     // v0.1.86 — Phase 1 cycle is done. Decide whether to retry.
     if last_err.is_none() {
         // Phase 1 succeeded (or direct fetch did) — exit the
@@ -1793,12 +2053,21 @@ async fn run_receive(
         emit_line("Retry loop cancelled by user.");
         break 'phase2;
     }
+    // v0.1.88 — telemetry: classify why Phase 1 failed so the GUI can
+    // explain the wait in plain language.
+    let (fail_code, fail_message) = match &last_err {
+        Some(e) => categorize_receive_failure(&format!("{e}")),
+        None => ("unknown", "Retrying.".to_string()),
+    };
+
     let remaining = phase2_deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         emit_event(json!({
             "type": "download_giving_up",
             "phase2_attempts": phase2_attempt,
             "budget_ms": PHASE2_BUDGET_SECS * 1000,
+            "reason_code": fail_code,
+            "reason": fail_message,
         }));
         emit_line(&format!(
             "Sender unreachable after Phase 2 retry budget ({} s). Giving up.",
@@ -1815,6 +2084,8 @@ async fn run_receive(
         "next_retry_in_ms": sleep_for.as_millis() as u64,
         "time_remaining_ms": remaining.as_millis() as u64,
         "budget_ms": PHASE2_BUDGET_SECS * 1000,
+        "reason_code": fail_code,
+        "reason": fail_message,
     }));
     emit_line(&format!(
         "Sender unreachable. Retry #{} in {} s (Phase 2 budget remaining: {} s).",
@@ -1842,6 +2113,25 @@ async fn run_receive(
 
     }
     // End of 'phase2 loop.
+
+    // v0.1.88 — clean user-initiated stop. Emit a dedicated
+    // `receive_stopped` event (NOT an error) so the GUI shows
+    // "Stopped" instead of "error / exited with code null", and
+    // exit promptly. The partial `.orbitxfer-pieces/` store is
+    // intentionally preserved so Resume Last Receive still works.
+    if user_stopped {
+        emit_event(json!({ "type": "receive_stopped" }));
+        emit_line("Receive stopped by user.");
+        // Best-effort: close the chat too (Stop Receive ends the
+        // whole receive session in v0.1.88; the Reconnect Chat
+        // button covers chat that drops on its own).
+        cmd_dispatch_task.abort();
+        // Flush the partial store to disk (but do NOT remove it) so
+        // the cached chunks survive for Resume Last Receive.
+        let _ = store.shutdown().await;
+        endpoint.close().await;
+        return Ok(());
+    }
 
     if !overall_succeeded {
         if let Some(err) = last_err {
@@ -1922,36 +2212,35 @@ async fn run_receive(
         }
     }
 
-    // v0.1.85 — drop our copy of chat_outbox_tx so its lifetime is
-    // pinned to the cmd_dispatch_task's clone (which holds the chat
-    // open as long as commands can still arrive).
-    drop(chat_outbox_tx);
-
-    // If chat was established, keep the receiver process alive until
-    // either the chat session ends (peer Bye, stream closed) or the
-    // GUI issues StopReceive (which also closes the chat via the
-    // dispatcher). The cmd_dispatch_task is already running in the
-    // background forwarding ChatSend → chat_outbox.
-    if let Some(chat_handle) = chat_handle {
+    // v0.1.88 — keep the receiver process alive after the transfer
+    // completes for as long as a chat session is active. The chat
+    // lifecycle is dynamic now (a dropped session can be replaced by
+    // Reconnect Chat), so instead of awaiting a single fixed
+    // JoinHandle we loop while `chat_active` is true, waking on:
+    //   - chat_ended  → a session ended; re-check chat_active (if a
+    //                    reconnect already set it true again, keep
+    //                    waiting; otherwise exit)
+    //   - stop_signal  → StopReceive
+    //   - ctrl-c
+    // If no chat is active when we arrive here (none ever connected,
+    // or it died and wasn't reconnected), we exit immediately — same
+    // as the pre-v0.1.88 "no chat → exit after transfer" behavior.
+    if chat_active.load(std::sync::atomic::Ordering::SeqCst) {
         emit_event(json!({ "type": "chat_keepalive_started" }));
-        // v0.1.86 — use the Notify signal (replaces v0.1.85's
-        // oneshot). Check the flag first in case StopReceive fired
-        // before we got here.
         let signal = stop_signal.clone();
-        if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
-            // No need to wait — already cancelled.
-        } else {
+        loop {
+            if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            if !chat_active.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
             tokio::select! {
-                join_result = chat_handle => {
-                    let _ = join_result;
+                _ = chat_ended.notified() => {
+                    // Loop and re-check chat_active.
                 }
-                _ = signal.notified() => {
-                    // Dispatcher already pushed Bye + signaled. Drop
-                    // through to shutdown.
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    // ctrl-c — the dispatcher is still running; abort it.
-                }
+                _ = signal.notified() => break,
+                _ = tokio::signal::ctrl_c() => break,
             }
         }
         emit_event(json!({ "type": "chat_keepalive_ended" }));
