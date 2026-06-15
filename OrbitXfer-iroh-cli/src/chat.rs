@@ -1,22 +1,26 @@
-//! Chat protocol (`orbitxfer/chat/1`) — v0.1.85.
+//! Chat protocol (`orbitxfer/chat/1`) — v0.1.85, made bidirectional
+//! and transfer-independent in v0.1.90.
 //!
-//! Implements a small 1:1 chat protocol that runs as a SECOND ALPN
-//! on the same iroh endpoints that already carry the `iroh_blobs`
-//! transfer (sender side) and dial it (receiver side). The two ALPNs
-//! have independent lifetimes: the chat outlives the transfer when
-//! the transfer ends first (which is the common case — the receiver
-//! finishes downloading but stays connected for conversation).
+//! Implements a small 1:1 chat protocol that runs as a SECOND ALPN on
+//! the same iroh endpoints that carry the `iroh_blobs` transfer. As of
+//! v0.1.90 BOTH sides register a `ChatCoordinator` (so either can
+//! accept a dial) AND can dial the other (so either side's Reconnect
+//! Chat re-establishes a dropped session). The chat ALPN's lifetime is
+//! independent of the transfer: chat outlives Stop Send / Stop Receive
+//! and a completed download; the process exits only when chat is
+//! closed (Stop Chat) or the window closes.
 //!
 //! Design highlights:
 //!   - **No PAKE.** Authentication is implicit: only someone with the
-//!     ticket can derive the sender's NodeID and dial it. iroh's QUIC
-//!     TLS layer encrypts the channel.
+//!     ticket can derive the sender's NodeID and dial it; once
+//!     connected, each side knows the other's authenticated id. iroh's
+//!     QUIC TLS layer encrypts the channel.
 //!   - **Length-prefixed JSON frames.** 4-byte big-endian length +
 //!     body. Max 4 KiB body (bounds memory; chat is text).
-//!   - **First-receiver-wins on the sender side.** The first chat
-//!     dialer claims the slot; subsequent dialers are dropped with no
-//!     session opened. The sender's UI only ever shows one
-//!     conversation per session for v0.1.85.
+//!   - **One session at a time.** The session slot is claimed
+//!     atomically when a connection is established (dial OR accept) and
+//!     released when it ends; the loser of a simultaneous-connect race
+//!     closes its connection, so the peers converge on one chat.
 //!   - **Bidirectional message exchange.** After both sides exchange
 //!     `Hello`, either may send `Text` at any time. Either side may
 //!     send `Bye` to close gracefully.
@@ -25,11 +29,13 @@ use anyhow::{anyhow, bail, Result};
 use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
     protocol::{AcceptError, ProtocolHandler},
+    Endpoint, EndpointAddr,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{timeout, Duration};
 
 /// The chat ALPN. Sender's Router accepts it alongside iroh_blobs::ALPN
@@ -79,55 +85,117 @@ pub enum ChatMessage {
     Bye,
 }
 
-/// Sender-side protocol handler. Holds the outbox `Sender<ChatMessage>`
-/// once a chat session establishes, allowing the outer subcommand
-/// (run_send) to push outbound messages without re-entering the
-/// chat-session task.
+/// v0.1.90 — the unified, bidirectional chat coordinator.
+///
+/// Earlier versions split chat into two halves: a sender-side
+/// `ChatProtocol` (accept-only) and a receiver-side manager
+/// (dial-only). v0.1.90 makes chat **symmetric** and **independent of
+/// the transfer**:
+///   - **Both** sides register a `ChatCoordinator` on their Router, so
+///     either peer can ACCEPT an incoming chat dial.
+///   - **Both** sides can DIAL the other — the receiver knows the
+///     sender from the ticket; the sender learns the receiver's
+///     address from the first connection — so either side's Reconnect
+///     Chat button can re-establish a dropped chat.
+///   - Chat **outlives the transfer**: Stop Send / Stop Receive cancel
+///     the transfer but the coordinator (and the process) stay alive
+///     so the conversation continues. The process exits when chat is
+///     closed (Stop Chat) or the window closes (stdin EOF).
+///
+/// One session at a time: the session slot (`active`) is claimed
+/// atomically the moment a connection is established — whether we
+/// dialed or accepted — and released when it ends. If both sides dial
+/// at once, the loser of the claim closes its connection without
+/// opening a session, so the peers converge on a single conversation.
 #[derive(Clone)]
-pub struct ChatProtocol {
-    inner: Arc<ChatProtocolInner>,
+pub struct ChatCoordinator {
+    inner: Arc<CoordInner>,
 }
 
-impl std::fmt::Debug for ChatProtocol {
+impl std::fmt::Debug for ChatCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChatProtocol")
+        f.debug_struct("ChatCoordinator")
             .field("self_label", &self.inner.self_label)
             .finish()
     }
 }
 
-struct ChatProtocolInner {
-    /// `Some(tx)` while a chat session is live; `None` before any
-    /// connection arrives, or after one closes.
-    outbox: Mutex<Option<mpsc::Sender<ChatMessage>>>,
+struct CoordInner {
     /// Label to send in our Hello frame so the peer can render us
     /// with a friendly name.
     self_label: String,
-    /// v0.1.89 — "a chat session is CURRENTLY active" (was a sticky
-    /// "ever used" flag in v0.1.85–88). One-chat-at-a-time: while a
-    /// session is live we reject a second dialer, but when it ends we
-    /// release the slot so the SAME receiver can reconnect (or a
-    /// different one can take over). The old sticky flag permanently
-    /// rejected every reconnect — which is why Reconnect Chat hung on
-    /// "Connecting…" forever.
-    active: Mutex<bool>,
+    /// One-session-at-a-time claim. Set true (atomically) when a
+    /// connection is established — dial-success OR accept — and false
+    /// when the session ends. The CAS loser closes its connection
+    /// without opening a session.
+    active: AtomicBool,
+    /// `Some(tx)` while a chat session is live; `None` otherwise. The
+    /// stdin dispatcher's ChatSend reaches the live session through it.
+    outbox: Mutex<Option<mpsc::Sender<ChatMessage>>>,
+    /// The peer we dial for (re)connection. Seeded on the receiver
+    /// from the ticket (rich addr with relay/direct paths); learned on
+    /// the sender from the first inbound connection. We never overwrite
+    /// a seeded addr with a barer learned one.
+    peer: std::sync::Mutex<Option<EndpointAddr>>,
+    /// A dialer is actively trying to (re)connect right now. Together
+    /// with `ever_connected` this tells the post-transfer keepalive to
+    /// hold the process open while chat is still live or fighting to
+    /// be. Written only by the side's single dialer task.
+    connecting: AtomicBool,
+    /// True once a chat has connected at least once (sticky). Lets the
+    /// keepalive linger for a dropped-but-recoverable chat so Reconnect
+    /// still has a process to run in.
+    ever_connected: AtomicBool,
+    /// Set by Stop Chat: the user closed chat for good. Dialers stop;
+    /// the keepalive stops lingering and the process can exit.
+    user_closed: AtomicBool,
+    /// Pulsed whenever a session ends or the dialer's `connecting`
+    /// state changes — wakes the keepalive (re-checks `should_linger`).
+    chat_ended: Notify,
+    /// Reconnect Chat: dial the peer now (or wake a parked dialer).
+    manual_reconnect: Notify,
 }
 
-impl ChatProtocol {
+/// Result of attempting to run one chat session over a connection.
+enum SessionOutcome {
+    /// A session ran and ended for this reason.
+    Ended(ChatEndReason),
+    /// Another session was already active (CAS lost) — the connection
+    /// was closed without opening a session. Not a failure.
+    Busy,
+    /// We connected but the handshake/session errored — treat as a
+    /// failed attempt (backoff + retry on the auto-dialer).
+    Failed,
+}
+
+impl ChatCoordinator {
     pub fn new(self_label: String) -> Self {
         Self {
-            inner: Arc::new(ChatProtocolInner {
-                outbox: Mutex::new(None),
+            inner: Arc::new(CoordInner {
                 self_label,
-                active: Mutex::new(false),
+                active: AtomicBool::new(false),
+                outbox: Mutex::new(None),
+                peer: std::sync::Mutex::new(None),
+                connecting: AtomicBool::new(false),
+                ever_connected: AtomicBool::new(false),
+                user_closed: AtomicBool::new(false),
+                chat_ended: Notify::new(),
+                manual_reconnect: Notify::new(),
             }),
         }
     }
 
-    /// Queue an outbound text message. The frame is constructed
-    /// here (with the current unix timestamp) and pushed to the
-    /// active chat session's outbox. Returns an error if no chat
-    /// is currently active.
+    /// Seed the peer address (receiver: the sender's ticket addr).
+    /// Does not overwrite an address we already have.
+    pub fn set_peer(&self, addr: EndpointAddr) {
+        let mut p = self.inner.peer.lock().unwrap();
+        if p.is_none() {
+            *p = Some(addr);
+        }
+    }
+
+    /// Queue an outbound text message to the live chat session.
+    /// Returns an error if no chat is currently connected.
     pub async fn send_text(&self, body: String) -> Result<()> {
         if body.len() > MAX_BODY_BYTES {
             bail!("text body too large: {} bytes (max {})", body.len(), MAX_BODY_BYTES);
@@ -147,79 +215,318 @@ impl ChatProtocol {
         Ok(())
     }
 
-    /// Send `Bye` and close the outbound side of the chat. The
-    /// session task will then drain inbound until the peer also
-    /// closes (or times out).
+    /// Stop Chat — close the live session with a `Bye` AND mark chat
+    /// closed for good so the dialers stop and the process can exit.
+    /// (Distinct from Stop Send / Stop Receive, which end only the
+    /// transfer and leave chat alive.)
     pub async fn close(&self) -> Result<()> {
-        let mut outbox = self.inner.outbox.lock().await;
-        let Some(sender) = outbox.take() else {
-            return Ok(());
-        };
-        let _ = sender.send(ChatMessage::Bye).await;
-        // Dropping the sender (out of scope here) signals "no more
-        // outbound messages" to the writer half of the chat session.
+        self.inner.user_closed.store(true, SeqCst);
+        {
+            let outbox = self.inner.outbox.lock().await;
+            if let Some(sender) = outbox.as_ref() {
+                let _ = sender.send(ChatMessage::Bye).await;
+            }
+        }
+        // Wake a parked dialer (so it re-checks user_closed and exits)
+        // and the keepalive (so it re-checks should_linger).
+        self.inner.manual_reconnect.notify_waiters();
+        self.inner.chat_ended.notify_waiters();
         Ok(())
+    }
+
+    /// Reconnect Chat — try to (re)establish a chat session now.
+    pub fn request_reconnect(&self) {
+        self.inner.manual_reconnect.notify_waiters();
+    }
+
+    /// Whether the process should keep lingering for chat after the
+    /// transfer ends. True while a session is live, a dialer is
+    /// trying, or a chat has connected at least once — unless the user
+    /// explicitly closed chat.
+    pub fn should_linger(&self) -> bool {
+        if self.inner.user_closed.load(SeqCst) {
+            return false;
+        }
+        self.inner.active.load(SeqCst)
+            || self.inner.connecting.load(SeqCst)
+            || self.inner.ever_connected.load(SeqCst)
+    }
+
+    /// Await the next chat-lifecycle change (session end / dialer
+    /// state change / Stop Chat). The keepalive races this against a
+    /// periodic tick and ctrl-c.
+    pub async fn wait_ended(&self) {
+        self.inner.chat_ended.notified().await;
+    }
+
+    /// Spawn the receiver-side AUTO-dialer: actively dials the peer,
+    /// runs the session, and self-heals through drops with backoff
+    /// (real drops reconnect quickly; intentional closes wait for a
+    /// manual Reconnect; dial/handshake failures back off to a streak
+    /// cap then wait). Independent of the transfer — it keeps healing
+    /// chat after Stop Receive; it stops only on Stop Chat.
+    pub fn spawn_auto_dialer(&self, endpoint: Endpoint, initial_conn: Option<Connection>) {
+        let inner = self.inner.clone();
+        inner.connecting.store(true, SeqCst);
+        tokio::spawn(async move {
+            const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
+            const MAX_FAIL_STREAK: u32 = 6;
+            let mut pending = initial_conn;
+            let mut first = true;
+            let mut fail_streak: u32 = 0;
+
+            loop {
+                if inner.user_closed.load(SeqCst) {
+                    break;
+                }
+
+                // ---- acquire a connection ----
+                let conn = if let Some(c) = pending.take() {
+                    Some(c)
+                } else {
+                    if !first {
+                        crate::emit_event(json!({ "type": "chat_reconnecting" }));
+                    }
+                    inner.connecting.store(true, SeqCst);
+                    let addr = inner.peer.lock().unwrap().clone();
+                    match addr {
+                        Some(a) => {
+                            match timeout(DIAL_TIMEOUT, endpoint.connect(a, CHAT_ALPN)).await {
+                                Ok(Ok(c)) => Some(c),
+                                Ok(Err(e)) => {
+                                    crate::emit_event(json!({
+                                        "type": if first { "chat_unavailable" } else { "chat_reconnect_failed" },
+                                        "reason": format!("{}", e),
+                                    }));
+                                    None
+                                }
+                                Err(_) => {
+                                    crate::emit_event(json!({
+                                        "type": if first { "chat_unavailable" } else { "chat_reconnect_failed" },
+                                        "reason": "timeout",
+                                    }));
+                                    None
+                                }
+                            }
+                        }
+                        None => None,
+                    }
+                };
+
+                // ---- run the session (or record the failed attempt) ----
+                let outcome = match conn {
+                    Some(c) => run_session_claimed(&inner, c, ChatSide::Receiver).await,
+                    None => SessionOutcome::Failed,
+                };
+                first = false;
+                if inner.user_closed.load(SeqCst) {
+                    break;
+                }
+
+                // ---- decide what to do next ----
+                match outcome {
+                    // Real drop → reconnect quickly (stay "connecting").
+                    SessionOutcome::Ended(r) if r.is_drop() => {
+                        fail_streak = 0;
+                        inner.connecting.store(true, SeqCst);
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            _ = inner.manual_reconnect.notified() => {}
+                        }
+                        continue;
+                    }
+                    // Intentional close (PeerBye / LocalBye) → stop auto-
+                    // dialing; wait for a manual Reconnect.
+                    SessionOutcome::Ended(_) => {
+                        fail_streak = 0;
+                        inner.connecting.store(false, SeqCst);
+                        inner.chat_ended.notify_waiters();
+                        inner.manual_reconnect.notified().await;
+                        continue;
+                    }
+                    // A session is already running via the accept path
+                    // (the sender dialed us). Wait for it to end.
+                    SessionOutcome::Busy => {
+                        inner.connecting.store(false, SeqCst);
+                        inner.chat_ended.notify_waiters();
+                        tokio::select! {
+                            _ = inner.chat_ended.notified() => {}
+                            _ = inner.manual_reconnect.notified() => {}
+                            // Re-check periodically so a missed wake (the
+                            // accept session can end before we register the
+                            // notified() above, in the rare both-sides-dial
+                            // race) can't strand us — we just re-dial.
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        }
+                        continue;
+                    }
+                    // Dial/handshake failed → backoff, then give up to a
+                    // manual Reconnect after the streak cap.
+                    SessionOutcome::Failed => {
+                        fail_streak += 1;
+                        if fail_streak >= MAX_FAIL_STREAK {
+                            crate::emit_event(json!({
+                                "type": "chat_gave_up",
+                                "attempts": fail_streak,
+                            }));
+                            inner.connecting.store(false, SeqCst);
+                            inner.chat_ended.notify_waiters();
+                            inner.manual_reconnect.notified().await;
+                            fail_streak = 0;
+                            continue;
+                        }
+                        let secs = (1u64 << fail_streak.min(5)).min(30);
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
+                            _ = inner.manual_reconnect.notified() => { fail_streak = 0; }
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            inner.connecting.store(false, SeqCst);
+            inner.chat_ended.notify_waiters();
+        });
+    }
+
+    /// Spawn the sender-side MANUAL dialer: it parks until the user
+    /// hits Reconnect Chat, then dials the receiver (learned from the
+    /// first inbound connection). It does NOT auto-dial on drops —
+    /// the receiver's auto-dialer heals those by re-dialing us (which
+    /// our accept path serves) — so the two sides don't fight over who
+    /// dials. Lets the Send side's Reconnect Chat button re-initiate
+    /// chat even when the receiver isn't auto-dialing (e.g. after an
+    /// intentional close).
+    pub fn spawn_manual_dialer(&self, endpoint: Endpoint) {
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
+            loop {
+                inner.manual_reconnect.notified().await;
+                if inner.user_closed.load(SeqCst) {
+                    break;
+                }
+                // Already chatting (or a session is establishing)? The
+                // poke is a harmless no-op.
+                if inner.active.load(SeqCst) {
+                    continue;
+                }
+                let addr = inner.peer.lock().unwrap().clone();
+                let Some(addr) = addr else {
+                    crate::emit_event(json!({
+                        "type": "chat_reconnect_failed",
+                        "reason": "peer not yet known",
+                    }));
+                    continue;
+                };
+                crate::emit_event(json!({ "type": "chat_reconnecting" }));
+                inner.connecting.store(true, SeqCst);
+                match timeout(DIAL_TIMEOUT, endpoint.connect(addr, CHAT_ALPN)).await {
+                    Ok(Ok(c)) => {
+                        let _ = run_session_claimed(&inner, c, ChatSide::Receiver).await;
+                    }
+                    Ok(Err(e)) => {
+                        crate::emit_event(json!({
+                            "type": "chat_reconnect_failed",
+                            "reason": format!("{}", e),
+                        }));
+                    }
+                    Err(_) => {
+                        crate::emit_event(json!({
+                            "type": "chat_reconnect_failed",
+                            "reason": "timeout",
+                        }));
+                    }
+                }
+                inner.connecting.store(false, SeqCst);
+                inner.chat_ended.notify_waiters();
+            }
+        });
     }
 }
 
-impl ProtocolHandler for ChatProtocol {
+/// Claim the single session slot (CAS), learn the peer if unknown,
+/// run one chat session, then release the slot. Used by both the
+/// accept path and the dialers so they share one conversation.
+async fn run_session_claimed(
+    inner: &Arc<CoordInner>,
+    connection: Connection,
+    role: ChatSide,
+) -> SessionOutcome {
+    // One session at a time. The loser of a simultaneous-connect race
+    // closes its connection without opening a session.
+    if inner
+        .active
+        .compare_exchange(false, true, SeqCst, SeqCst)
+        .is_err()
+    {
+        connection.close(0u32.into(), b"chat busy");
+        return SessionOutcome::Busy;
+    }
+
+    // Learn the peer's address if we don't already have one (sender
+    // side). A barer learned addr never overwrites a seeded one.
+    {
+        let mut p = inner.peer.lock().unwrap();
+        if p.is_none() {
+            *p = Some(EndpointAddr::new(connection.remote_id()));
+        }
+    }
+
+    let (tx, rx) = mpsc::channel::<ChatMessage>(64);
+    {
+        *inner.outbox.lock().await = Some(tx);
+    }
+    let result = run_chat_session(connection, role, inner.self_label.clone(), rx).await;
+    {
+        *inner.outbox.lock().await = None;
+    }
+    inner.active.store(false, SeqCst);
+
+    match result {
+        Ok(reason) => {
+            inner.ever_connected.store(true, SeqCst);
+            SessionOutcome::Ended(reason)
+        }
+        Err(e) => {
+            crate::emit_event(json!({
+                "type": "chat_session_error",
+                "error": format!("{}", e),
+            }));
+            SessionOutcome::Failed
+        }
+    }
+}
+
+impl ProtocolHandler for ChatCoordinator {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
         let remote_id = connection.remote_id().to_string();
 
-        // v0.1.89 — one-chat-at-a-time gate. Reject only if a session
-        // is CURRENTLY active (a second concurrent receiver). When the
-        // active session ends the slot is released (see the session
-        // task below), so the same receiver reconnecting — or a
-        // different one taking over after the first left — is
-        // accepted. This replaces v0.1.85's sticky "ever used" flag,
-        // which permanently rejected reconnects.
-        {
-            let mut active = self.inner.active.lock().await;
-            if *active {
-                crate::emit_event(json!({
-                    "type": "chat_attempt_rejected",
-                    "reason": "chat_busy",
-                    "endpoint_id": remote_id,
-                }));
-                connection.close(0u32.into(), b"chat busy");
-                return Ok(());
-            }
-            *active = true;
+        // Fast-path reject if a session is already live (the CAS in
+        // run_session_claimed is the real guard; this avoids spawning
+        // a task we'd immediately tear down and emits a useful event).
+        if self.inner.active.load(SeqCst) {
+            crate::emit_event(json!({
+                "type": "chat_attempt_rejected",
+                "reason": "chat_busy",
+                "endpoint_id": remote_id,
+            }));
+            connection.close(0u32.into(), b"chat busy");
+            return Ok(());
         }
 
-        // Claim the outbox slot.
-        let (outbox_tx, outbox_rx) = mpsc::channel::<ChatMessage>(64);
-        {
-            let mut outbox = self.inner.outbox.lock().await;
-            *outbox = Some(outbox_tx);
-        }
-
-        let self_label = self.inner.self_label.clone();
-        let proto_clone = self.clone();
-
-        // Spawn the chat session as a task so this accept() can
-        // return; the iroh router keeps the connection alive via
-        // the task.
+        let inner = self.inner.clone();
+        // Spawn the session as a task so accept() can return; the iroh
+        // router keeps the connection alive via the task. We use the
+        // accept (server) stream role here.
         tokio::spawn(async move {
-            if let Err(e) =
-                run_chat_session(connection, ChatSide::Sender, self_label, outbox_rx).await
-            {
-                crate::emit_event(json!({
-                    "type": "chat_session_error",
-                    "error": format!("{}", e),
-                }));
-            }
-            // Session ended; clear the outbox so send_text() fails
-            // cleanly if anyone still tries to use it, and release the
-            // active slot so a reconnect is accepted.
-            {
-                let mut outbox = proto_clone.inner.outbox.lock().await;
-                *outbox = None;
-            }
-            {
-                let mut active = proto_clone.inner.active.lock().await;
-                *active = false;
-            }
+            let _ = run_session_claimed(&inner, connection, ChatSide::Sender).await;
+            // Accept path doesn't loop; wake the keepalive so it can
+            // re-evaluate (ever_connected keeps it lingering if a real
+            // chat happened; the receiver's auto-dialer or a manual
+            // Reconnect can re-establish).
+            inner.chat_ended.notify_waiters();
         });
 
         Ok(())

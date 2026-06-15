@@ -16,6 +16,10 @@ type SendStatus =
   | "creating_ticket"
   | "sharing"
   | "complete"
+  // v0.1.90 — clean user-initiated Stop Send. The sidecar stops
+  // serving the file but stays alive for chat (chat outlives the
+  // transfer), so this is distinct from "error" and from "idle".
+  | "stopped"
   | "error";
 type ConnectionMode = "full" | "relay_only" | "direct_only";
 
@@ -481,7 +485,13 @@ function App() {
     const inner = window.innerHeight; // current webview content height (CSS px)
     const chrome = chromeHeightRef.current;
     const MIN_HEIGHT = 420;
-    const SAFETY = 6;
+    // v0.1.90 — bottom headroom. A few px is not enough: the measured
+    // `chrome` delta can under-estimate the real titlebar by a px or two,
+    // and child margins can extend past the container box, both of which
+    // leave content a hair taller than the inner height → a thin
+    // scrollbar even right after a grow. 16px reliably clears it while
+    // staying well inside the shrink deadband (no oscillation).
+    const SAFETY = 16;
 
     let maxHeight = 2400;
     try {
@@ -717,6 +727,12 @@ function App() {
   // transfer — `recvStatus === "complete"` does NOT close the chat
   // panel.
   const [chatStatus, setChatStatus] = useState<ChatStatus>("idle");
+  // v0.1.90 — true after the user clicks Stop Chat (a deliberate
+  // close), so we DON'T offer a Reconnect Chat button afterward — the
+  // sidecar is closing chat for good. Cleared whenever a chat connects
+  // again. (A chat that merely DROPPED leaves this false, so Reconnect
+  // is offered.)
+  const [chatClosedByUser, setChatClosedByUser] = useState(false);
   const [chatPeerLabel, setChatPeerLabel] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessageItem[]>([]);
   const [chatInput, setChatInput] = useState("");
@@ -1264,6 +1280,12 @@ function App() {
             setSendError(`${parsed.stage}: ${parsed.message}`);
             setSendStatus("error");
             break;
+          // v0.1.90 — clean Stop Send. The transfer stops but the
+          // sidecar stays alive for chat; show "Stopped" (not error)
+          // and leave the chat panel live.
+          case "send_stopped":
+            setSendStatus("stopped");
+            break;
           // v0.1.85 — chat events. Same set fires on the receive side
           // listener below; the handler logic is identical, just
           // scoped to whichever sidecar this window is running.
@@ -1272,6 +1294,7 @@ function App() {
               typeof parsed.label === "string" ? parsed.label : "Receiver";
             setChatPeerLabel(label);
             setChatStatus("connected");
+            setChatClosedByUser(false);
             setChatMessages((prev) => [
               ...prev,
               {
@@ -1644,6 +1667,7 @@ function App() {
               typeof parsed.label === "string" ? parsed.label : "Sender";
             setChatPeerLabel(label);
             setChatStatus("connected");
+            setChatClosedByUser(false);
             setChatMessages((prev) => [
               ...prev,
               {
@@ -1926,7 +1950,12 @@ function App() {
     } catch (err) {
       console.error(err);
     }
-    setSendStatus("idle");
+    // v0.1.90 — Stop Send no longer ends the process: it stops serving
+    // the file but the sidecar stays alive for chat. Reflect "stopped"
+    // (the CLI confirms with a `send_stopped` event) rather than
+    // resetting to "idle" — that would hide the live chat's Reconnect
+    // affordance and the stopped state.
+    setSendStatus("stopped");
   }
 
   // ---------- Receive actions ----------
@@ -2131,8 +2160,13 @@ function App() {
     // v0.1.88 (#6) — show "Stopping…" immediately and flag that this
     // exit is user-initiated, so the recv:exit handler shows
     // "Stopped" instead of "error / exited with code null". The CLI
-    // now cancels the in-flight download promptly (no more waiting
-    // for the 5s SIGKILL), and emits `receive_stopped`.
+    // cancels the in-flight download promptly and emits
+    // `receive_stopped`.
+    //
+    // v0.1.90 — Stop Receive no longer ends the process: it cancels
+    // the download but the sidecar stays alive for chat (chat outlives
+    // the transfer). The recv:exit handler fires only later, when chat
+    // closes or the window is closed.
     recvStoppingRef.current = true;
     setRecvStatus("stopping");
     setRecvRetryInfo(null);
@@ -2185,6 +2219,9 @@ function App() {
     // Optimistically reflect the close locally; the sidecar will also
     // emit `chat_disconnected` which will overwrite this.
     setChatStatus("disconnected");
+    // v0.1.90 — deliberate close: suppress the Reconnect Chat button
+    // (the sidecar closes chat for good and the process may exit).
+    setChatClosedByUser(true);
   }
 
   // v0.1.88 (#8/#9) — re-dial a dropped chat. Works while the receive
@@ -2271,6 +2308,23 @@ function App() {
     sendStatus === "creating_ticket" ||
     sendStatus === "sharing" ||
     sendStatus === "complete";
+
+  // v0.1.90 — is a sidecar that can host chat still alive? Chat now
+  // outlives the transfer (Stop Send / Stop Receive keep the process
+  // up), so Reconnect Chat is offered whenever the process is alive on
+  // EITHER side — including after a Stop — not just mid-download. Used
+  // to gate the Reconnect Chat button. Excludes idle/error (process
+  // gone) and the pre-serving/pre-connect states.
+  const chatProcessAlive =
+    mode === "receive"
+      ? recvStatus === "downloading" ||
+        recvStatus === "waiting_for_sender" ||
+        recvStatus === "exporting" ||
+        recvStatus === "complete" ||
+        recvStatus === "stopped"
+      : sendStatus === "sharing" ||
+        sendStatus === "complete" ||
+        sendStatus === "stopped";
 
   // Pick which ticket variant to put in the share line based on the
   // selected connection mode. The CLI emits all three variants (full /
@@ -3134,15 +3188,17 @@ function App() {
                 {chatStatus === "disconnected" && "Disconnected"}
                 {chatStatus === "unavailable" && "Unavailable"}
               </span>
-              {/* v0.1.88 (#8/#9) — Reconnect Chat appears when the chat
-                  has dropped but the receive process is still alive
-                  (mid-download or waiting for the sender to return).
-                  One click re-dials the chat ALPN. */}
+              {/* v0.1.88/90 — Reconnect Chat appears when the chat has
+                  dropped but a sidecar that can host chat is still
+                  alive. v0.1.90 makes this BIDIRECTIONAL and
+                  STOP-independent: it shows on BOTH the Send and
+                  Receive sides, and stays available after Stop Send /
+                  Stop Receive (chat outlives the transfer). One click
+                  re-dials the peer's chat ALPN. */}
               {(chatStatus === "disconnected" ||
                 chatStatus === "unavailable") &&
-                mode === "receive" &&
-                (recvStatus === "downloading" ||
-                  recvStatus === "waiting_for_sender") && (
+                chatProcessAlive &&
+                !chatClosedByUser && (
                   <button
                     onClick={reconnectChat}
                     className="ghost-button"

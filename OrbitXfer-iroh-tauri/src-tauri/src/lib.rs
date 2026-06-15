@@ -754,20 +754,21 @@ async fn start_send(
     )
 }
 
-/// v0.1.85 — graceful stop. Writes `OX_CMD {"type":"stop_send"}` to
-/// the sidecar's stdin (the CLI's stdin command parser handles the
-/// graceful shutdown: closes any active chat with Bye, exits). After
-/// `GRACEFUL_STOP_TIMEOUT_MS`, if the child is still in the slot, we
-/// fall back to SIGKILL so an unresponsive sidecar can't hang
-/// the UI forever.
+/// v0.1.85/90 — stop sending. Writes `OX_CMD {"type":"stop_send"}` to
+/// the sidecar's stdin.
+///
+/// v0.1.90 — chat is INDEPENDENT of the transfer, so Stop Send no
+/// longer ends the process: the sidecar stops serving the file but
+/// stays alive for chat. We therefore do NOT force-kill it here — that
+/// would tear down the conversation the user wants to keep. The
+/// sidecar exits on its own when chat is closed (Stop Chat) or the
+/// window closes (stdin EOF, handled in the CLI).
 #[tauri::command]
 async fn stop_send(
-    app: AppHandle,
     window: WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     write_ox_cmd(&state, window.label(), Slot::Send, r#"{"type":"stop_send"}"#)?;
-    schedule_graceful_kill_fallback(app, window.label().to_string(), Slot::Send);
     Ok(())
 }
 
@@ -797,15 +798,15 @@ async fn start_receive(
     )
 }
 
-/// v0.1.85 — graceful stop, same pattern as `stop_send`.
+/// v0.1.85/90 — stop receiving, same independent-chat pattern as
+/// `stop_send`. Cancels the download; the sidecar stays alive for chat
+/// (no force-kill). It exits on Stop Chat or window close.
 #[tauri::command]
 async fn stop_receive(
-    app: AppHandle,
     window: WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     write_ox_cmd(&state, window.label(), Slot::Recv, r#"{"type":"stop_receive"}"#)?;
-    schedule_graceful_kill_fallback(app, window.label().to_string(), Slot::Recv);
     Ok(())
 }
 
@@ -849,12 +850,6 @@ async fn reconnect_chat(
 ) -> Result<(), String> {
     write_ox_cmd_to_active_chat_slot(&state, window.label(), r#"{"type":"reconnect_chat"}"#)
 }
-
-/// Milliseconds the GUI waits for a graceful shutdown after writing
-/// an `OX_CMD stop_*` line before falling back to SIGKILL. Five
-/// seconds is generous: the sidecar's chat close (Bye + drain) is
-/// sub-second; the safety net catches genuinely hung processes.
-const GRACEFUL_STOP_TIMEOUT_MS: u64 = 5_000;
 
 /// Write a single `OX_CMD <line>\n` to the given slot's sidecar
 /// stdin. Returns Ok(()) if the slot is empty (no sidecar running —
@@ -911,38 +906,6 @@ fn write_ox_cmd_to_active_chat_slot(
         return Ok(());
     }
     Ok(())
-}
-
-/// After a graceful-stop OX_CMD has been sent, spawn a background
-/// task that waits GRACEFUL_STOP_TIMEOUT_MS and force-kills the
-/// sidecar if it's still in its slot. Keeps the UI responsive even
-/// when a sidecar is wedged.
-fn schedule_graceful_kill_fallback(app: AppHandle, label: String, slot: Slot) {
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(
-            GRACEFUL_STOP_TIMEOUT_MS,
-        ))
-        .await;
-        let Some(state) = app.try_state::<AppState>() else {
-            return;
-        };
-        let stuck_child = {
-            let Ok(mut guard) = state.windows.lock() else {
-                return;
-            };
-            let Some(ws) = guard.get_mut(&label) else {
-                return;
-            };
-            slot.pick(ws).take()
-        };
-        if let Some(child) = stuck_child {
-            eprintln!(
-                "[stop_{:?}] sidecar still alive after {}ms — falling back to SIGKILL",
-                slot, GRACEFUL_STOP_TIMEOUT_MS
-            );
-            let _ = child.kill();
-        }
-    });
 }
 
 /// v0.1.86 — Check the available disk space at a given path. Used by
@@ -1103,12 +1066,16 @@ pub fn run() {
 
                     api.prevent_close();
 
-                    // Single uniform message — the softer "may be in progress"
+                    // Single uniform message — the softer "may be active"
                     // wording matches the quit-dialog style and avoids overstating
                     // certainty about the in-flight state of the sidecar.
+                    //
+                    // v0.1.90 — an occupied slot can now mean a live CHAT
+                    // (the process outlives a stopped transfer), so the copy
+                    // covers both.
                     let _ = active_kinds; // (intentionally unused with unified copy)
-                    let body = "A transfer may be in progress. Closing this \
-                                window will stop the transfer. Close anyway?";
+                    let body = "A transfer or chat may be active. Closing this \
+                                window will end it. Close anyway?";
 
                     let window_clone = window.clone();
                     let label_clone = label.clone();
