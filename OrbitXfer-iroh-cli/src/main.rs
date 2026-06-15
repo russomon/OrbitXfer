@@ -43,7 +43,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.88";
+const CLI_VERSION: &str = "0.1.89";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -763,41 +763,187 @@ fn categorize_receive_failure(err_text: &str) -> (&'static str, String) {
     }
 }
 
-/// v0.1.88 (#8/#9) — launch a receiver-side chat session and track its
-/// liveness so Reconnect Chat can replace a dropped session and the
-/// post-transfer keepalive can tell whether any chat is still active.
-///
-/// Sets the shared `current_outbox` to the new session's sender (so
-/// the stdin dispatcher's ChatSend goes to the latest session),
-/// flips `chat_active` true, and spawns the session. When the session
-/// ends, flips `chat_active` false and fires `chat_ended` so the
-/// keepalive loop can re-evaluate.
-async fn launch_receiver_chat(
-    conn: iroh::endpoint::Connection,
-    label: String,
+/// Shared handles the receiver-side chat manager coordinates with the
+/// rest of `run_receive`.
+#[derive(Clone)]
+struct ChatManagerHandles {
+    /// The active session's inbound sender, so the stdin dispatcher's
+    /// ChatSend reaches the latest session. None when not connected.
     current_outbox: std::sync::Arc<
         tokio::sync::Mutex<Option<tokio::sync::mpsc::Sender<chat::ChatMessage>>>,
     >,
+    /// "connected, or actively auto-reconnecting after a drop" — the
+    /// post-transfer keepalive watches this to decide whether to
+    /// linger. Goes false when chat is intentionally closed or the
+    /// manager has given up (then the keepalive lets the process
+    /// exit).
     chat_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Pulsed whenever `chat_active` goes false, to wake the keepalive.
     chat_ended: std::sync::Arc<tokio::sync::Notify>,
+    /// Set by StopReceive — tells the manager to stop for good.
+    user_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Poked by the Reconnect Chat button: try a connection NOW
+    /// (shortcuts a backoff sleep, or wakes a manual-wait).
+    manual_reconnect: std::sync::Arc<tokio::sync::Notify>,
+    /// StopReceive's notify, so the manager's sleeps end promptly.
+    stop_signal: std::sync::Arc<tokio::sync::Notify>,
+}
+
+/// v0.1.89 (#8/#9, Theme B) — spawn the receiver-side chat manager: a
+/// single long-lived task that owns the chat lifecycle, including
+/// reconnection. It self-heals through sender bounces:
+///   - a real DROP (stream closed / send error) auto-reconnects with
+///     exponential backoff,
+///   - an intentional close (either side's Bye) does NOT auto-
+///     reconnect, but stays available for a manual Reconnect Chat,
+///   - dial/handshake failures retry with backoff up to a streak cap,
+///     then wait for a manual Reconnect.
+///
+/// `chat_active` reflects "connected or auto-reconnecting" so the
+/// post-transfer keepalive holds the process open only while chat is
+/// genuinely live (or fighting to be); it's released the moment chat
+/// is intentionally closed or the manager gives up.
+fn spawn_receiver_chat_manager(
+    endpoint: Endpoint,
+    addr: EndpointAddr,
+    label: String,
+    initial_conn: Option<iroh::endpoint::Connection>,
+    h: ChatManagerHandles,
 ) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<chat::ChatMessage>(64);
-    {
-        let mut slot = current_outbox.lock().await;
-        *slot = Some(tx);
-    }
-    chat_active.store(true, std::sync::atomic::Ordering::SeqCst);
+    use std::sync::atomic::Ordering::SeqCst;
+    const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
+    const MAX_FAIL_STREAK: u32 = 6;
+
+    // Lifecycle starts "alive" so the keepalive doesn't exit while we
+    // get the first connection up.
+    h.chat_active.store(true, SeqCst);
+
     tokio::spawn(async move {
-        if let Err(e) =
-            chat::run_chat_session(conn, chat::ChatSide::Receiver, label, rx).await
-        {
-            emit_event(json!({
-                "type": "chat_session_error",
-                "error": format!("{}", e),
-            }));
+        let mut pending = initial_conn;
+        let mut first = true;
+        let mut fail_streak: u32 = 0;
+
+        loop {
+            if h.user_closed.load(SeqCst) {
+                break;
+            }
+
+            // ---- Acquire a connection ----
+            let conn = if let Some(c) = pending.take() {
+                Some(c)
+            } else {
+                if !first {
+                    emit_event(json!({ "type": "chat_reconnecting" }));
+                }
+                h.chat_active.store(true, SeqCst);
+                match timeout(DIAL_TIMEOUT, endpoint.connect(addr.clone(), chat::CHAT_ALPN))
+                    .await
+                {
+                    Ok(Ok(c)) => Some(c),
+                    Ok(Err(e)) => {
+                        emit_event(json!({
+                            "type": if first { "chat_unavailable" } else { "chat_reconnect_failed" },
+                            "reason": format!("{}", e),
+                        }));
+                        None
+                    }
+                    Err(_) => {
+                        emit_event(json!({
+                            "type": if first { "chat_unavailable" } else { "chat_reconnect_failed" },
+                            "reason": "timeout",
+                        }));
+                        None
+                    }
+                }
+            };
+
+            // ---- Run the session (or record the failed attempt) ----
+            let outcome: Option<chat::ChatEndReason> = match conn {
+                Some(c) => {
+                    fail_streak = 0;
+                    let (tx, rx) = tokio::sync::mpsc::channel::<chat::ChatMessage>(64);
+                    {
+                        *h.current_outbox.lock().await = Some(tx);
+                    }
+                    let r = chat::run_chat_session(c, chat::ChatSide::Receiver, label.clone(), rx)
+                        .await;
+                    {
+                        *h.current_outbox.lock().await = None;
+                    }
+                    match r {
+                        Ok(reason) => Some(reason),
+                        Err(e) => {
+                            // Handshake failed (e.g. sender rejected /
+                            // went offline mid-handshake). Treat as a
+                            // failed attempt → backoff retry.
+                            emit_event(json!({
+                                "type": "chat_reconnect_failed",
+                                "reason": format!("{}", e),
+                            }));
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            first = false;
+
+            if h.user_closed.load(SeqCst) {
+                break;
+            }
+
+            // ---- Decide what to do next ----
+            match outcome {
+                // Real drop → auto-reconnect quickly.
+                Some(r) if r.is_drop() => {
+                    // chat_active stays true (we're actively healing).
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        _ = h.manual_reconnect.notified() => {}
+                        _ = h.stop_signal.notified() => break,
+                    }
+                    continue;
+                }
+                // Intentional close (PeerBye / LocalBye). Don't auto-
+                // reconnect; release the keepalive and wait for either
+                // a manual Reconnect or StopReceive.
+                Some(_) => {
+                    h.chat_active.store(false, SeqCst);
+                    h.chat_ended.notify_waiters();
+                    tokio::select! {
+                        _ = h.manual_reconnect.notified() => { continue; }
+                        _ = h.stop_signal.notified() => break,
+                    }
+                }
+                // Dial/handshake failed.
+                None => {
+                    fail_streak += 1;
+                    if fail_streak >= MAX_FAIL_STREAK {
+                        emit_event(json!({
+                            "type": "chat_gave_up",
+                            "attempts": fail_streak,
+                        }));
+                        h.chat_active.store(false, SeqCst);
+                        h.chat_ended.notify_waiters();
+                        tokio::select! {
+                            _ = h.manual_reconnect.notified() => { fail_streak = 0; continue; }
+                            _ = h.stop_signal.notified() => break,
+                        }
+                    } else {
+                        let secs = (1u64 << fail_streak.min(5)).min(30);
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
+                            _ = h.manual_reconnect.notified() => { fail_streak = 0; }
+                            _ = h.stop_signal.notified() => break,
+                        }
+                        continue;
+                    }
+                }
+            }
         }
-        chat_active.store(false, std::sync::atomic::Ordering::SeqCst);
-        chat_ended.notify_waiters();
+
+        h.chat_active.store(false, SeqCst);
+        h.chat_ended.notify_waiters();
     });
 }
 
@@ -1497,79 +1643,57 @@ async fn run_receive(
         }
     }
 
-    // v0.1.85/88 — open a separate connection on the chat ALPN. This
-    // is best-effort: a chat failure does NOT block the transfer.
+    // v0.1.85/88/89 — chat over the separate `orbitxfer/chat/1` ALPN.
+    // Best-effort: a chat failure never blocks the transfer.
     //
-    // v0.1.88 (#8/#9) — the chat lifecycle is now DYNAMIC: the
-    // initial session can be replaced by a Reconnect Chat command if
-    // it drops (e.g. the sender bounced during a Phase 2 retry).
-    // Shared state:
-    //   - current_outbox: the active session's inbound sender, so
-    //     the stdin dispatcher's ChatSend always reaches the latest
-    //     session.
-    //   - chat_active: true while any chat session is live; the
-    //     post-transfer keepalive uses it to decide whether to
-    //     linger.
-    //   - chat_ended: pulsed when a session ends, to wake the
-    //     keepalive for re-evaluation.
+    // v0.1.89 (Theme B) — the chat lifecycle is owned by a single
+    // long-lived manager task (spawn_receiver_chat_manager) that
+    // self-heals through sender bounces: real drops auto-reconnect
+    // with backoff; intentional closes wait for a manual Reconnect.
+    // We share a small set of handles with the dispatcher + keepalive.
     let chat_self_label = std::env::var("ORBITXFER_RECEIVER_LABEL")
         .ok()
         .map(|s| sanitize_label_text(&s))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Receiver".to_string());
-    let current_outbox: std::sync::Arc<
-        tokio::sync::Mutex<Option<tokio::sync::mpsc::Sender<chat::ChatMessage>>>,
-    > = std::sync::Arc::new(tokio::sync::Mutex::new(None));
-    let chat_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let chat_ended = std::sync::Arc::new(tokio::sync::Notify::new());
 
-    match timeout(
-        Duration::from_secs(8),
-        endpoint.connect(ticket_addr.clone(), chat::CHAT_ALPN),
-    )
-    .await
-    {
-        Ok(Ok(chat_conn)) => {
-            emit_line("Chat ALPN connected.");
-            launch_receiver_chat(
-                chat_conn,
-                chat_self_label.clone(),
-                current_outbox.clone(),
-                chat_active.clone(),
-                chat_ended.clone(),
-            )
-            .await;
-        }
-        Ok(Err(err)) => {
-            emit_event(json!({
-                "type": "chat_unavailable",
-                "reason": format!("{}", err),
-            }));
-        }
-        Err(_) => {
-            emit_event(json!({
-                "type": "chat_unavailable",
-                "reason": "timeout",
-            }));
-        }
-    };
-
-    // v0.1.85/86/88 — spawn the stdin command dispatcher. Runs in
-    // parallel with the download so ChatSend flows immediately. It
-    // owns the shared chat state so it can service ChatSend / ChatStop
-    // / ReconnectChat against the LATEST session, and signals
-    // StopReceive via the Notify + AtomicBool (which the cancellable
-    // download loops and the keepalive both watch).
+    // Shared stop signalling (used by the cancellable download loops,
+    // the keepalive, and the chat manager). Declared here so the chat
+    // manager can take a clone.
     let stop_signal = std::sync::Arc::new(tokio::sync::Notify::new());
     let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let chat_handles = ChatManagerHandles {
+        current_outbox: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        chat_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        chat_ended: std::sync::Arc::new(tokio::sync::Notify::new()),
+        user_closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        manual_reconnect: std::sync::Arc::new(tokio::sync::Notify::new()),
+        stop_signal: stop_signal.clone(),
+    };
+    // Keep convenient aliases for the rest of run_receive.
+    let chat_active = chat_handles.chat_active.clone();
+    let chat_ended = chat_handles.chat_ended.clone();
+
+    // The manager dials the initial chat connection itself (first
+    // attempt → chat_unavailable on failure; later attempts →
+    // chat_reconnect_failed). Runs concurrently with the download.
+    spawn_receiver_chat_manager(
+        endpoint.clone(),
+        ticket_addr.clone(),
+        chat_self_label.clone(),
+        None,
+        chat_handles.clone(),
+    );
+
+    // v0.1.85/86/88/89 — spawn the stdin command dispatcher. Services
+    // ChatSend / ChatStop / ReconnectChat against the manager's shared
+    // state, and signals StopReceive via the stop Notify + AtomicBool.
     let stop_signal_for_dispatch = stop_signal.clone();
     let stop_requested_for_dispatch = stop_requested.clone();
-    let dispatch_endpoint = endpoint.clone();
-    let dispatch_addr = ticket_addr.clone();
-    let dispatch_label = chat_self_label.clone();
-    let dispatch_outbox = current_outbox.clone();
-    let dispatch_active = chat_active.clone();
-    let dispatch_ended = chat_ended.clone();
+    let dispatch_outbox = chat_handles.current_outbox.clone();
+    let dispatch_user_closed = chat_handles.user_closed.clone();
+    let dispatch_manual_reconnect = chat_handles.manual_reconnect.clone();
     let cmd_dispatch_task = tokio::spawn(async move {
         let mut cmd_rx = cmd_rx;
         while let Some(cmd) = cmd_rx.recv().await {
@@ -1607,43 +1731,12 @@ async fn run_receive(
                     }
                 }
                 chat::CliCommand::ReconnectChat => {
-                    // v0.1.88 — re-dial the chat ALPN to the same
-                    // sender. Only meaningful while the process is
-                    // alive (download / waiting / keepalive).
-                    if dispatch_active.load(std::sync::atomic::Ordering::SeqCst) {
-                        // A chat is already live; nothing to do.
-                        continue;
-                    }
-                    emit_event(json!({ "type": "chat_reconnecting" }));
-                    match timeout(
-                        Duration::from_secs(8),
-                        dispatch_endpoint.connect(dispatch_addr.clone(), chat::CHAT_ALPN),
-                    )
-                    .await
-                    {
-                        Ok(Ok(conn)) => {
-                            launch_receiver_chat(
-                                conn,
-                                dispatch_label.clone(),
-                                dispatch_outbox.clone(),
-                                dispatch_active.clone(),
-                                dispatch_ended.clone(),
-                            )
-                            .await;
-                        }
-                        Ok(Err(err)) => {
-                            emit_event(json!({
-                                "type": "chat_reconnect_failed",
-                                "reason": format!("{}", err),
-                            }));
-                        }
-                        Err(_) => {
-                            emit_event(json!({
-                                "type": "chat_reconnect_failed",
-                                "reason": "timeout",
-                            }));
-                        }
-                    }
+                    // v0.1.89 — poke the chat manager to try a
+                    // connection now. The manager owns all the dial /
+                    // backoff / session logic; it shortcuts a backoff
+                    // sleep or wakes from a manual-wait. If a session
+                    // is already live, the poke is harmlessly ignored.
+                    dispatch_manual_reconnect.notify_waiters();
                 }
                 chat::CliCommand::StopReceive => {
                     let slot = dispatch_outbox.lock().await;
@@ -1651,6 +1744,11 @@ async fn run_receive(
                         let _ = tx.send(chat::ChatMessage::Bye).await;
                     }
                     drop(slot);
+                    // v0.1.89 — tell the chat manager to stop for good,
+                    // then signal the download/keepalive to exit.
+                    dispatch_user_closed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    dispatch_manual_reconnect.notify_waiters();
                     stop_requested_for_dispatch
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                     stop_signal_for_dispatch.notify_waiters();

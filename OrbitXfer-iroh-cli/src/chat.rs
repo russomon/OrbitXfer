@@ -98,17 +98,19 @@ impl std::fmt::Debug for ChatProtocol {
 
 struct ChatProtocolInner {
     /// `Some(tx)` while a chat session is live; `None` before any
-    /// connection arrives, or after one closes (first-receiver-wins
-    /// means the slot doesn't refill — subsequent dialers get
-    /// rejected).
+    /// connection arrives, or after one closes.
     outbox: Mutex<Option<mpsc::Sender<ChatMessage>>>,
     /// Label to send in our Hello frame so the peer can render us
     /// with a friendly name.
     self_label: String,
-    /// Sticky "this slot has ever been used" flag. First-receiver-
-    /// wins means we DON'T accept new chats after the first one
-    /// closes — even if outbox is None again, we reject.
-    used: Mutex<bool>,
+    /// v0.1.89 — "a chat session is CURRENTLY active" (was a sticky
+    /// "ever used" flag in v0.1.85–88). One-chat-at-a-time: while a
+    /// session is live we reject a second dialer, but when it ends we
+    /// release the slot so the SAME receiver can reconnect (or a
+    /// different one can take over). The old sticky flag permanently
+    /// rejected every reconnect — which is why Reconnect Chat hung on
+    /// "Connecting…" forever.
+    active: Mutex<bool>,
 }
 
 impl ChatProtocol {
@@ -117,22 +119,9 @@ impl ChatProtocol {
             inner: Arc::new(ChatProtocolInner {
                 outbox: Mutex::new(None),
                 self_label,
-                used: Mutex::new(false),
+                active: Mutex::new(false),
             }),
         }
-    }
-
-    /// True if there's a live chat session right now.
-    pub async fn is_active(&self) -> bool {
-        self.inner.outbox.lock().await.is_some()
-    }
-
-    /// True if a chat has ever been opened in this session (even if
-    /// it has since closed). Used by the receiver-side wait-for-exit
-    /// logic to distinguish "no chat ever happened" from "chat was
-    /// here but closed".
-    pub async fn has_been_used(&self) -> bool {
-        *self.inner.used.lock().await
     }
 
     /// Queue an outbound text message. The frame is constructed
@@ -177,22 +166,25 @@ impl ProtocolHandler for ChatProtocol {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
         let remote_id = connection.remote_id().to_string();
 
-        // First-receiver-wins gate. If this slot has ever been used
-        // (whether or not the session is currently live), drop the
-        // new dialer. v0.1.85 spec: subsequent receivers can still
-        // download the file but don't get a chat panel.
+        // v0.1.89 — one-chat-at-a-time gate. Reject only if a session
+        // is CURRENTLY active (a second concurrent receiver). When the
+        // active session ends the slot is released (see the session
+        // task below), so the same receiver reconnecting — or a
+        // different one taking over after the first left — is
+        // accepted. This replaces v0.1.85's sticky "ever used" flag,
+        // which permanently rejected reconnects.
         {
-            let mut used = self.inner.used.lock().await;
-            if *used {
+            let mut active = self.inner.active.lock().await;
+            if *active {
                 crate::emit_event(json!({
                     "type": "chat_attempt_rejected",
-                    "reason": "first_receiver_wins",
+                    "reason": "chat_busy",
                     "endpoint_id": remote_id,
                 }));
                 connection.close(0u32.into(), b"chat busy");
                 return Ok(());
             }
-            *used = true;
+            *active = true;
         }
 
         // Claim the outbox slot.
@@ -218,9 +210,16 @@ impl ProtocolHandler for ChatProtocol {
                 }));
             }
             // Session ended; clear the outbox so send_text() fails
-            // cleanly if anyone still tries to use it.
-            let mut outbox = proto_clone.inner.outbox.lock().await;
-            *outbox = None;
+            // cleanly if anyone still tries to use it, and release the
+            // active slot so a reconnect is accepted.
+            {
+                let mut outbox = proto_clone.inner.outbox.lock().await;
+                *outbox = None;
+            }
+            {
+                let mut active = proto_clone.inner.active.lock().await;
+                *active = false;
+            }
         });
 
         Ok(())
@@ -256,12 +255,38 @@ impl ChatSide {
 ///   - `chat_send_failed` (error) — on write failure
 ///   - `chat_disconnected` — on graceful close (Bye received) or
 ///     stream end
+/// v0.1.89 — why a chat session ended. The receiver-side chat manager
+/// uses this to decide whether to auto-reconnect: a real DROP
+/// (`StreamClosed` / `SendError`) self-heals with backoff, while an
+/// intentional `PeerBye` / `LocalBye` does not (the chat was closed on
+/// purpose; the user can still hit Reconnect Chat manually).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatEndReason {
+    /// The peer sent a Bye frame (they closed chat).
+    PeerBye,
+    /// We sent a Bye frame (this side closed chat — Stop Chat / Stop
+    /// Receive, or the outbox was dropped).
+    LocalBye,
+    /// The stream ended without a Bye (EOF / connection lost) — a
+    /// drop, e.g. the sender bounced. Reconnectable.
+    StreamClosed,
+    /// An outbound write failed. Reconnectable.
+    SendError,
+}
+
+impl ChatEndReason {
+    /// True for the reasons the manager should auto-reconnect on.
+    pub fn is_drop(self) -> bool {
+        matches!(self, ChatEndReason::StreamClosed | ChatEndReason::SendError)
+    }
+}
+
 pub async fn run_chat_session(
     connection: Connection,
     side: ChatSide,
     self_label: String,
     mut outbox_rx: mpsc::Receiver<ChatMessage>,
-) -> Result<()> {
+) -> Result<ChatEndReason> {
     let remote_id = connection.remote_id().to_string();
 
     // Open or accept the bidirectional stream depending on which
@@ -318,7 +343,7 @@ pub async fn run_chat_session(
     // directions lets us close the loop the moment Bye flows in
     // either direction.
     let mut we_sent_bye = false;
-    loop {
+    let reason: ChatEndReason = loop {
         tokio::select! {
             // Outbound: pull from the GUI-driven outbox.
             outbound = outbox_rx.recv() => {
@@ -330,11 +355,11 @@ pub async fn run_chat_session(
                                 "type": "chat_send_failed",
                                 "error": format!("{}", e),
                             }));
-                            break;
+                            break ChatEndReason::SendError;
                         }
                         if is_bye {
                             we_sent_bye = true;
-                            break;
+                            break ChatEndReason::LocalBye;
                         }
                     }
                     None => {
@@ -344,7 +369,7 @@ pub async fn run_chat_session(
                         if !we_sent_bye {
                             let _ = send_frame(&mut send, &ChatMessage::Bye).await;
                         }
-                        break;
+                        break ChatEndReason::LocalBye;
                     }
                 }
             }
@@ -368,7 +393,7 @@ pub async fn run_chat_session(
                         if !we_sent_bye {
                             let _ = send_frame(&mut send, &ChatMessage::Bye).await;
                         }
-                        break;
+                        break ChatEndReason::PeerBye;
                     }
                     Err(e) => {
                         let msg = format!("{}", e);
@@ -381,12 +406,12 @@ pub async fn run_chat_session(
                                 "error": msg,
                             }));
                         }
-                        break;
+                        break ChatEndReason::StreamClosed;
                     }
                 }
             }
         }
-    }
+    };
 
     // Close our write side so the peer's stream read returns EOF.
     let _ = send.finish();
@@ -394,9 +419,10 @@ pub async fn run_chat_session(
     crate::emit_event(json!({
         "type": "chat_disconnected",
         "endpoint_id": remote_id,
+        "reason": format!("{:?}", reason),
     }));
 
-    Ok(())
+    Ok(reason)
 }
 
 // ----------------------------------------------------------------

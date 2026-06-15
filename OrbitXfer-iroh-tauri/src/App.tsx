@@ -1,12 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { open, save, ask } from "@tauri-apps/plugin-dialog";
-import {
-  getCurrentWindow,
-  currentMonitor,
-  LogicalSize,
-} from "@tauri-apps/api/window";
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { downloadDir } from "@tauri-apps/api/path";
 import { platform } from "@tauri-apps/plugin-os";
@@ -437,67 +433,104 @@ function App() {
     return () => mq.removeEventListener("change", handler);
   }, [themePref]);
 
-  // v0.1.87 — auto-fit the window to its content height (see the
-  // containerRef comment above). The ResizeObserver fires whenever
-  // the content's rendered height changes — which is exactly the
-  // major transitions we care about (ticket appears, chat opens,
-  // mode switch, retry panel). We debounce briefly so a burst of
-  // layout changes coalesces into one resize, and clamp to a
-  // minimum and an approximate monitor work-area maximum.
+  // v0.1.89 — measure the window chrome height ONCE (outer − inner,
+  // in logical px) so `fitWindow` can compensate for the titlebar.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const w = getCurrentWindow();
+        const scale = await w.scaleFactor();
+        const outer = await w.outerSize();
+        const inner = await w.innerSize();
+        const delta = (outer.height - inner.height) / scale;
+        // Guard against nonsense (negative / absurd) readings.
+        chromeHeightRef.current = delta > 0 && delta < 120 ? delta : 28;
+      } catch {
+        chromeHeightRef.current = 28; // macOS titlebar fallback
+      }
+    })();
+  }, []);
+
+  // v0.1.89 — resize the window so ALL content fits without scrolling.
+  // Robust rewrite of v0.1.87's auto-fit:
+  //   - target = content height + chrome (titlebar) + small margin,
+  //     so the bottom never gets clipped under the titlebar.
+  //   - max bound from window.screen.availHeight (synchronous,
+  //     already excludes the macOS menu bar + Dock) instead of the
+  //     flaky async currentMonitor().
+  //   - width left untouched (only height flexes).
+  // Called from the ResizeObserver AND explicitly on key state
+  // transitions (below), since content appears in waves.
+  // v0.1.89 (revised) — DEADBAND fit. The earlier "measure once and
+  // setSize" approach raced with content that renders in waves (the
+  // share-ticket textarea, receivers, logs appear after the
+  // ticket_variants event), leaving the window short for seconds.
+  // This version:
+  //   - GROWS the moment the content overflows the current inner
+  //     (webview) height,
+  //   - SHRINKS only when there's clearly excess empty space,
+  //   - does NOTHING inside a deadband — which also absorbs the
+  //     ambiguity of whether setSize targets the inner or outer size
+  //     (the titlebar's worth of px), so there's no oscillation.
+  // Run from the ResizeObserver (snappy) AND a low-frequency interval
+  // (bulletproof catch-up regardless of render timing).
+  const fitWindow = useCallback(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const content = Math.ceil(el.getBoundingClientRect().height);
+    const inner = window.innerHeight; // current webview content height (CSS px)
+    const chrome = chromeHeightRef.current;
+    const MIN_HEIGHT = 420;
+    const SAFETY = 6;
+
+    let maxHeight = 2400;
+    try {
+      const avail = window.screen?.availHeight;
+      if (typeof avail === "number" && avail > 200) maxHeight = avail - 8;
+    } catch {
+      /* keep default */
+    }
+
+    const overflowing = content > inner - 2; // content doesn't fit
+    const tooMuchSpace = inner - content > chrome + 80; // lots of empty space
+    if (!overflowing && !tooMuchSpace) return; // inside deadband — no-op
+
+    const target = Math.max(
+      MIN_HEIGHT,
+      Math.min(content + chrome + SAFETY, maxHeight)
+    );
+    getCurrentWindow()
+      .setSize(new LogicalSize(window.innerWidth, target))
+      .catch((e) => console.warn("auto-resize failed:", e));
+  }, []);
+
+  // ResizeObserver → fitWindow on content-size changes (snappy path).
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-
-    const MIN_HEIGHT = 420;
     let timer: number | undefined;
-
-    const apply = () => {
-      const contentHeight = Math.ceil(el.getBoundingClientRect().height);
-      void (async () => {
-        let maxHeight = 2400;
-        try {
-          const mon = await currentMonitor();
-          if (mon) {
-            const logicalMonitorHeight = mon.size.height / mon.scaleFactor;
-            // Leave headroom for the menu bar + Dock so the window
-            // doesn't get pushed under either.
-            maxHeight = Math.floor(logicalMonitorHeight - 120);
-          }
-        } catch {
-          // currentMonitor can fail in odd window states; fall back
-          // to the generous default and let the OS clamp if needed.
-        }
-        const target = Math.max(
-          MIN_HEIGHT,
-          Math.min(contentHeight, maxHeight)
-        );
-        try {
-          // Keep the current width (window.innerWidth is the webview
-          // viewport width in CSS/logical px); only adjust height.
-          await getCurrentWindow().setSize(
-            new LogicalSize(window.innerWidth, target)
-          );
-        } catch (e) {
-          console.warn("auto-resize failed:", e);
-        }
-      })();
-    };
-
     const debounced = () => {
       if (timer !== undefined) window.clearTimeout(timer);
-      timer = window.setTimeout(apply, 90);
+      timer = window.setTimeout(fitWindow, 50);
     };
-
     const ro = new ResizeObserver(debounced);
     ro.observe(el);
-    // Run once on mount to fit the initial idle layout.
     debounced();
-
     return () => {
       ro.disconnect();
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, []);
+  }, [fitWindow]);
+
+  // v0.1.89 — bulletproof catch-up: poll fitWindow on a low-frequency
+  // interval. The deadband makes this a near-free no-op whenever the
+  // window already fits, but it GUARANTEES the window catches up to
+  // staged content within ~250ms no matter how the render timing
+  // races the ResizeObserver.
+  useEffect(() => {
+    const id = window.setInterval(fitWindow, 250);
+    return () => window.clearInterval(id);
+  }, [fitWindow]);
 
   // Cross-window sync: when one window changes the theme, every other
   // open window picks it up via the storage event.
@@ -549,6 +582,12 @@ function App() {
   // the content genuinely exceeds the screen, in which case
   // scrolling remains as a fallback.
   const containerRef = useRef<HTMLElement | null>(null);
+  // v0.1.89 — the window chrome (titlebar) height in logical px,
+  // measured once as outerSize − innerSize. We ADD this to the target
+  // so the window is tall enough to show all content below the
+  // titlebar. If setSize turns out to target the inner size, the only
+  // cost is a few px of slack at the bottom — never a clip.
+  const chromeHeightRef = useRef<number>(0);
 
   // Persisted "last send" / "last receive" so the user can resume an
   // interrupted transfer (or just redo their last one) after a window close,
@@ -1311,10 +1350,30 @@ function App() {
                 kind: "system",
                 body: `Couldn't reconnect chat (${
                   typeof parsed.reason === "string" ? parsed.reason : "unknown"
-                }). The sender may still be offline.`,
+                }). Retrying…`,
                 at: Date.now(),
               },
             ]);
+            break;
+          // v0.1.89 — auto-reconnect gave up after the streak cap.
+          // Chat stays available for a manual Reconnect Chat.
+          case "chat_gave_up":
+            setChatStatus("disconnected");
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                kind: "system",
+                body: "Gave up auto-reconnecting — the sender seems to be offline. Click Reconnect Chat to try again.",
+                at: Date.now(),
+              },
+            ]);
+            break;
+          // v0.1.89 — never leave the UI stuck on "Connecting…": any
+          // session error resolves to disconnected.
+          case "chat_session_error":
+            setChatStatus((cur) =>
+              cur === "connected" ? cur : "disconnected"
+            );
             break;
         }
       })
@@ -1663,10 +1722,30 @@ function App() {
                 kind: "system",
                 body: `Couldn't reconnect chat (${
                   typeof parsed.reason === "string" ? parsed.reason : "unknown"
-                }). The sender may still be offline.`,
+                }). Retrying…`,
                 at: Date.now(),
               },
             ]);
+            break;
+          // v0.1.89 — auto-reconnect gave up after the streak cap.
+          // Chat stays available for a manual Reconnect Chat.
+          case "chat_gave_up":
+            setChatStatus("disconnected");
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                kind: "system",
+                body: "Gave up auto-reconnecting — the sender seems to be offline. Click Reconnect Chat to try again.",
+                at: Date.now(),
+              },
+            ]);
+            break;
+          // v0.1.89 — never leave the UI stuck on "Connecting…": any
+          // session error resolves to disconnected.
+          case "chat_session_error":
+            setChatStatus((cur) =>
+              cur === "connected" ? cur : "disconnected"
+            );
             break;
         }
       })
@@ -2134,6 +2213,31 @@ function App() {
     }, 1000);
     return () => clearInterval(id);
   }, [recvRetryInfo]);
+
+  // v0.1.89 — explicit window re-fit on the major state transitions
+  // that grow/shrink the layout in waves (mode switch, ticket appears,
+  // chat opens, progress/summary/retry panels appear). The
+  // ResizeObserver usually catches these, but firing here too — after
+  // React has committed the new DOM (one tick later) — makes the fit
+  // reliable even when content lands in a burst that the observer's
+  // debounce might measure mid-render.
+  useEffect(() => {
+    const id = window.setTimeout(fitWindow, 80);
+    return () => window.clearTimeout(id);
+  }, [
+    fitWindow,
+    mode,
+    sendStatus,
+    recvStatus,
+    chatStatus,
+    chatMessages.length,
+    tickets,
+    isPreservedTicket,
+    recvProgress,
+    recvRetryInfo,
+    receivers.length,
+    sendProgress,
+  ]);
 
   // ---------- Render ----------
 
