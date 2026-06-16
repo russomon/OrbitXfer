@@ -2737,12 +2737,20 @@ function App() {
                             : "connecting…"}
                         </span>
                       </div>
-                      {r.status === "active" && r.total ? (
+                      {/* v0.1.91 — keep the progress bar + byte count
+                          FROZEN when a receiver disconnects (transfer
+                          interrupted), instead of hiding it. Only the
+                          live speed/ETA drop off; the red "disconnected"
+                          status label above is the interrupted marker. */}
+                      {(r.status === "active" ||
+                        r.status === "disconnected") &&
+                      r.total ? (
                         <progress value={r.bytes} max={r.total} />
                       ) : r.status === "active" ? (
                         <progress />
                       ) : null}
-                      {r.status === "active" && (
+                      {(r.status === "active" ||
+                        r.status === "disconnected") && (
                         <div className="receiver-meta">
                           <span>
                             {formatBytes(r.bytes)}
@@ -2750,16 +2758,24 @@ function App() {
                               <> / {formatBytes(r.total)}</>
                             )}
                           </span>
-                          {r.speed !== null && (
+                          {r.status === "active" && r.speed !== null && (
                             <>
                               <span className="progress-sep">·</span>
                               <span>{formatSpeed(r.speed)}</span>
                             </>
                           )}
-                          {eta !== null && (
+                          {r.status === "active" && eta !== null && (
                             <>
                               <span className="progress-sep">·</span>
                               <span>ETA {eta}</span>
+                            </>
+                          )}
+                          {r.status === "disconnected" && (
+                            <>
+                              <span className="progress-sep">·</span>
+                              <span className="receiver-interrupted">
+                                interrupted
+                              </span>
                             </>
                           )}
                         </div>
@@ -3072,11 +3088,25 @@ function App() {
             return (
               <div className="progress-box">
                 <div className="progress-header">
-                  <span className="progress-phase">{phaseLabel}</span>
-                  {recvPercent !== null && (
-                    <span className="progress-pct">
-                      {recvPercent.toFixed(1)}%
+                  {/* v0.1.91 — when the transfer is interrupted (Stop, or
+                      the sender dropped), freeze the progress and show a
+                      red "Disconnected" marker, mirroring the red
+                      "disconnected" status on the Send side. */}
+                  <span className="progress-phase">
+                    {recvStatus === "stopped"
+                      ? "Transfer interrupted"
+                      : phaseLabel}
+                  </span>
+                  {recvStatus === "stopped" ? (
+                    <span className="progress-disconnected">
+                      ● Disconnected
                     </span>
+                  ) : (
+                    recvPercent !== null && (
+                      <span className="progress-pct">
+                        {recvPercent.toFixed(1)}%
+                      </span>
+                    )
                   )}
                 </div>
                 {recvProgress.total ? (

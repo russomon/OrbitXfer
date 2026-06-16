@@ -23,7 +23,7 @@ use iroh_blobs::{
     api::remote::GetProgressItem,
     api::TempTag,
     format::collection::Collection,
-    provider::events::{EventMask, EventSender, ProviderMessage, RequestUpdate, ThrottleMode},
+    provider::events::{AbortReason, EventMask, EventSender, ProviderMessage, RequestUpdate},
     store::fs::FsStore,
     ticket::BlobTicket,
     BlobFormat,
@@ -44,7 +44,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.89";
+const CLI_VERSION: &str = "0.1.91";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -795,12 +795,20 @@ async fn run_send(
     std::fs::create_dir_all(&store_dir)?;
     let store = FsStore::load(store_dir.clone()).await?;
     let store_handle = store.as_ref().clone();
-    let event_mask = EventMask {
-        throttle: ThrottleMode::None,
-        ..EventMask::ALL_READONLY
-    };
+    // v0.1.91 — enable throttle INTERCEPT so Stop Send can abort an
+    // in-flight serve. ALL_READONLY already sets throttle: Intercept;
+    // v0.1.90 overrode it to None, which is why Stop Send couldn't
+    // actually halt the transfer (it only unpinned the blob). The
+    // throttle handler below checks `abort_serving` on each progress
+    // tick and returns an abort when the user has stopped — tearing
+    // down the blob request while the chat ALPN (a separate request
+    // stream on the same endpoint) keeps running.
+    let event_mask = EventMask::ALL_READONLY;
     let (events_tx, mut events_rx) = EventSender::channel(32, event_mask);
     let blobs = BlobsProtocol::new(&store, Some(events_tx));
+    // Set true by Stop Send; read by the Throttle handler to abort the
+    // in-flight blob serve.
+    let abort_serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // v0.1.88 (#5) — Resume fast path. On "Resume Last Send", the GUI
     // passes the previous session's ticket via ORBITXFER_REUSE_TICKET.
@@ -1066,6 +1074,7 @@ async fn run_send(
         });
     };
 
+    let abort_serving_events = abort_serving.clone();
     tokio::spawn(async move {
         while let Some(event) = events_rx.recv().await {
             match event {
@@ -1117,7 +1126,17 @@ async fn run_send(
                     }));
                 }
                 ProviderMessage::Throttle(msg) => {
-                    let _ = msg.tx.send(Ok(())).await;
+                    // v0.1.91 — the abort hook. Returning an error here
+                    // aborts the in-flight blob request (Stop Send),
+                    // leaving chat untouched. Otherwise allow the chunk.
+                    let resp = if abort_serving_events
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        Err(AbortReason::Permission)
+                    } else {
+                        Ok(())
+                    };
+                    let _ = msg.tx.send(resp).await;
                 }
                 _ => {}
             }
@@ -1184,11 +1203,19 @@ async fn run_send(
                         let _ = chat.close().await;
                     }
                     Some(chat::CliCommand::StopSend) => {
-                        // v0.1.90 — stop serving the file, but keep chat
-                        // (and this process) alive. Release the temp
-                        // tags so the served content is unpinned.
+                        // v0.1.90/91 — stop serving the file, but keep
+                        // chat (and this process) alive.
                         if !serving_stopped {
                             serving_stopped = true;
+                            // v0.1.91 — actually ABORT the in-flight
+                            // serve: the throttle handler returns an
+                            // abort on the next progress tick, tearing
+                            // down the active blob request. Chat is a
+                            // separate request stream and survives.
+                            abort_serving
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            // Release the temp tags so the content is
+                            // unpinned (no new receiver can fetch it).
                             keep_tags.clear();
                             emit_event(json!({ "type": "send_stopped" }));
                             emit_line("Send stopped by user; chat remains available.");

@@ -591,6 +591,20 @@ button:disabled {
   color: var(--danger);
 }
 
+/* v0.1.91 — "interrupted" note on a frozen receiver row (Send side). */
+.receiver-interrupted {
+  color: var(--danger);
+}
+
+/* v0.1.91 — red "Disconnected" marker on the Receive side's frozen
+   progress, mirroring the Send side's red "disconnected" status. */
+.progress-disconnected {
+  color: var(--danger);
+  font-weight: 600;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
 .receiver-row progress {
   width: 100%;
   height: 6px;
