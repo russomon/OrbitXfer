@@ -124,6 +124,11 @@ struct CoordInner {
     /// Label to send in our Hello frame so the peer can render us
     /// with a friendly name.
     self_label: String,
+    /// The shared iroh endpoint (same one the transfer uses). The chat
+    /// rides it on the chat ALPN but is otherwise independent. Held here
+    /// so the accept path can look up the peer's full address via
+    /// `remote_info` (the "initial connection push" — v0.1.92).
+    endpoint: Endpoint,
     /// One-session-at-a-time claim. Set true (atomically) when a
     /// connection is established — dial-success OR accept — and false
     /// when the session ends. The CAS loser closes its connection
@@ -132,10 +137,11 @@ struct CoordInner {
     /// `Some(tx)` while a chat session is live; `None` otherwise. The
     /// stdin dispatcher's ChatSend reaches the live session through it.
     outbox: Mutex<Option<mpsc::Sender<ChatMessage>>>,
-    /// The peer we dial for (re)connection. Seeded on the receiver
-    /// from the ticket (rich addr with relay/direct paths); learned on
-    /// the sender from the first inbound connection. We never overwrite
-    /// a seeded addr with a barer learned one.
+    /// The peer we dial for (re)connection. Seeded on the receiver from
+    /// the ticket; on the sender it's captured from the first inbound
+    /// connection as a FULL routable address via `remote_info` (relay +
+    /// direct), so the Send side can reliably dial back (v0.1.92 — was a
+    /// bare NodeID before, which couldn't be dialed).
     peer: std::sync::Mutex<Option<EndpointAddr>>,
     /// A dialer is actively trying to (re)connect right now. Together
     /// with `ever_connected` this tells the post-transfer keepalive to
@@ -146,9 +152,6 @@ struct CoordInner {
     /// keepalive linger for a dropped-but-recoverable chat so Reconnect
     /// still has a process to run in.
     ever_connected: AtomicBool,
-    /// Set by Stop Chat: the user closed chat for good. Dialers stop;
-    /// the keepalive stops lingering and the process can exit.
-    user_closed: AtomicBool,
     /// Pulsed whenever a session ends or the dialer's `connecting`
     /// state changes — wakes the keepalive (re-checks `should_linger`).
     chat_ended: Notify,
@@ -169,16 +172,16 @@ enum SessionOutcome {
 }
 
 impl ChatCoordinator {
-    pub fn new(self_label: String) -> Self {
+    pub fn new(self_label: String, endpoint: Endpoint) -> Self {
         Self {
             inner: Arc::new(CoordInner {
                 self_label,
+                endpoint,
                 active: AtomicBool::new(false),
                 outbox: Mutex::new(None),
                 peer: std::sync::Mutex::new(None),
                 connecting: AtomicBool::new(false),
                 ever_connected: AtomicBool::new(false),
-                user_closed: AtomicBool::new(false),
                 chat_ended: Notify::new(),
                 manual_reconnect: Notify::new(),
             }),
@@ -215,21 +218,22 @@ impl ChatCoordinator {
         Ok(())
     }
 
-    /// Stop Chat — close the live session with a `Bye` AND mark chat
-    /// closed for good so the dialers stop and the process can exit.
-    /// (Distinct from Stop Send / Stop Receive, which end only the
-    /// transfer and leave chat alive.)
+    /// Stop Chat — v0.1.92: REVERSIBLE. Close the live session with a
+    /// `Bye`, but keep the coordinator alive so Reconnect Chat can
+    /// re-establish it. We do NOT stop the dialers for good and do NOT
+    /// exit — the session ends as an intentional close, the dialers park
+    /// waiting for a manual Reconnect, and the process keeps lingering
+    /// (it exits only when the window closes). This is what lets the
+    /// side that clicked Stop Chat get a working Reconnect button.
     pub async fn close(&self) -> Result<()> {
-        self.inner.user_closed.store(true, SeqCst);
-        {
-            let outbox = self.inner.outbox.lock().await;
-            if let Some(sender) = outbox.as_ref() {
-                let _ = sender.send(ChatMessage::Bye).await;
-            }
+        let outbox = self.inner.outbox.lock().await;
+        if let Some(sender) = outbox.as_ref() {
+            let _ = sender.send(ChatMessage::Bye).await;
         }
-        // Wake a parked dialer (so it re-checks user_closed and exits)
-        // and the keepalive (so it re-checks should_linger).
-        self.inner.manual_reconnect.notify_waiters();
+        // NOTE: deliberately do NOT pulse manual_reconnect here — that
+        // would make the auto-dialer immediately redial. We want it to
+        // wait for an EXPLICIT Reconnect. chat_ended wakes the keepalive
+        // to re-evaluate (it keeps lingering on `ever_connected`).
         self.inner.chat_ended.notify_waiters();
         Ok(())
     }
@@ -240,13 +244,12 @@ impl ChatCoordinator {
     }
 
     /// Whether the process should keep lingering for chat after the
-    /// transfer ends. True while a session is live, a dialer is
-    /// trying, or a chat has connected at least once — unless the user
-    /// explicitly closed chat.
+    /// transfer ends. True while a session is live, a dialer is trying,
+    /// or a chat has connected at least once. v0.1.92 — once a chat has
+    /// ever connected this stays true until the window closes (Stop Chat
+    /// is reversible now, so it no longer forces an exit); a transfer
+    /// that finishes with no chat ever established still exits promptly.
     pub fn should_linger(&self) -> bool {
-        if self.inner.user_closed.load(SeqCst) {
-            return false;
-        }
         self.inner.active.load(SeqCst)
             || self.inner.connecting.load(SeqCst)
             || self.inner.ever_connected.load(SeqCst)
@@ -265,21 +268,21 @@ impl ChatCoordinator {
     /// manual Reconnect; dial/handshake failures back off to a streak
     /// cap then wait). Independent of the transfer — it keeps healing
     /// chat after Stop Receive; it stops only on Stop Chat.
-    pub fn spawn_auto_dialer(&self, endpoint: Endpoint, initial_conn: Option<Connection>) {
+    pub fn spawn_auto_dialer(&self, initial_conn: Option<Connection>) {
         let inner = self.inner.clone();
         inner.connecting.store(true, SeqCst);
         tokio::spawn(async move {
-            const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
-            const MAX_FAIL_STREAK: u32 = 6;
+            // v0.1.92 — snappier reconnect: shorter dial timeout and a
+            // lower backoff cap, still ramping gradually. Runs until the
+            // process exits (window close); Stop Chat no longer stops it
+            // for good — it just parks until a manual Reconnect.
+            const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+            const MAX_FAIL_STREAK: u32 = 5;
             let mut pending = initial_conn;
             let mut first = true;
             let mut fail_streak: u32 = 0;
 
             loop {
-                if inner.user_closed.load(SeqCst) {
-                    break;
-                }
-
                 // ---- acquire a connection ----
                 let conn = if let Some(c) = pending.take() {
                     Some(c)
@@ -291,7 +294,9 @@ impl ChatCoordinator {
                     let addr = inner.peer.lock().unwrap().clone();
                     match addr {
                         Some(a) => {
-                            match timeout(DIAL_TIMEOUT, endpoint.connect(a, CHAT_ALPN)).await {
+                            match timeout(DIAL_TIMEOUT, inner.endpoint.connect(a, CHAT_ALPN))
+                                .await
+                            {
                                 Ok(Ok(c)) => Some(c),
                                 Ok(Err(e)) => {
                                     crate::emit_event(json!({
@@ -319,9 +324,6 @@ impl ChatCoordinator {
                     None => SessionOutcome::Failed,
                 };
                 first = false;
-                if inner.user_closed.load(SeqCst) {
-                    break;
-                }
 
                 // ---- decide what to do next ----
                 match outcome {
@@ -336,7 +338,7 @@ impl ChatCoordinator {
                         continue;
                     }
                     // Intentional close (PeerBye / LocalBye) → stop auto-
-                    // dialing; wait for a manual Reconnect.
+                    // dialing; park until a manual Reconnect.
                     SessionOutcome::Ended(_) => {
                         fail_streak = 0;
                         inner.connecting.store(false, SeqCst);
@@ -360,7 +362,7 @@ impl ChatCoordinator {
                         }
                         continue;
                     }
-                    // Dial/handshake failed → backoff, then give up to a
+                    // Dial/handshake failed → backoff, then park for a
                     // manual Reconnect after the streak cap.
                     SessionOutcome::Failed => {
                         fail_streak += 1;
@@ -375,7 +377,7 @@ impl ChatCoordinator {
                             fail_streak = 0;
                             continue;
                         }
-                        let secs = (1u64 << fail_streak.min(5)).min(30);
+                        let secs = (1u64 << fail_streak.min(3)).min(8);
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
                             _ = inner.manual_reconnect.notified() => { fail_streak = 0; }
@@ -384,9 +386,6 @@ impl ChatCoordinator {
                     }
                 }
             }
-
-            inner.connecting.store(false, SeqCst);
-            inner.chat_ended.notify_waiters();
         });
     }
 
@@ -398,15 +397,12 @@ impl ChatCoordinator {
     /// dials. Lets the Send side's Reconnect Chat button re-initiate
     /// chat even when the receiver isn't auto-dialing (e.g. after an
     /// intentional close).
-    pub fn spawn_manual_dialer(&self, endpoint: Endpoint) {
+    pub fn spawn_manual_dialer(&self) {
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
+            const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
             loop {
                 inner.manual_reconnect.notified().await;
-                if inner.user_closed.load(SeqCst) {
-                    break;
-                }
                 // Already chatting (or a session is establishing)? The
                 // poke is a harmless no-op.
                 if inner.active.load(SeqCst) {
@@ -422,7 +418,7 @@ impl ChatCoordinator {
                 };
                 crate::emit_event(json!({ "type": "chat_reconnecting" }));
                 inner.connecting.store(true, SeqCst);
-                match timeout(DIAL_TIMEOUT, endpoint.connect(addr, CHAT_ALPN)).await {
+                match timeout(DIAL_TIMEOUT, inner.endpoint.connect(addr, CHAT_ALPN)).await {
                     Ok(Ok(c)) => {
                         let _ = run_session_claimed(&inner, c, ChatSide::Receiver).await;
                     }
@@ -465,12 +461,23 @@ async fn run_session_claimed(
         return SessionOutcome::Busy;
     }
 
-    // Learn the peer's address if we don't already have one (sender
-    // side). A barer learned addr never overwrites a seeded one.
-    {
+    // v0.1.92 — the "initial connection push". Learn the peer's FULL
+    // routable address (relay + direct paths) via remote_info, so the
+    // sender can reliably dial the receiver back later. Only when we
+    // don't already have one — the receiver keeps its rich ticket addr.
+    // (remote_info is async, so we don't hold the std mutex across it.)
+    let need_peer = inner.peer.lock().unwrap().is_none();
+    if need_peer {
+        let id = connection.remote_id();
+        let addr = match inner.endpoint.remote_info(id).await {
+            Some(info) => {
+                EndpointAddr::from_parts(info.id(), info.into_addrs().map(|a| a.into_addr()))
+            }
+            None => EndpointAddr::new(id),
+        };
         let mut p = inner.peer.lock().unwrap();
         if p.is_none() {
-            *p = Some(EndpointAddr::new(connection.remote_id()));
+            *p = Some(addr);
         }
     }
 

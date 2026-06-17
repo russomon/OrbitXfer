@@ -640,6 +640,12 @@ function App() {
   // Kept separately because a label can arrive before or after the
   // matching blob connection.
   const labelsByEndpointRef = useRef<Map<string, string>>(new Map());
+  // v0.1.92 — map each blob connection id to the receiver's (ephemeral)
+  // NodeID, so progress events that only carry a connection id can be
+  // attributed to the right ENDPOINT row. A single receiver opens a new
+  // connection on every retry; without this we'd render one row per
+  // connection (the duplicate-"Receivers" bug).
+  const connToEndpointRef = useRef<Map<number, string>>(new Map());
   // Timestamps bracketing the actual data transfer, used to compute the
   // average speed + total time in the "Transfer Complete" summary. For
   // sends with multiple receivers the stats reflect the FIRST receiver's
@@ -727,12 +733,6 @@ function App() {
   // transfer — `recvStatus === "complete"` does NOT close the chat
   // panel.
   const [chatStatus, setChatStatus] = useState<ChatStatus>("idle");
-  // v0.1.90 — true after the user clicks Stop Chat (a deliberate
-  // close), so we DON'T offer a Reconnect Chat button afterward — the
-  // sidecar is closing chat for good. Cleared whenever a chat connects
-  // again. (A chat that merely DROPPED leaves this false, so Reconnect
-  // is offered.)
-  const [chatClosedByUser, setChatClosedByUser] = useState(false);
   const [chatPeerLabel, setChatPeerLabel] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessageItem[]>([]);
   const [chatInput, setChatInput] = useState("");
@@ -981,15 +981,33 @@ function App() {
         if (typeof parsed.files === "number") setSendFileCount(parsed.files);
 
         // Upsert a receiver row by connection id, creating it if absent.
+        // v0.1.92 — upsert a receiver row keyed by ENDPOINT, not
+        // connection. A single receiver re-dials with a new connection
+        // id on every retry/resume; we collapse all of those into one
+        // row (the latest connection wins) so the Receivers list shows
+        // one entry per actual peer instead of a pile of duplicates.
+        // Connection ids are monotonically increasing per send session,
+        // so a smaller id than the row's current one is a stale event
+        // from a superseded connection and is ignored (no progress
+        // regression).
         const upsertReceiver = (id: number, patch: Partial<ReceiverRow>) =>
           setReceivers((prev) => {
-            const idx = prev.findIndex((r) => r.connectionId === id);
+            const endpointId =
+              patch.endpointId ??
+              connToEndpointRef.current.get(id) ??
+              null;
+            let idx = endpointId
+              ? prev.findIndex((r) => r.endpointId === endpointId)
+              : -1;
+            if (idx === -1) {
+              idx = prev.findIndex((r) => r.connectionId === id);
+            }
             if (idx === -1) {
               return [
                 ...prev,
                 {
                   connectionId: id,
-                  endpointId: null,
+                  endpointId,
                   label: null,
                   bytes: 0,
                   total: null,
@@ -999,8 +1017,18 @@ function App() {
                 },
               ];
             }
+            const row = prev[idx];
+            // Stale event from an older connection for this endpoint.
+            if (id < row.connectionId) {
+              return prev;
+            }
             const next = [...prev];
-            next[idx] = { ...next[idx], ...patch };
+            next[idx] = {
+              ...row,
+              ...patch,
+              connectionId: id,
+              endpointId: endpointId ?? row.endpointId,
+            };
             return next;
           });
 
@@ -1114,6 +1142,9 @@ function App() {
               const knownLabel = endpointId
                 ? labelsByEndpointRef.current.get(endpointId) ?? null
                 : null;
+              if (endpointId) {
+                connToEndpointRef.current.set(connId, endpointId);
+              }
               upsertReceiver(connId, {
                 endpointId,
                 label: knownLabel,
@@ -1173,12 +1204,26 @@ function App() {
           }
           case "receiver_disconnected":
             if (connId !== null) {
+              // v0.1.92 — resolve to the endpoint row and only mark it
+              // disconnected if THIS is its current connection. A late
+              // disconnect from a superseded (older) connection must not
+              // knock the freshly-reconnected row offline.
+              const endpointId =
+                connToEndpointRef.current.get(connId) ?? null;
               setReceivers((prev) =>
-                prev.map((r) =>
-                  r.connectionId === connId && r.status !== "complete"
-                    ? { ...r, status: "disconnected" }
-                    : r
-                )
+                prev.map((r) => {
+                  const isThisRow = endpointId
+                    ? r.endpointId === endpointId
+                    : r.connectionId === connId;
+                  if (
+                    isThisRow &&
+                    connId >= r.connectionId &&
+                    r.status !== "complete"
+                  ) {
+                    return { ...r, status: "disconnected" };
+                  }
+                  return r;
+                })
               );
             }
             break;
@@ -1294,7 +1339,6 @@ function App() {
               typeof parsed.label === "string" ? parsed.label : "Receiver";
             setChatPeerLabel(label);
             setChatStatus("connected");
-            setChatClosedByUser(false);
             setChatMessages((prev) => [
               ...prev,
               {
@@ -1667,7 +1711,6 @@ function App() {
               typeof parsed.label === "string" ? parsed.label : "Sender";
             setChatPeerLabel(label);
             setChatStatus("connected");
-            setChatClosedByUser(false);
             setChatMessages((prev) => [
               ...prev,
               {
@@ -1864,6 +1907,7 @@ function App() {
     setReceivers([]);
     receiverSpeedRef.current.clear();
     labelsByEndpointRef.current.clear();
+    connToEndpointRef.current.clear();
     setSendStartedAt(null);
     setSendCompletedAt(null);
     // v0.1.85 — only clear tickets when NOT in preserve mode. When
@@ -2218,10 +2262,10 @@ function App() {
     }
     // Optimistically reflect the close locally; the sidecar will also
     // emit `chat_disconnected` which will overwrite this.
+    // v0.1.92 — Stop Chat is REVERSIBLE now: the coordinator stays
+    // alive, so the Reconnect Chat button is intentionally still
+    // offered on this side (no more suppression).
     setChatStatus("disconnected");
-    // v0.1.90 — deliberate close: suppress the Reconnect Chat button
-    // (the sidecar closes chat for good and the process may exit).
-    setChatClosedByUser(true);
   }
 
   // v0.1.88 (#8/#9) — re-dial a dropped chat. Works while the receive
@@ -2737,11 +2781,16 @@ function App() {
                             : "connecting…"}
                         </span>
                       </div>
-                      {/* v0.1.91 — keep the progress bar + byte count
-                          FROZEN when a receiver disconnects (transfer
-                          interrupted), instead of hiding it. Only the
-                          live speed/ETA drop off; the red "disconnected"
-                          status label above is the interrupted marker. */}
+                      {/* v0.1.91/92 — keep the progress bar + byte count
+                          FROZEN when a receiver disconnects, instead of
+                          hiding it; only the live speed/ETA drop off.
+                          v0.1.92: dropped the "interrupted" word — on a
+                          RESUMED transfer the sender only serves the
+                          missing slice, so it genuinely can't tell a
+                          clean finish from an abort. The red
+                          "disconnected" status above is the neutral
+                          "connection ended" marker; the frozen bytes are
+                          what THIS sender actually sent. */}
                       {(r.status === "active" ||
                         r.status === "disconnected") &&
                       r.total ? (
@@ -2757,6 +2806,7 @@ function App() {
                             {r.total !== null && (
                               <> / {formatBytes(r.total)}</>
                             )}
+                            {r.status === "disconnected" && " sent"}
                           </span>
                           {r.status === "active" && r.speed !== null && (
                             <>
@@ -2768,14 +2818,6 @@ function App() {
                             <>
                               <span className="progress-sep">·</span>
                               <span>ETA {eta}</span>
-                            </>
-                          )}
-                          {r.status === "disconnected" && (
-                            <>
-                              <span className="progress-sep">·</span>
-                              <span className="receiver-interrupted">
-                                interrupted
-                              </span>
                             </>
                           )}
                         </div>
@@ -3218,17 +3260,15 @@ function App() {
                 {chatStatus === "disconnected" && "Disconnected"}
                 {chatStatus === "unavailable" && "Unavailable"}
               </span>
-              {/* v0.1.88/90 — Reconnect Chat appears when the chat has
-                  dropped but a sidecar that can host chat is still
-                  alive. v0.1.90 makes this BIDIRECTIONAL and
-                  STOP-independent: it shows on BOTH the Send and
-                  Receive sides, and stays available after Stop Send /
-                  Stop Receive (chat outlives the transfer). One click
-                  re-dials the peer's chat ALPN. */}
+              {/* v0.1.88/90/92 — Reconnect Chat appears when the chat
+                  has dropped but a sidecar that can host chat is still
+                  alive. Bidirectional and Stop-independent: it shows on
+                  BOTH the Send and Receive sides, stays available after
+                  Stop Send / Stop Receive, AND after a (now reversible)
+                  Stop Chat. One click re-dials the peer. */}
               {(chatStatus === "disconnected" ||
                 chatStatus === "unavailable") &&
-                chatProcessAlive &&
-                !chatClosedByUser && (
+                chatProcessAlive && (
                   <button
                     onClick={reconnectChat}
                     className="ghost-button"

@@ -44,7 +44,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.91";
+const CLI_VERSION: &str = "0.1.92";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -62,9 +62,12 @@ const ORBITXFER_LABEL_ALPN: &[u8] = b"orbitxfer/label/0";
 // common "sender clicked Stop and is about to click Resume" case
 // where a human-paced delay (seconds to several minutes) separates
 // the disconnect from the reconnect.
-const PHASE2_INITIAL_BACKOFF_SECS: u64 = 10;
-const PHASE2_MAX_BACKOFF_SECS: u64 = 60;
-const PHASE2_BUDGET_SECS: u64 = 600; // 10 minutes
+// v0.1.92 — snappier reconnect. The backoff still ramps gradually, but
+// starts and caps much lower so a returning sender is picked up in a
+// few seconds, not tens of seconds.
+const PHASE2_INITIAL_BACKOFF_SECS: u64 = 3;
+const PHASE2_MAX_BACKOFF_SECS: u64 = 20;
+const PHASE2_BUDGET_SECS: u64 = 300; // 5 minutes
 const PHASE2_BACKOFF_MULTIPLIER: u32 = 2;
 
 /// Clamp an attacker-controlled label to something safe to display: drop
@@ -1158,13 +1161,13 @@ async fn run_send(
         .map(|s| sanitize_label_text(&s))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Sender".to_string());
-    let chat = chat::ChatCoordinator::new(sender_label);
+    let chat = chat::ChatCoordinator::new(sender_label, endpoint.clone());
     let router = Router::builder(endpoint.clone())
         .accept(iroh_blobs::ALPN, blobs)
         .accept(ORBITXFER_LABEL_ALPN, LabelProtocol)
         .accept(chat::CHAT_ALPN, chat.clone())
         .spawn();
-    chat.spawn_manual_dialer(endpoint.clone());
+    chat.spawn_manual_dialer();
 
     emit_line("Hashing complete.");
     emit_line("File analyzed. Fetch this file by running:");
@@ -1549,7 +1552,7 @@ async fn run_receive(
     let stop_signal = std::sync::Arc::new(tokio::sync::Notify::new());
     let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let chat = chat::ChatCoordinator::new(chat_self_label.clone());
+    let chat = chat::ChatCoordinator::new(chat_self_label.clone(), endpoint.clone());
     // Seed the dial target: the sender (from the ticket).
     chat.set_peer(ticket_addr.clone());
     // Accept inbound chat dials so the sender can reconnect to us.
@@ -1559,7 +1562,7 @@ async fn run_receive(
     // Auto-dial the sender (first attempt → chat_unavailable on
     // failure; later attempts → chat_reconnect_failed). Runs
     // concurrently with the download.
-    chat.spawn_auto_dialer(endpoint.clone(), None);
+    chat.spawn_auto_dialer(None);
 
     // v0.1.85/86/88/89/90 — spawn the stdin command dispatcher.
     // Services ChatSend / ChatStop / ReconnectChat against the
