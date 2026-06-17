@@ -839,6 +839,35 @@ async fn stop_receive(
     Ok(())
 }
 
+/// v0.1.94 — warm resume for the receive side, mirroring
+/// `resume_send_warm`. If the receive process is still alive (kept up
+/// for chat after Stop), it re-runs the download IN-PROCESS via an
+/// OX_CMD — no respawn, no spurious "ended unexpectedly" error, and the
+/// chat connection is undisturbed. Returns `true` when it resumed warm;
+/// `false` tells the frontend to do a cold respawn.
+#[tauri::command]
+async fn resume_receive_warm(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let alive = {
+        let guard = state
+            .windows
+            .lock()
+            .map_err(|e| format!("state poisoned: {e}"))?;
+        guard
+            .get(window.label())
+            .map(|ws| ws.receiver.is_some())
+            .unwrap_or(false)
+    };
+    if alive {
+        write_ox_cmd(&state, window.label(), Slot::Recv, r#"{"type":"resume_receive"}"#)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// v0.1.85 — push a chat text message into the active sidecar's stdin.
 /// We try the sender slot first, then the receiver — whichever is
 /// currently hosting the chat session in this window.
@@ -1176,6 +1205,7 @@ pub fn run() {
             resume_send_warm,
             start_receive,
             stop_receive,
+            resume_receive_warm,
             // v0.1.85 — chat-while-you-transfer.
             send_chat_message,
             stop_chat,

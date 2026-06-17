@@ -2226,6 +2226,21 @@ function App() {
     setOutputPath(lastRecv.outputPath);
     // Suppress the auto-fill effect from clobbering the resumed destination.
     userPickedDest.current = true;
+    // v0.1.94 — try a WARM resume first. If the receive process is still
+    // alive (kept up for chat after Stop), it re-runs the download
+    // in-process with no respawn and no "ended unexpectedly" error — and
+    // chat stays connected. Falls back to the cold respawn otherwise.
+    try {
+      const warm = await invoke<boolean>("resume_receive_warm");
+      if (warm) {
+        recvStoppingRef.current = false;
+        setRecvError(null);
+        setRecvStatus("downloading");
+        return;
+      }
+    } catch (err) {
+      console.error(err);
+    }
     await startReceiveWith(lastRecv.ticketInput, lastRecv.outputPath);
   }
 

@@ -44,7 +44,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.93";
+const CLI_VERSION: &str = "0.1.94";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -1092,30 +1092,49 @@ async fn run_send(
                     let _ = msg.tx.send(Ok(())).await;
                 }
                 ProviderMessage::GetRequestReceived(msg) => {
-                    if let Ok(status) = store_handle.blobs().status(msg.request.hash).await {
-                        emit_line(&format!("Provider GET hash {} status {:?}", msg.request.hash, status));
-                        emit_event(json!({
-                            "type": "provider_get_request",
-                            "hash": msg.request.hash.to_string(),
-                            "status": format!("{:?}", status)
-                        }));
+                    // v0.1.94 — when serving is stopped, REJECT the
+                    // request outright instead of accept-then-abort.
+                    // Accept-then-abort made the receiver's retry briefly
+                    // enter "downloading" before failing, strobing its
+                    // "waiting for sender" panel on/off. A clean reject
+                    // keeps the receiver in a steady waiting state.
+                    if abort_serving_events.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = msg.tx.send(Err(AbortReason::Permission)).await;
+                    } else {
+                        if let Ok(status) =
+                            store_handle.blobs().status(msg.request.hash).await
+                        {
+                            emit_line(&format!(
+                                "Provider GET hash {} status {:?}",
+                                msg.request.hash, status
+                            ));
+                            emit_event(json!({
+                                "type": "provider_get_request",
+                                "hash": msg.request.hash.to_string(),
+                                "status": format!("{:?}", status)
+                            }));
+                        }
+                        let connection_id = msg.connection_id;
+                        let _ = msg.tx.send(Ok(())).await;
+                        spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
                     }
-                    let connection_id = msg.connection_id;
-                    let _ = msg.tx.send(Ok(())).await;
-                    spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
                 }
                 ProviderMessage::GetRequestReceivedNotify(msg) => {
                     let connection_id = msg.connection_id;
                     spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
                 }
                 ProviderMessage::GetManyRequestReceived(msg) => {
-                    emit_event(json!({
-                        "type": "provider_get_many_request",
-                        "count": msg.request.hashes.len()
-                    }));
-                    let connection_id = msg.connection_id;
-                    let _ = msg.tx.send(Ok(())).await;
-                    spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
+                    if abort_serving_events.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = msg.tx.send(Err(AbortReason::Permission)).await;
+                    } else {
+                        emit_event(json!({
+                            "type": "provider_get_many_request",
+                            "count": msg.request.hashes.len()
+                        }));
+                        let connection_id = msg.connection_id;
+                        let _ = msg.tx.send(Ok(())).await;
+                        spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
+                    }
                 }
                 ProviderMessage::GetManyRequestReceivedNotify(msg) => {
                     let connection_id = msg.connection_id;
@@ -1573,6 +1592,9 @@ async fn run_receive(
     // download loops). Stop Receive trips these; chat is unaffected.
     let stop_signal = std::sync::Arc::new(tokio::sync::Notify::new());
     let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // v0.1.94 — pulsed by the resume_receive command to re-run the
+    // download IN-PROCESS (no respawn), so chat survives a Stop->Resume.
+    let resume_signal = std::sync::Arc::new(tokio::sync::Notify::new());
 
     let chat = chat::ChatCoordinator::new(chat_self_label.clone(), endpoint.clone());
     // Seed the dial target: the sender (from the ticket).
@@ -1593,6 +1615,7 @@ async fn run_receive(
     // chat commands still work.
     let stop_signal_for_dispatch = stop_signal.clone();
     let stop_requested_for_dispatch = stop_requested.clone();
+    let resume_signal_for_dispatch = resume_signal.clone();
     let dispatch_chat = chat.clone();
     let cmd_dispatch_task = tokio::spawn(async move {
         let mut cmd_rx = cmd_rx;
@@ -1634,10 +1657,10 @@ async fn run_receive(
                     // Not applicable on the receive side.
                 }
                 chat::CliCommand::ResumeReceive => {
-                    // v0.1.94 (planned) — warm in-process resume. Until
-                    // the download loop is made re-runnable, the GUI
-                    // resumes the receive by respawning, so this is a
-                    // no-op placeholder.
+                    // v0.1.94 — warm in-process resume: wake the download
+                    // 'session loop to re-run from the partial store. No
+                    // respawn, so chat is undisturbed.
+                    resume_signal_for_dispatch.notify_waiters();
                 }
             }
         }
@@ -1751,35 +1774,33 @@ async fn run_receive(
         }
     }
 
-    emit_line("Downloading into temporary transfer data.");
-    emit_event(json!({ "type": "download_started", "total": total_size }));
-
     let max_attempts: u32 = env::var("ORBITXFER_DOWNLOAD_ATTEMPTS")
         .ok()
         .and_then(|val| val.parse().ok())
         .unwrap_or(3);
-    let mut last_err: Option<anyhow::Error> = None;
 
-    // v0.1.86 — Phase 2 retry budget. The outer loop below wraps the
-    // existing direct-fetch + 3-attempt download logic (Phase 1).
-    // After Phase 1 exhausts without success, we sleep with
-    // exponential backoff (capped at PHASE2_MAX_BACKOFF_SECS) and
-    // retry until either success or PHASE2_BUDGET_SECS elapses.
-    // StopReceive interrupts the sleep via the Notify signal.
-    let phase2_deadline =
-        Instant::now() + Duration::from_secs(PHASE2_BUDGET_SECS);
-    let mut phase2_attempt: u32 = 0;
-    let mut current_backoff = Duration::from_secs(PHASE2_INITIAL_BACKOFF_SECS);
-    let mut overall_succeeded = false;
-    // v0.1.88 — set when the user clicks Stop during the download.
-    // The download loops select on the stop signal so a Stop is
-    // near-instant instead of waiting for the GUI's 5s SIGKILL
-    // fallback. When set, we skip export and exit cleanly with a
-    // `receive_stopped` event (so the frontend shows "Stopped",
-    // not "error / exited with code null").
-    let mut user_stopped = false;
-
+    // v0.1.94 — the download runs in a re-runnable `'session` loop. On a
+    // Stop or error we keep the process alive for chat and wait for a
+    // resume_receive command (warm, in-process), then re-run from the
+    // partial store — no respawn, so the chat connection is undisturbed.
+    // `completed` and `direct_completed` persist past the loop for the
+    // export step below.
+    let mut completed = false;
     let mut direct_completed = false;
+    'session: loop {
+        // Fresh per-attempt state. stop_requested is cleared so a prior
+        // Stop doesn't immediately cancel the re-run.
+        stop_requested.store(false, std::sync::atomic::Ordering::SeqCst);
+        emit_line("Downloading into temporary transfer data.");
+        emit_event(json!({ "type": "download_started", "total": total_size }));
+        let mut last_err: Option<anyhow::Error> = None;
+        let phase2_deadline =
+            Instant::now() + Duration::from_secs(PHASE2_BUDGET_SECS);
+        let mut phase2_attempt: u32 = 0;
+        let mut current_backoff = Duration::from_secs(PHASE2_INITIAL_BACKOFF_SECS);
+        let mut overall_succeeded = false;
+        let mut user_stopped = false;
+        direct_completed = false;
     'phase2: loop {
         // Reset per-Phase-1-cycle state. `direct_completed` from a
         // prior iteration stays false (preflight_conn was consumed
@@ -2094,47 +2115,40 @@ async fn run_receive(
     }
     // End of 'phase2 loop.
 
-    // v0.1.88/90 — clean user-initiated stop. Emit a dedicated
-    // `receive_stopped` event (NOT an error) so the GUI shows
-    // "Stopped" instead of "error / exited with code null". The
-    // partial `.orbitxfer-pieces/` store is intentionally preserved so
-    // Resume Last Receive still works.
-    //
-    // v0.1.90 — chat OUTLIVES Stop Receive. Instead of exiting, we
-    // flush the partial store and then linger for chat (the dispatcher
-    // stays alive so Reconnect Chat / Stop Chat keep working). The
-    // process exits when chat closes (Stop Chat) or the window closes.
-    if user_stopped {
-        emit_event(json!({ "type": "receive_stopped" }));
-        emit_line("Receive stopped by user; chat remains available.");
-        // Flush the partial store to disk (but do NOT remove it) so
-        // the cached chunks survive for Resume Last Receive. Chat uses
-        // the endpoint, not the store, so this is safe.
-        let _ = store.shutdown().await;
-        chat_keepalive(&chat).await;
-        cmd_dispatch_task.abort();
-        // v0.1.90 — chat is fully done; exit decisively. A bounded
-        // router shutdown closes the endpoint cleanly, then we force
-        // exit: the blocking stdin reader thread (and a stuck router
-        // shutdown) must not keep the process alive once the user has
-        // closed both the transfer and chat.
-        let _ = tokio::time::timeout(Duration::from_secs(2), chat_router.shutdown()).await;
-        std::process::exit(0);
-    }
-
-    if !overall_succeeded {
-        if let Some(err) = last_err {
-            emit_error("download", &err);
-            return Err(err);
+    // v0.1.94 — post-download handling, STILL INSIDE 'session. On a
+    // clean Stop or an error we emit the status, then keep the process
+    // alive for chat and wait for a resume_receive command. On resume
+    // we re-run the download from the partial store (no respawn → chat
+    // survives); otherwise (chat done / window closed) we fall through
+    // and exit, with the partial store preserved.
+        if user_stopped {
+            emit_event(json!({ "type": "receive_stopped" }));
+            emit_line("Receive stopped by user; chat remains available.");
+            if wait_for_resume_or_done(&chat, &resume_signal).await {
+                continue 'session;
+            }
+            break 'session;
         }
-        // No error was captured but we also didn't succeed — this
-        // happens on user-cancelled retry. Return a clean error so
-        // the GUI shows the right state.
-        let cancelled = anyhow!("download cancelled or budget exhausted");
-        emit_error("download", &cancelled);
-        return Err(cancelled);
+        if !overall_succeeded {
+            match last_err {
+                Some(ref err) => emit_error("download", err),
+                None => emit_error(
+                    "download",
+                    &anyhow!("download cancelled or budget exhausted"),
+                ),
+            }
+            if wait_for_resume_or_done(&chat, &resume_signal).await {
+                continue 'session;
+            }
+            break 'session;
+        }
+        // Success — finalize below.
+        completed = true;
+        break 'session;
     }
+    // ---- after the download 'session ----
 
+    if completed {
     if !direct_completed {
         emit_line(if is_collection {
             "Finalizing files into destination folder."
@@ -2204,6 +2218,12 @@ async fn run_receive(
     // v0.1.88/90 — keep the receiver process alive after the transfer
     // completes for as long as chat wants to live (see chat_keepalive).
     chat_keepalive(&chat).await;
+    } else {
+        // v0.1.94 — the download stopped or errored and chat is done,
+        // so we're exiting. Flush (but preserve) the partial store for
+        // a later Resume Last Receive.
+        let _ = store.shutdown().await;
+    }
 
     // Stop the dispatcher and shut down cleanly.
     cmd_dispatch_task.abort();
@@ -2240,4 +2260,35 @@ async fn chat_keepalive(chat: &chat::ChatCoordinator) {
         }
     }
     emit_event(json!({ "type": "chat_keepalive_ended" }));
+}
+
+/// v0.1.94 — after the download stops or errors, linger for chat (like
+/// chat_keepalive) BUT also watch for a resume_receive command. Returns
+/// `true` to re-run the download IN-PROCESS (warm resume, chat
+/// undisturbed), or `false` to exit (chat is done / ctrl-c — the GUI
+/// will cold-respawn for a resume in that case). Chat stays live
+/// throughout the wait.
+async fn wait_for_resume_or_done(
+    chat: &chat::ChatCoordinator,
+    resume: &tokio::sync::Notify,
+) -> bool {
+    // If chat isn't keeping us alive, there's nothing to preserve — let
+    // the process exit so a resume is a clean cold respawn.
+    if !chat.should_linger() {
+        return false;
+    }
+    emit_event(json!({ "type": "chat_keepalive_started" }));
+    let result = loop {
+        if !chat.should_linger() {
+            break false;
+        }
+        tokio::select! {
+            _ = resume.notified() => break true,
+            _ = chat.wait_ended() => {}
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            _ = tokio::signal::ctrl_c() => break false,
+        }
+    };
+    emit_event(json!({ "type": "chat_keepalive_ended" }));
+    result
 }
