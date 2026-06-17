@@ -592,6 +592,9 @@ function App() {
   // the content genuinely exceeds the screen, in which case
   // scrolling remains as a fallback.
   const containerRef = useRef<HTMLElement | null>(null);
+  // v0.1.93 — the chat transcript element; auto-scrolled to the newest
+  // message so you don't have to scroll down to see incoming chat.
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
   // v0.1.89 — the window chrome (titlebar) height in logical px,
   // measured once as outerSize − innerSize. We ADD this to the target
   // so the window is tall enough to show all content below the
@@ -736,6 +739,11 @@ function App() {
   const [chatPeerLabel, setChatPeerLabel] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessageItem[]>([]);
   const [chatInput, setChatInput] = useState("");
+  // v0.1.93 — keep the chat transcript pinned to the newest message.
+  useEffect(() => {
+    const el = chatScrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [chatMessages]);
   // Opt-in nickname the receiver volunteers so the sender sees who's
   // downloading. Empty = don't send any label. Persisted across launches.
   const [receiverLabel, setReceiverLabel] = useState<string>(loadReceiverLabel);
@@ -1330,6 +1338,12 @@ function App() {
           // and leave the chat panel live.
           case "send_stopped":
             setSendStatus("stopped");
+            break;
+          // v0.1.93 — warm resume confirmed by the CLI (serving picked
+          // back up in the same process; chat undisturbed).
+          case "send_resumed":
+            setSendStatus("sharing");
+            setSendError(null);
             break;
           // v0.1.85 — chat events. Same set fires on the receive side
           // listener below; the handler logic is identical, just
@@ -1960,6 +1974,21 @@ function App() {
 
   async function resumeLastSend() {
     if (!lastSend) return;
+    // v0.1.93 — try a WARM resume first. If the send process is still
+    // alive (kept up for chat after Stop), it resumes serving in-process
+    // with no respawn and no spurious "exited" error — and the chat
+    // connection is undisturbed. Falls back to the cold respawn below
+    // when the process had already exited.
+    try {
+      const warm = await invoke<boolean>("resume_send_warm");
+      if (warm) {
+        setFilePath(lastSend.filePath);
+        setSendStatus("sharing");
+        return;
+      }
+    } catch (err) {
+      console.error(err);
+    }
     setFilePath(lastSend.filePath);
     // v0.1.85 — pre-populate the displayed tickets with the saved
     // variants from the original session. The NodeID portion of
@@ -3153,7 +3182,11 @@ function App() {
                 </div>
                 {recvProgress.total ? (
                   <progress
-                    value={recvProgress.bytes}
+                    // v0.1.93 — cap at total. The resume "already-cached"
+                    // baseline is an over-estimate (includes store
+                    // metadata overhead), so baseline + session bytes can
+                    // exceed the real total and read >100%.
+                    value={Math.min(recvProgress.bytes, recvProgress.total)}
                     max={recvProgress.total}
                   />
                 ) : (
@@ -3162,7 +3195,11 @@ function App() {
                 )}
                 <div className="progress-footer">
                   <span className="progress-bytes">
-                    {formatBytes(recvProgress.bytes)}
+                    {formatBytes(
+                      recvProgress.total !== null
+                        ? Math.min(recvProgress.bytes, recvProgress.total)
+                        : recvProgress.bytes
+                    )}
                     {recvProgress.total !== null && (
                       <> / {formatBytes(recvProgress.total)}</>
                     )}
@@ -3286,7 +3323,12 @@ function App() {
             </div>
           </header>
 
-          <div className="chat-scrollback" role="log" aria-live="polite">
+          <div
+            className="chat-scrollback"
+            role="log"
+            aria-live="polite"
+            ref={chatScrollRef}
+          >
             {chatMessages.length === 0 ? (
               <p className="chat-empty hint">
                 No messages yet — say hi.

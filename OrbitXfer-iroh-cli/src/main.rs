@@ -44,7 +44,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.92";
+const CLI_VERSION: &str = "0.1.93";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -1231,6 +1231,28 @@ async fn run_send(
                         // v0.1.90 — Send-side reconnect: dial the receiver.
                         chat.request_reconnect();
                     }
+                    Some(chat::CliCommand::ResumeSend) => {
+                        // v0.1.93 — warm resume in THIS process (no
+                        // respawn). Clear the stop/abort flags and
+                        // re-pin the cached blob so serving picks back
+                        // up; the receiver's next retry succeeds.
+                        if serving_stopped {
+                            serving_stopped = false;
+                            abort_serving
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            match store.tags().temp_tag(ticket.hash_and_format()).await {
+                                Ok(tag) => keep_tags.push(tag),
+                                Err(e) => emit_line(&format!(
+                                    "resume re-pin warning: {e}"
+                                )),
+                            }
+                            emit_event(json!({ "type": "send_resumed" }));
+                            emit_line("Send resumed by user.");
+                        }
+                    }
+                    Some(chat::CliCommand::ResumeReceive) => {
+                        // Not applicable to a send sidecar; ignore.
+                    }
                     None => {
                         // Command bus closed — fall through to shutdown.
                         break;
@@ -1607,6 +1629,15 @@ async fn run_receive(
                 }
                 chat::CliCommand::StopSend => {
                     // Not applicable on the receive side.
+                }
+                chat::CliCommand::ResumeSend => {
+                    // Not applicable on the receive side.
+                }
+                chat::CliCommand::ResumeReceive => {
+                    // v0.1.94 (planned) — warm in-process resume. Until
+                    // the download loop is made re-runnable, the GUI
+                    // resumes the receive by respawning, so this is a
+                    // no-op placeholder.
                 }
             }
         }

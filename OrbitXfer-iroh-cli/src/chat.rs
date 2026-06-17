@@ -60,6 +60,12 @@ const MAX_BODY_BYTES: usize = 4096;
 /// we assume the session is broken and close.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// v0.1.93 — heartbeat cadence and the idle window after which a silent
+/// peer is treated as gone. PING_INTERVAL well under IDLE_TIMEOUT so a
+/// healthy peer always refreshes liveness with room to spare.
+const PING_INTERVAL: Duration = Duration::from_secs(3);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Wire-format chat messages.
 ///
 /// We use serde's `tag = "type"` representation so JSON looks like
@@ -80,6 +86,11 @@ pub enum ChatMessage {
     /// sender's local clock at compose time — UI uses it for the
     /// per-message timestamp.
     Text { body: String, sent_at_unix_ms: u64 },
+    /// v0.1.93 — heartbeat. Sent every few seconds; carries no payload.
+    /// Its job is to prove the connection is alive so a dead peer is
+    /// detected within seconds (and the one-session slot freed for a
+    /// quick reconnect) instead of waiting on the QUIC idle timeout.
+    Ping,
     /// Graceful shutdown signal. The recipient should not send more
     /// messages after seeing this.
     Bye,
@@ -650,12 +661,39 @@ pub async fn run_chat_session(
         "endpoint_id": remote_id.clone(),
     }));
 
-    // v0.1.85 — single-loop reader+writer using tokio::select!. The
-    // earlier two-task design deadlocked on graceful close: if one
-    // side sent Bye, the other side's reader exited but its writer
-    // kept waiting for outbox input forever. Co-locating both
-    // directions lets us close the loop the moment Bye flows in
-    // either direction.
+    // v0.1.93 — the message loop. The WRITE half stays in this loop
+    // (so outbound text, heartbeat pings, and Bye all serialize on the
+    // single send stream). The READ half runs in a dedicated task and
+    // forwards decoded frames over a channel — this matters because a
+    // `select!` would otherwise cancel `recv_frame` mid-frame whenever
+    // the outbound/ping branch fires, corrupting the stream. mpsc recv
+    // is cancellation-safe, so the channel hop fixes that.
+    let (frame_tx, mut frame_rx) =
+        mpsc::channel::<std::result::Result<ChatMessage, ()>>(16);
+    let mut reader_recv = recv;
+    let reader = tokio::spawn(async move {
+        loop {
+            match recv_frame(&mut reader_recv).await {
+                Ok(msg) => {
+                    if frame_tx.send(Ok(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = frame_tx.send(Err(())).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    // Heartbeat: ping every PING_INTERVAL, and on each tick check that a
+    // frame (ping OR message) has arrived within IDLE_TIMEOUT — if not,
+    // the peer is gone, so end the session promptly to free the slot.
+    let mut ping = tokio::time::interval(PING_INTERVAL);
+    ping.tick().await; // consume the immediate first tick
+    let mut last_inbound = std::time::Instant::now();
+
     let mut we_sent_bye = false;
     let reason: ChatEndReason = loop {
         tokio::select! {
@@ -677,9 +715,8 @@ pub async fn run_chat_session(
                         }
                     }
                     None => {
-                        // Outbox closed externally (e.g. ChatProtocol::close
-                        // taking the sender). Treat as an implicit Bye if
-                        // we haven't already sent one.
+                        // Outbox closed externally. Treat as an implicit
+                        // Bye if we haven't already sent one.
                         if !we_sent_bye {
                             let _ = send_frame(&mut send, &ChatMessage::Bye).await;
                         }
@@ -687,47 +724,50 @@ pub async fn run_chat_session(
                     }
                 }
             }
-            // Inbound: read one frame from the peer.
-            inbound = recv_frame(&mut recv) => {
+            // Inbound: a decoded frame (or a read error) from the reader.
+            inbound = frame_rx.recv() => {
                 match inbound {
-                    Ok(ChatMessage::Text { body, sent_at_unix_ms }) => {
-                        let body = sanitize_text(&body);
-                        crate::emit_event(json!({
-                            "type": "chat_message_received",
-                            "body": body,
-                            "sent_at_unix_ms": sent_at_unix_ms,
-                        }));
-                    }
-                    Ok(ChatMessage::Hello { .. }) => {
-                        eprintln!("[chat] unexpected Hello after handshake");
-                    }
-                    Ok(ChatMessage::Bye) => {
-                        // Peer initiated close. Echo a Bye so the
-                        // peer's loop also breaks cleanly, then exit.
-                        if !we_sent_bye {
-                            let _ = send_frame(&mut send, &ChatMessage::Bye).await;
+                    None | Some(Err(())) => break ChatEndReason::StreamClosed,
+                    Some(Ok(msg)) => {
+                        last_inbound = std::time::Instant::now();
+                        match msg {
+                            ChatMessage::Text { body, sent_at_unix_ms } => {
+                                let body = sanitize_text(&body);
+                                crate::emit_event(json!({
+                                    "type": "chat_message_received",
+                                    "body": body,
+                                    "sent_at_unix_ms": sent_at_unix_ms,
+                                }));
+                            }
+                            // Heartbeat — already refreshed last_inbound.
+                            ChatMessage::Ping => {}
+                            ChatMessage::Hello { .. } => {
+                                eprintln!("[chat] unexpected Hello after handshake");
+                            }
+                            ChatMessage::Bye => {
+                                if !we_sent_bye {
+                                    let _ = send_frame(&mut send, &ChatMessage::Bye).await;
+                                }
+                                break ChatEndReason::PeerBye;
+                            }
                         }
-                        break ChatEndReason::PeerBye;
                     }
-                    Err(e) => {
-                        let msg = format!("{}", e);
-                        // EOF on the stream is a normal close, not an error.
-                        if !msg.contains("UnexpectedEof")
-                            && !msg.contains("ConnectionLost")
-                        {
-                            crate::emit_event(json!({
-                                "type": "chat_read_error",
-                                "error": msg,
-                            }));
-                        }
-                        break ChatEndReason::StreamClosed;
-                    }
+                }
+            }
+            // Heartbeat tick: detect a dead peer, then ping.
+            _ = ping.tick() => {
+                if last_inbound.elapsed() > IDLE_TIMEOUT {
+                    break ChatEndReason::StreamClosed;
+                }
+                if send_frame(&mut send, &ChatMessage::Ping).await.is_err() {
+                    break ChatEndReason::SendError;
                 }
             }
         }
     };
 
-    // Close our write side so the peer's stream read returns EOF.
+    // Stop the reader and close our write side so the peer reads EOF.
+    reader.abort();
     let _ = send.finish();
 
     crate::emit_event(json!({
@@ -832,6 +872,14 @@ pub enum CliCommand {
     /// still alive. Starts a fresh chat session to the same sender.
     #[serde(rename = "reconnect_chat")]
     ReconnectChat,
+    /// v0.1.93 — resume serving in the EXISTING send process (no
+    /// respawn): re-pin the cached blob and clear the stop/abort flags.
+    #[serde(rename = "resume_send")]
+    ResumeSend,
+    /// v0.1.93 — resume the download in the EXISTING receive process
+    /// (no respawn): re-run the download loop from the partial store.
+    #[serde(rename = "resume_receive")]
+    ResumeReceive,
 }
 
 /// Spawn the stdin watcher as a tokio task. Reads stdin line by

@@ -772,6 +772,35 @@ async fn stop_send(
     Ok(())
 }
 
+/// v0.1.93 — warm resume for the send side. If the send process is
+/// still alive (it stays up for chat after Stop Send), resume serving
+/// IN-PROCESS via an OX_CMD — no respawn, no spurious "exited" error,
+/// and the chat connection is undisturbed. Returns `true` when it
+/// resumed warm; `false` tells the frontend to fall back to a cold
+/// respawn (the process had already exited, e.g. no chat was active).
+#[tauri::command]
+async fn resume_send_warm(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let alive = {
+        let guard = state
+            .windows
+            .lock()
+            .map_err(|e| format!("state poisoned: {e}"))?;
+        guard
+            .get(window.label())
+            .map(|ws| ws.sender.is_some())
+            .unwrap_or(false)
+    };
+    if alive {
+        write_ox_cmd(&state, window.label(), Slot::Send, r#"{"type":"resume_send"}"#)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 #[tauri::command]
 async fn start_receive(
     app: AppHandle,
@@ -1144,6 +1173,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_send,
             stop_send,
+            resume_send_warm,
             start_receive,
             stop_receive,
             // v0.1.85 — chat-while-you-transfer.
