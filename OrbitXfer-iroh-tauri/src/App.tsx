@@ -1365,6 +1365,46 @@ function App() {
             // bytes display continues uninterrupted.
             break;
           }
+          case "upload_request_done": {
+            // v0.1.96 — the definitive "this receiver finished" signal. The
+            // CLI emits it when a GET request's update stream closes after a
+            // clean serve (Completed, never Aborted), which means the peer
+            // pulled everything it asked for. Unlike upload_complete this is
+            // INDEPENDENT of byte totals, so it correctly fires on a resumed
+            // /partial transfer where the sender only served the missing
+            // ranges (bytes < total) — exactly the case that used to leave
+            // the row stuck "disconnected". Mark the row complete
+            // unconditionally so it wins regardless of whether a racing
+            // receiver_disconnected already flipped it red.
+            setSendStatus("complete");
+            setSendCompletedAt((prev) => prev ?? Date.now());
+            setSendProgress((prev) =>
+              prev
+                ? {
+                    phase: "uploading",
+                    bytes: prev.total ?? prev.bytes,
+                    total: prev.total,
+                  }
+                : null
+            );
+            sendSpeedRef.current = [];
+            setSendSpeed(null);
+            if (connId !== null) {
+              setReceivers((prev) =>
+                prev.map((r) =>
+                  r.connectionId === connId
+                    ? {
+                        ...r,
+                        bytes: r.total ?? r.bytes,
+                        speed: null,
+                        status: "complete",
+                      }
+                    : r
+                )
+              );
+            }
+            break;
+          }
           case "error":
             setSendError(`${parsed.stage}: ${parsed.message}`);
             setSendStatus("error");

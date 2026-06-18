@@ -44,7 +44,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.95";
+const CLI_VERSION: &str = "0.1.96";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -1009,6 +1009,20 @@ async fn run_send(
             let mut completed_bytes = 0u64;
             let mut current_blob_size: Option<u64> = None;
             let mut throttle = ProgressThrottle::new();
+            // v0.1.96 — terminal-state tracking for a byte-total-independent
+            // completion signal. `completedBytes >= total` is the WRONG test
+            // for whether a receiver finished: on a resumed/partial transfer
+            // the receiver already holds some files and requests only the
+            // missing ranges, so the sender never serves the full payload and
+            // the byte count never reaches `total`. Instead we watch the
+            // request's update stream: if it ends after a clean Completed
+            // (and was never Aborted), the receiver got everything it asked
+            // for — i.e. it now has the complete blob. We emit
+            // `upload_request_done` on stream close so the UI can flip the
+            // row to ✓ Transfer Complete regardless of how many bytes THIS
+            // session actually carried.
+            let mut saw_completed = false;
+            let mut saw_abort = false;
             while let Ok(Some(update)) = rx.recv().await {
                 match update {
                     RequestUpdate::Started(started) => {
@@ -1061,6 +1075,7 @@ async fn run_send(
                         if let Some(prev) = current_blob_size.take() {
                             completed_bytes = completed_bytes.saturating_add(prev);
                         }
+                        saw_completed = true;
                         let total_val = total.load(Ordering::Relaxed);
                         let total_opt = if total_val > 0 { Some(total_val) } else { None };
                         emit_event(json!({
@@ -1071,6 +1086,7 @@ async fn run_send(
                         }));
                     }
                     RequestUpdate::Aborted(aborted) => {
+                        saw_abort = true;
                         emit_line(&format!("Upload aborted payload={} other_sent={} other_read={}", aborted.stats.payload_bytes_sent, aborted.stats.other_bytes_sent, aborted.stats.other_bytes_read));
                         emit_event(json!({
                             "type": "upload_aborted",
@@ -1080,6 +1096,19 @@ async fn run_send(
                         }));
                     }
                 }
+            }
+            // The request's update stream has closed. If it ended after a
+            // clean Completed and was never Aborted, this receiver
+            // successfully pulled everything it requested — which, for a
+            // resume, means it now holds the complete payload even though we
+            // served only the missing ranges. Signal a definitive
+            // completion so the sender's row shows ✓ Transfer Complete
+            // instead of falling to "disconnected" when the peer hangs up.
+            if saw_completed && !saw_abort {
+                emit_event(json!({
+                    "type": "upload_request_done",
+                    "connection_id": connection_id
+                }));
             }
         });
     };
