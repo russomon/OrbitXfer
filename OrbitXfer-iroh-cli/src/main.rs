@@ -39,12 +39,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.96";
+const CLI_VERSION: &str = "0.1.97";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -989,8 +989,18 @@ async fn run_send(
     // the protocol-level view if it ever diverges.
     let upload_total = Arc::new(AtomicU64::new(total_size.unwrap_or(0)));
     let upload_total_events = upload_total.clone();
+    // Whether the payload we're currently serving is a folder (HashSeq) vs a
+    // single file (Raw). Updated on StartSendNew so it tracks the live blob.
+    // Used to tell a folder's tiny *structural* request (HashSeq root at blob
+    // index 0 + names meta at index 1) apart from a *payload* request that
+    // actually carries file content (blob index >= 2). Without this the
+    // structural request — which closes cleanly in microseconds — would fire
+    // a premature "transfer done".
+    let serving_is_folder = Arc::new(AtomicBool::new(matches!(format, BlobFormat::HashSeq)));
+    let serving_is_folder_events = serving_is_folder.clone();
     let spawn_updates = |mut rx: mpsc::Receiver<RequestUpdate>,
                          total: Arc<AtomicU64>,
+                         is_folder: Arc<AtomicBool>,
                          connection_id: u64| {
         tokio::spawn(async move {
             // For a HashSeq (folder) send, iroh's `Progress.end_offset`
@@ -1023,6 +1033,13 @@ async fn run_send(
             // session actually carried.
             let mut saw_completed = false;
             let mut saw_abort = false;
+            // Highest collection blob index this request served. For a folder
+            // (HashSeq): index 0 is the root hash-sequence, index 1 is the
+            // names meta, and indices >= 2 are the actual files. A request
+            // that only touched 0..=1 is purely structural and must NOT count
+            // as a completed transfer. For a single file (Raw) there is no
+            // structure — the lone request serves index 0, which IS the file.
+            let mut max_blob_index: u64 = 0;
             while let Ok(Some(update)) = rx.recv().await {
                 match update {
                     RequestUpdate::Started(started) => {
@@ -1034,11 +1051,13 @@ async fn run_send(
                             completed_bytes = completed_bytes.saturating_add(prev);
                         }
                         current_blob_size = Some(started.size);
+                        max_blob_index = max_blob_index.max(started.index);
                         emit_event(json!({
                             "type": "upload_started",
                             "connection_id": connection_id,
                             "total": total.load(Ordering::Relaxed),
                             "iroh_size": started.size,
+                            "blob_index": started.index,
                             "completed_bytes": completed_bytes
                         }));
                     }
@@ -1098,13 +1117,26 @@ async fn run_send(
                 }
             }
             // The request's update stream has closed. If it ended after a
-            // clean Completed and was never Aborted, this receiver
-            // successfully pulled everything it requested — which, for a
-            // resume, means it now holds the complete payload even though we
-            // served only the missing ranges. Signal a definitive
-            // completion so the sender's row shows ✓ Transfer Complete
-            // instead of falling to "disconnected" when the peer hangs up.
-            if saw_completed && !saw_abort {
+            // clean Completed (never Aborted) AND it actually carried file
+            // payload, this receiver successfully pulled everything it
+            // requested — which, for a resume, means it now holds the
+            // complete payload even though we served only the missing ranges.
+            // Signal a definitive completion so the sender's row shows
+            // ✓ Transfer Complete instead of falling to "disconnected" when
+            // the peer hangs up.
+            //
+            // "Carried file payload" is the crucial guard: a folder download
+            // issues a tiny *structural* request first (HashSeq root at index
+            // 0 + names meta at index 1) that completes in microseconds. That
+            // request must NOT be treated as the transfer finishing or the UI
+            // flips to ✓ Complete the instant the transfer starts. Files live
+            // at blob index >= 2, so a folder request only counts once it has
+            // served such a blob. A single file (Raw) has no structural
+            // request — its lone request serves index 0, which is the file —
+            // so it always counts.
+            let folder = is_folder.load(Ordering::Relaxed);
+            let carried_payload = !folder || max_blob_index >= 2;
+            if saw_completed && !saw_abort && carried_payload {
                 emit_event(json!({
                     "type": "upload_request_done",
                     "connection_id": connection_id
@@ -1152,12 +1184,12 @@ async fn run_send(
                         }
                         let connection_id = msg.connection_id;
                         let _ = msg.tx.send(Ok(())).await;
-                        spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
+                        spawn_updates(msg.rx, upload_total_events.clone(), serving_is_folder_events.clone(), connection_id);
                     }
                 }
                 ProviderMessage::GetRequestReceivedNotify(msg) => {
                     let connection_id = msg.connection_id;
-                    spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
+                    spawn_updates(msg.rx, upload_total_events.clone(), serving_is_folder_events.clone(), connection_id);
                 }
                 ProviderMessage::GetManyRequestReceived(msg) => {
                     if abort_serving_events.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1169,12 +1201,12 @@ async fn run_send(
                         }));
                         let connection_id = msg.connection_id;
                         let _ = msg.tx.send(Ok(())).await;
-                        spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
+                        spawn_updates(msg.rx, upload_total_events.clone(), serving_is_folder_events.clone(), connection_id);
                     }
                 }
                 ProviderMessage::GetManyRequestReceivedNotify(msg) => {
                     let connection_id = msg.connection_id;
-                    spawn_updates(msg.rx, upload_total_events.clone(), connection_id);
+                    spawn_updates(msg.rx, upload_total_events.clone(), serving_is_folder_events.clone(), connection_id);
                 }
                 ProviderMessage::ConnectionClosed(msg) => {
                     emit_line("Receiver disconnected");
@@ -1331,6 +1363,13 @@ async fn run_send(
                                 keep_tags = tags;
                                 upload_total.store(
                                     t.unwrap_or(0),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                // Track folder vs single-file for the new
+                                // payload so the structural-request guard in
+                                // spawn_updates stays correct after a swap.
+                                serving_is_folder.store(
+                                    matches!(f, BlobFormat::HashSeq),
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
                                 ticket = announce_ticket(&full_addr, h, f, t);
