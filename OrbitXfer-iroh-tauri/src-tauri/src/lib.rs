@@ -772,6 +772,36 @@ async fn stop_send(
     Ok(())
 }
 
+/// v0.1.95 — start a NEW transfer in the EXISTING send process (no
+/// respawn), so the live chat survives. If the send process is alive,
+/// writes an OX_CMD that re-hashes `file_path` and mints a fresh ticket
+/// on the same endpoint; returns `true`. Returns `false` when no send
+/// process is running, so the frontend cold-spawns instead.
+#[tauri::command]
+async fn start_send_new_warm(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    file_path: String,
+) -> Result<bool, String> {
+    let alive = {
+        let guard = state
+            .windows
+            .lock()
+            .map_err(|e| format!("state poisoned: {e}"))?;
+        guard
+            .get(window.label())
+            .map(|ws| ws.sender.is_some())
+            .unwrap_or(false)
+    };
+    if alive {
+        let payload = serde_json::json!({ "type": "start_send_new", "path": file_path });
+        write_ox_cmd(&state, window.label(), Slot::Send, &payload.to_string())?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// v0.1.93 — warm resume for the send side. If the send process is
 /// still alive (it stays up for chat after Stop Send), resume serving
 /// IN-PROCESS via an OX_CMD — no respawn, no spurious "exited" error,
@@ -1201,6 +1231,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             start_send,
+            start_send_new_warm,
             stop_send,
             resume_send_warm,
             start_receive,

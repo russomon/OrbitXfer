@@ -994,11 +994,22 @@ function App() {
         // id on every retry/resume; we collapse all of those into one
         // row (the latest connection wins) so the Receivers list shows
         // one entry per actual peer instead of a pile of duplicates.
-        // Connection ids are monotonically increasing per send session,
-        // so a smaller id than the row's current one is a stale event
-        // from a superseded connection and is ignored (no progress
-        // regression).
-        const upsertReceiver = (id: number, patch: Partial<ReceiverRow>) =>
+        //
+        // v0.1.94 — key on connection IDENTITY, not magnitude.
+        // connection ids are handle-like, NOT monotonic (a resumed
+        // connection can have a SMALLER id than the one it replaces — an
+        // earlier magnitude check wrongly dropped resume updates, leaving
+        // the row stuck "disconnected"). Instead: a `supersede` event (a
+        // new connection's receiver_connected / upload_started) makes
+        // that connection the CURRENT one for the endpoint; a
+        // non-supersede event (upload_progress) only applies to the
+        // current connection, so stale events from a superseded
+        // connection are ignored without dropping the live one.
+        const upsertReceiver = (
+          id: number,
+          patch: Partial<ReceiverRow>,
+          supersede = false
+        ) =>
           setReceivers((prev) => {
             const endpointId =
               patch.endpointId ??
@@ -1026,14 +1037,24 @@ function App() {
               ];
             }
             const row = prev[idx];
-            // Stale event from an older connection for this endpoint.
-            if (id < row.connectionId) {
+            // Non-supersede events only update the CURRENT connection.
+            if (!supersede && row.connectionId !== id) {
               return prev;
             }
             const next = [...prev];
+            // v0.1.95 — keep per-receiver bytes MONOTONIC so a resume's
+            // upload_started(bytes:0) (and the delta-only serve that
+            // follows) doesn't drop the bar below where it was. A
+            // genuinely new transfer clears the receivers first, so this
+            // never sticks across transfers.
+            const nextBytes =
+              patch.bytes !== undefined
+                ? Math.max(patch.bytes, row.bytes ?? 0)
+                : row.bytes;
             next[idx] = {
               ...row,
               ...patch,
+              bytes: nextBytes,
               connectionId: id,
               endpointId: endpointId ?? row.endpointId,
             };
@@ -1153,11 +1174,17 @@ function App() {
               if (endpointId) {
                 connToEndpointRef.current.set(connId, endpointId);
               }
-              upsertReceiver(connId, {
-                endpointId,
-                label: knownLabel,
-                status: "active",
-              });
+              // supersede: this connection becomes the endpoint's current
+              // one (re-activates a row left "disconnected" by a Stop).
+              upsertReceiver(
+                connId,
+                {
+                  endpointId,
+                  label: knownLabel,
+                  status: "active",
+                },
+                true
+              );
             }
             break;
           case "receiver_label": {
@@ -1223,9 +1250,13 @@ function App() {
                   const isThisRow = endpointId
                     ? r.endpointId === endpointId
                     : r.connectionId === connId;
+                  // Only the row's CURRENT connection dropping counts —
+                  // a late disconnect from a superseded connection (e.g.
+                  // after a resume re-connected) must not knock the live
+                  // row offline. (Match identity, not magnitude.)
                   if (
                     isThisRow &&
-                    connId >= r.connectionId &&
+                    connId === r.connectionId &&
                     r.status !== "complete"
                   ) {
                     return { ...r, status: "disconnected" };
@@ -1247,11 +1278,16 @@ function App() {
             // the FIRST upload_started (across all receivers) wins.
             setSendStartedAt((prev) => prev ?? Date.now());
             if (connId !== null) {
-              upsertReceiver(connId, {
-                bytes: 0,
-                total: total ?? null,
-                status: "active",
-              });
+              // supersede: a fresh serve makes this the current connection.
+              upsertReceiver(
+                connId,
+                {
+                  bytes: 0,
+                  total: total ?? null,
+                  status: "active",
+                },
+                true
+              );
             }
             break;
           case "upload_progress":
@@ -1938,13 +1974,29 @@ function App() {
     sendSpeedRef.current = [];
     setSendTotalSize(null);
     try {
-      await invoke("start_send", {
-        filePath: targetPath,
-        connectionMode,
-        // v0.1.88 (#5) — fast-path reuse args (undefined for a fresh send).
-        reuseTicket: reuse?.ticket,
-        reuseSize: reuse?.size,
-      });
+      // v0.1.95 — if a send process is already alive (kept up for chat
+      // after Stop), start the NEW transfer IN-PROCESS so the live chat
+      // survives — no respawn. Only for a fresh pick; a reuse/resume goes
+      // through the cached-blob fast path below.
+      let warm = false;
+      if (!reuse) {
+        try {
+          warm = await invoke<boolean>("start_send_new_warm", {
+            filePath: targetPath,
+          });
+        } catch (e) {
+          console.error(e);
+        }
+      }
+      if (!warm) {
+        await invoke("start_send", {
+          filePath: targetPath,
+          connectionMode,
+          // v0.1.88 (#5) — fast-path reuse args (undefined for a fresh send).
+          reuseTicket: reuse?.ticket,
+          reuseSize: reuse?.size,
+        });
+      }
       // Persist the path on successful spawn — even if the transfer is later
       // interrupted, the user can resume with one click. isFolder is kept so
       // the resumed share line gets the right folder hint. Tickets are

@@ -44,7 +44,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.94";
+const CLI_VERSION: &str = "0.1.95";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -788,6 +788,74 @@ fn safe_relative_path(name: &str) -> Option<PathBuf> {
     }
 }
 
+/// v0.1.95 — build the three ticket variants (relay / direct / full) for
+/// `(hash, format)` on `full_addr`, emit `ticket_variants` +
+/// `ticket_created`, and return the share ticket per ORBITXFER_TICKET_MODE.
+/// Shared by the initial hash AND by an in-process StartSendNew, so a
+/// second transfer can mint a ticket on the SAME endpoint (keeping chat
+/// alive) without a respawn.
+fn announce_ticket(
+    full_addr: &EndpointAddr,
+    hash: Hash,
+    format: BlobFormat,
+    total_size: Option<u64>,
+) -> BlobTicket {
+    let relay_ticket = full_addr.relay_urls().next().cloned().map(|relay| {
+        let relay_addr = EndpointAddr::new(full_addr.id).with_relay_url(relay);
+        BlobTicket::new(relay_addr, hash, format).to_string()
+    });
+    let mut direct_addr = EndpointAddr::new(full_addr.id);
+    for ip in full_addr.ip_addrs().cloned() {
+        direct_addr = direct_addr.with_ip_addr(ip);
+    }
+    let direct_ticket = if direct_addr.ip_addrs().next().is_some() {
+        Some(BlobTicket::new(direct_addr, hash, format).to_string())
+    } else {
+        None
+    };
+    let full_ticket = BlobTicket::new(full_addr.clone(), hash, format).to_string();
+    emit_event(json!({
+        "type": "ticket_variants",
+        "direct": direct_ticket,
+        "relay": relay_ticket,
+        "full": full_ticket,
+        "total": total_size
+    }));
+
+    let mode = ticket_mode_from_env();
+    let addr = match mode.as_str() {
+        "relay_only" => {
+            if let Some(relay) = full_addr.relay_urls().next().cloned() {
+                emit_line("Ticket mode: relay_only");
+                EndpointAddr::new(full_addr.id).with_relay_url(relay)
+            } else {
+                emit_line("WARNING: No relay URL available. Falling back to full address.");
+                full_addr.clone()
+            }
+        }
+        "direct_only" => {
+            emit_line("Ticket mode: direct_only");
+            let mut direct = EndpointAddr::new(full_addr.id);
+            for ip in full_addr.ip_addrs().cloned() {
+                direct = direct.with_ip_addr(ip);
+            }
+            direct
+        }
+        _ => {
+            emit_line("Ticket mode: full (relay + ip)");
+            full_addr.clone()
+        }
+    };
+    emit_line(&format!("Ticket addr: {}", describe_addr(&addr)));
+    let ticket = BlobTicket::new(addr, hash, format);
+    emit_event(json!({
+        "type": "ticket_created",
+        "ticket": ticket.to_string(),
+        "total": total_size
+    }));
+    ticket
+}
+
 async fn run_send(
     file_path: PathBuf,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<chat::CliCommand>,
@@ -903,73 +971,12 @@ async fn run_send(
     let full_addr = endpoint.addr();
     emit_line(&format!("Sender endpoint addr: {}", describe_addr(&full_addr)));
 
-    let relay_ticket = full_addr
-        .relay_urls()
-        .next()
-        .cloned()
-        .map(|relay| {
-            let relay_addr = EndpointAddr::new(full_addr.id).with_relay_url(relay);
-            BlobTicket::new(relay_addr, hash, format).to_string()
-        });
-    let mut direct_addr = EndpointAddr::new(full_addr.id);
-    for ip in full_addr.ip_addrs().cloned() {
-        direct_addr = direct_addr.with_ip_addr(ip);
-    }
-    let direct_ticket = if direct_addr.ip_addrs().next().is_some() {
-        Some(BlobTicket::new(direct_addr, hash, format).to_string())
-    } else {
-        None
-    };
-    let full_ticket = BlobTicket::new(full_addr.clone(), hash, format).to_string();
-    // `total` is the canonical payload size from `std::fs::metadata().len()`
-    // at the start of hashing. We surface it here so the frontend can
-    // append `# size=<N>` to the share line — the receiver parses that to
-    // seed its progress total immediately on paste, before the CLI is even
-    // spawned. Without it the receiver UI doesn't know the denominator
-    // until the provider's `observe()` round-trip lands, which on a relay
-    // path can be several seconds in.
-    emit_event(json!({
-        "type": "ticket_variants",
-        "direct": direct_ticket,
-        "relay": relay_ticket,
-        "full": full_ticket,
-        "total": total_size
-    }));
-
-    let mode = ticket_mode_from_env();
-    let addr = match mode.as_str() {
-        "relay_only" => {
-            if let Some(relay) = full_addr.relay_urls().next().cloned() {
-                emit_line("Ticket mode: relay_only");
-                EndpointAddr::new(full_addr.id).with_relay_url(relay)
-            } else {
-                emit_line("WARNING: No relay URL available. Falling back to full address.");
-                full_addr.clone()
-            }
-        }
-        "direct_only" => {
-            emit_line("Ticket mode: direct_only");
-            let mut direct = EndpointAddr::new(full_addr.id);
-            for ip in full_addr.ip_addrs().cloned() {
-                direct = direct.with_ip_addr(ip);
-            }
-            direct
-        }
-        _ => {
-            emit_line("Ticket mode: full (relay + ip)");
-            full_addr.clone()
-        }
-    };
-
-    emit_line(&format!("Ticket addr: {}", describe_addr(&addr)));
-
-    let ticket = BlobTicket::new(addr, hash, format);
-
-    emit_event(json!({
-        "type": "ticket_created",
-        "ticket": ticket.to_string(),
-        "total": total_size
-    }));
+    // `total_size` is the canonical payload size from metadata; the
+    // share line embeds it as `# size=<N>` so the receiver seeds its
+    // progress denominator on paste. v0.1.95 — ticket building is now a
+    // shared helper so an in-process StartSendNew can re-announce.
+    // `ticket` is mutable so a second transfer can replace it.
+    let mut ticket = announce_ticket(&full_addr, hash, format, total_size);
 
     // Canonical total is set once from the file's metadata length (the same
     // value emitted via `ticket_variants.total` and embedded in the share
@@ -1271,6 +1278,40 @@ async fn run_send(
                     }
                     Some(chat::CliCommand::ResumeReceive) => {
                         // Not applicable to a send sidecar; ignore.
+                    }
+                    Some(chat::CliCommand::StartSendNew { path }) => {
+                        // v0.1.95 — start a NEW transfer IN THIS process
+                        // (no respawn) so chat survives. Hash the new
+                        // file/folder into the store, mint a fresh ticket
+                        // on the SAME endpoint, and serve it. The Pick
+                        // dialog always yields an absolute path.
+                        let new_abs = std::path::PathBuf::from(&path);
+                        if new_abs.is_dir() {
+                            emit_line("Verifying folder contents (this can take a while).");
+                        } else {
+                            emit_line("Hashing file (this can take a while for large files).");
+                        }
+                        emit_event(json!({ "type": "ticket_hashing_start" }));
+                        let hashed = if new_abs.is_dir() {
+                            prepare_folder(&store, &new_abs).await
+                        } else {
+                            prepare_single_file(&store, &new_abs).await
+                        };
+                        match hashed {
+                            Ok((h, f, t, tags)) => {
+                                keep_tags = tags;
+                                upload_total.store(
+                                    t.unwrap_or(0),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                ticket = announce_ticket(&full_addr, h, f, t);
+                                abort_serving
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                serving_stopped = false;
+                                emit_line("Now serving the new file.");
+                            }
+                            Err(e) => emit_error("hashing", &e),
+                        }
                     }
                     None => {
                         // Command bus closed — fall through to shutdown.
@@ -1661,6 +1702,9 @@ async fn run_receive(
                     // 'session loop to re-run from the partial store. No
                     // respawn, so chat is undisturbed.
                     resume_signal_for_dispatch.notify_waiters();
+                }
+                chat::CliCommand::StartSendNew { .. } => {
+                    // Not applicable on the receive side.
                 }
             }
         }

@@ -880,6 +880,12 @@ pub enum CliCommand {
     /// (no respawn): re-run the download loop from the partial store.
     #[serde(rename = "resume_receive")]
     ResumeReceive,
+    /// v0.1.95 — start a NEW send in the EXISTING send process (no
+    /// respawn): re-hash `path` into the store and mint a fresh ticket
+    /// on the same endpoint, so chat survives. Lets the user share a
+    /// second file's ticket over the live chat.
+    #[serde(rename = "start_send_new")]
+    StartSendNew { path: String },
 }
 
 /// Spawn the stdin watcher as a tokio task. Reads stdin line by
