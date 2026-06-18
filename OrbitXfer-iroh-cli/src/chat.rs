@@ -886,6 +886,22 @@ pub enum CliCommand {
     /// second file's ticket over the live chat.
     #[serde(rename = "start_send_new")]
     StartSendNew { path: String },
+    /// v0.1.98 — receive a NEW ticket in the EXISTING receive process
+    /// (no respawn): the warm endpoint + live chat are reused, and the
+    /// download 'session restarts on the new ticket/destination. Mirrors
+    /// StartSendNew on the receive side; lets the user accept a second
+    /// ticket (e.g. one just shared over chat) without dropping chat or
+    /// paying a cold connection setup.
+    #[serde(rename = "start_receive_new")]
+    StartReceiveNew {
+        ticket: String,
+        output_path: String,
+        /// Sender-summed payload size parsed from the new share line, so
+        /// the receiver's progress bar has a denominator immediately
+        /// (same role as ORBITXFER_EXPECTED_SIZE for the first receive).
+        #[serde(default)]
+        expected_size: Option<u64>,
+    },
 }
 
 /// Spawn the stdin watcher as a tokio task. Reads stdin line by

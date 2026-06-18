@@ -44,7 +44,7 @@ use std::sync::{
 };
 use tokio::time::{sleep, timeout, Duration};
 
-const CLI_VERSION: &str = "0.1.97";
+const CLI_VERSION: &str = "0.1.98";
 
 /// ALPN for the optional "receiver label" side-channel. A receiver may
 /// open a short connection to the sender on this protocol and send a
@@ -1340,6 +1340,9 @@ async fn run_send(
                     Some(chat::CliCommand::ResumeReceive) => {
                         // Not applicable to a send sidecar; ignore.
                     }
+                    Some(chat::CliCommand::StartReceiveNew { .. }) => {
+                        // Not applicable to a send sidecar; ignore.
+                    }
                     Some(chat::CliCommand::StartSendNew { path }) => {
                         // v0.1.95 — start a NEW transfer IN THIS process
                         // (no respawn) so chat survives. Hash the new
@@ -1548,39 +1551,25 @@ async fn run_receive(
     output_path: PathBuf,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<chat::CliCommand>,
 ) -> Result<()> {
-    let ticket: BlobTicket = ticket_str.parse().context("invalid ticket")?;
-    let ticket_addr = ticket.addr().clone();
-    emit_line(&format!("Ticket addr: {}", describe_addr(&ticket_addr)));
-    // A HashSeq ticket is a folder (collection); a Raw ticket is a single
-    // file. The format is authoritative — it lives inside the ticket — so we
-    // don't rely on any UI hint to decide how to write to disk.
-    let is_collection = matches!(ticket.hash_and_format().format, BlobFormat::HashSeq);
-    let mut abs_path = abs_path(&output_path)?;
-    if is_collection {
-        // For a folder, abs_path is the destination directory the collection
-        // entries are extracted into. Don't synth a filename.
-        emit_line(&format!("Receiving a folder into: {}", abs_path.display()));
-        emit_event(json!({ "type": "receive_kind", "kind": "folder" }));
-    } else if abs_path.is_dir() {
-        // Single file targeted at an existing directory → synth a name.
-        let hash_str = ticket.hash().to_string();
-        let short = hash_str.chars().take(12).collect::<String>();
-        abs_path = abs_path.join(format!("orbitxfer-{short}.blob"));
-    }
-
-    let mut lookup_addrs = vec![ticket_addr.clone()];
-    if let Some(relay) = ticket_addr.relay_urls().next().cloned() {
-        let relay_only = EndpointAddr::new(ticket_addr.id).with_relay_url(relay);
+    // ---- Endpoint + chat: created ONCE and reused for every ticket this
+    // process receives. A warm new-receive (start_receive_new) swaps the
+    // ticket/destination without rebuilding either, so chat is never
+    // dropped and the (same) sender connection stays warm — fixing the
+    // cold-respawn drop + first-attempt failure of the old kill+respawn.
+    let first_ticket: BlobTicket = ticket_str.parse().context("invalid ticket")?;
+    let first_addr = first_ticket.addr().clone();
+    let mut lookup_addrs = vec![first_addr.clone()];
+    if let Some(relay) = first_addr.relay_urls().next().cloned() {
+        let relay_only = EndpointAddr::new(first_addr.id).with_relay_url(relay);
         lookup_addrs.push(relay_only);
     }
-    let mut direct = EndpointAddr::new(ticket_addr.id);
-    for ip in ticket_addr.ip_addrs().cloned() {
+    let mut direct = EndpointAddr::new(first_addr.id);
+    for ip in first_addr.ip_addrs().cloned() {
         direct = direct.with_ip_addr(ip);
     }
     if direct.ip_addrs().next().is_some() {
         lookup_addrs.push(direct);
     }
-
     let lookup = MemoryLookup::from_endpoint_info(lookup_addrs);
     let endpoint = Endpoint::builder().address_lookup(lookup).bind().await?;
     emit_event(json!({ "type": "connect_start" }));
@@ -1588,143 +1577,41 @@ async fn run_receive(
     let receiver_addr = endpoint.addr();
     emit_line(&format!("Receiver endpoint addr: {}", describe_addr(&receiver_addr)));
 
-    // Optional: volunteer a label to the sender so they can see who's
-    // downloading. Opt-in — only sent when the user provided one. Best
-    // effort: a short timeout and any failure is ignored so the download
-    // proceeds regardless (e.g. older provider without the label ALPN).
-    if let Ok(label_raw) = env::var("ORBITXFER_RECEIVER_LABEL") {
-        let label = sanitize_label_text(&label_raw);
-        if !label.is_empty() {
-            match timeout(
-                Duration::from_secs(8),
-                send_receiver_label(&endpoint, ticket_addr.clone(), &label),
-            )
-            .await
-            {
-                Ok(Ok(())) => emit_line(&format!("Sent receiver label: {label}")),
-                Ok(Err(e)) => emit_line(&format!("Could not send receiver label: {e}")),
-                Err(_) => emit_line("Receiver label send timed out (provider may not support it)."),
-            }
-        }
-    }
+    // Transfer-only stop signalling (chat is unaffected).
+    let stop_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+    let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let resume_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+    // v0.1.98 — warm new-receive plumbing: a queued (ticket, dest, size)
+    // and a wake signal. The dispatcher fills these on start_receive_new;
+    // the 'outer loop drains them to switch tickets in-process.
+    let new_receive_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+    let pending_new_receive: std::sync::Arc<
+        std::sync::Mutex<Option<(String, String, Option<u64>)>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
 
-    let (store_dir, auto_store_cleanup) = store_root_for_receive(&abs_path)?;
-    std::fs::create_dir_all(&store_dir)?;
-
-    // v0.1.85 — Resume baseline. If the user stopped a previous
-    // receive (Stop button, sidecar kill, etc.) the `.orbitxfer-
-    // pieces/` store directory may already contain partial blob
-    // data for this hash. iroh-blobs IS resuming at the store
-    // level (we don't wipe the store between sessions), but the
-    // download_progress events from the downloader stream report
-    // ONLY this session's network bytes — they don't know about
-    // the bytes already on disk. Result: the progress bar starts
-    // at 0% even though a chunk of the file is already there.
-    //
-    // The fix: walk the store dir, sum the file sizes as a
-    // baseline, emit it as a `download_resume_baseline` event,
-    // and add it to every subsequent `download_progress.bytes`
-    // value so the bar reflects cumulative completion.
-    //
-    // CRITICAL ordering: we walk BEFORE `FsStore::load`. The load
-    // step reorganizes / compacts the on-disk format (partial
-    // data moves into blobs.db's internal layout), and by the
-    // time `load` returns the simple "sum directory file sizes"
-    // estimate undercounts wildly — first attempt at this had
-    // 597 MB on disk pre-load reporting as 1.1 MB after load.
-    //
-    // The walk is an over-estimate (includes blobs.db's
-    // SQLite-style overhead + per-blob .obao4/.sizes4 metadata),
-    // but the metadata overhead is single-digit MB for a multi-GB
-    // transfer. Good enough to make the bar honest.
-    let baseline_bytes = estimate_cached_bytes(&store_dir);
-    if baseline_bytes > 0 {
-        emit_line(&format!(
-            "Resuming with {} already cached.",
-            format_bytes(baseline_bytes)
-        ));
-        emit_event(json!({
-            "type": "download_resume_baseline",
-            "bytes": baseline_bytes,
-        }));
-    }
-
-    let store = FsStore::load(store_dir.clone()).await?;
-
-    emit_line("Checking provider connectivity...");
-    emit_event(json!({ "type": "connect_check_start" }));
-    let mut preflight_conn: Option<iroh::endpoint::Connection> = None;
-    match timeout(Duration::from_secs(8), endpoint.connect(ticket_addr.clone(), iroh_blobs::ALPN))
-        .await
-    {
-        Ok(Ok(conn)) => {
-            emit_line("Provider preflight connected.");
-            emit_event(json!({ "type": "connect_check_ok" }));
-            preflight_conn = Some(conn);
-        }
-        Ok(Err(err)) => {
-            emit_line(&format!("Provider preflight failed: {err}"));
-            emit_event(json!({
-                "type": "connect_check_failed",
-                "message": err.to_string()
-            }));
-        }
-        Err(_) => {
-            emit_line("Provider preflight timed out.");
-            emit_event(json!({
-                "type": "connect_check_failed",
-                "message": "timeout"
-            }));
-        }
-    }
-
-    // v0.1.85/88/89/90 — chat over the separate `orbitxfer/chat/1`
-    // ALPN. Best-effort: a chat failure never blocks the transfer.
-    //
-    // v0.1.90 — chat is bidirectional and independent of the transfer.
-    // The receiver uses the SAME `ChatCoordinator` as the sender:
-    //   - it AUTO-dials the sender and self-heals through drops
-    //     (spawn_auto_dialer),
-    //   - it also ACCEPTS inbound dials (a small Router on its own
-    //     endpoint), so the sender's Reconnect Chat can dial it back,
-    //   - it OUTLIVES the transfer: Stop Receive cancels the download
-    //     but the coordinator + process stay alive for chat; the
-    //     process exits when chat is closed (Stop Chat) or the window
-    //     closes (stdin EOF).
+    // v0.1.90 — chat is bidirectional and independent of the transfer:
+    // it auto-dials the sender, accepts inbound dials, and OUTLIVES the
+    // transfer (Stop cancels the download; the process stays alive for
+    // chat). It now also outlives a ticket SWITCH (warm new-receive).
     let chat_self_label = std::env::var("ORBITXFER_RECEIVER_LABEL")
         .ok()
         .map(|s| sanitize_label_text(&s))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Receiver".to_string());
-
-    // Shared stop signalling for the TRANSFER only (cancellable
-    // download loops). Stop Receive trips these; chat is unaffected.
-    let stop_signal = std::sync::Arc::new(tokio::sync::Notify::new());
-    let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // v0.1.94 — pulsed by the resume_receive command to re-run the
-    // download IN-PROCESS (no respawn), so chat survives a Stop->Resume.
-    let resume_signal = std::sync::Arc::new(tokio::sync::Notify::new());
-
     let chat = chat::ChatCoordinator::new(chat_self_label.clone(), endpoint.clone());
-    // Seed the dial target: the sender (from the ticket).
-    chat.set_peer(ticket_addr.clone());
-    // Accept inbound chat dials so the sender can reconnect to us.
+    chat.set_peer(first_addr.clone());
     let chat_router = Router::builder(endpoint.clone())
         .accept(chat::CHAT_ALPN, chat.clone())
         .spawn();
-    // Auto-dial the sender (first attempt → chat_unavailable on
-    // failure; later attempts → chat_reconnect_failed). Runs
-    // concurrently with the download.
     chat.spawn_auto_dialer(None);
 
-    // v0.1.85/86/88/89/90 — spawn the stdin command dispatcher.
-    // Services ChatSend / ChatStop / ReconnectChat against the
-    // coordinator, and signals StopReceive (transfer only) via the
-    // stop Notify + AtomicBool. It KEEPS running after Stop Receive so
-    // chat commands still work.
+    // stdin command dispatcher (chat send/stop/reconnect, stop/resume
+    // receive, and warm new-receive). Outlives the transfer.
     let stop_signal_for_dispatch = stop_signal.clone();
     let stop_requested_for_dispatch = stop_requested.clone();
     let resume_signal_for_dispatch = resume_signal.clone();
+    let new_receive_signal_for_dispatch = new_receive_signal.clone();
+    let pending_new_receive_for_dispatch = pending_new_receive.clone();
     let dispatch_chat = chat.clone();
     let cmd_dispatch_task = tokio::spawn(async move {
         let mut cmd_rx = cmd_rx;
@@ -1742,149 +1629,70 @@ async fn run_receive(
                     let _ = dispatch_chat.close().await;
                 }
                 chat::CliCommand::ReconnectChat => {
-                    // Try a chat connection now (shortcuts a backoff
-                    // sleep / wakes a parked dialer). No-op if already
-                    // connected.
                     dispatch_chat.request_reconnect();
                 }
                 chat::CliCommand::StopReceive => {
-                    // v0.1.90 — cancel the TRANSFER only. Do NOT close
-                    // chat: the coordinator + process stay alive so the
-                    // conversation continues and Reconnect Chat still
-                    // works. (Stop Chat closes chat; closing the window
-                    // exits the process.)
+                    // Cancel the TRANSFER only; chat stays alive.
                     stop_requested_for_dispatch
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                     stop_signal_for_dispatch.notify_waiters();
-                    // Keep dispatching (no `return`) so chat commands
-                    // keep being serviced after the transfer stops.
-                }
-                chat::CliCommand::StopSend => {
-                    // Not applicable on the receive side.
-                }
-                chat::CliCommand::ResumeSend => {
-                    // Not applicable on the receive side.
                 }
                 chat::CliCommand::ResumeReceive => {
-                    // v0.1.94 — warm in-process resume: wake the download
-                    // 'session loop to re-run from the partial store. No
-                    // respawn, so chat is undisturbed.
+                    // Warm in-process resume of the SAME ticket.
                     resume_signal_for_dispatch.notify_waiters();
                 }
-                chat::CliCommand::StartSendNew { .. } => {
+                chat::CliCommand::StartReceiveNew {
+                    ticket,
+                    output_path,
+                    expected_size,
+                } => {
+                    // Queue the new ticket, then cancel the in-flight
+                    // download (reuse the stop path) so the 'outer loop
+                    // reaches a rest point and switches to it.
+                    if let Ok(mut slot) = pending_new_receive_for_dispatch.lock() {
+                        *slot = Some((ticket, output_path, expected_size));
+                    }
+                    stop_requested_for_dispatch
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    stop_signal_for_dispatch.notify_waiters();
+                    new_receive_signal_for_dispatch.notify_waiters();
+                }
+                chat::CliCommand::StopSend
+                | chat::CliCommand::ResumeSend
+                | chat::CliCommand::StartSendNew { .. } => {
                     // Not applicable on the receive side.
                 }
             }
         }
     });
 
-    let expected_size = expected_size_from_env();
-    let mut total_size: Option<u64> = expected_size;
-    if let Some(size) = expected_size {
-        emit_line(&format!(
-            "Using expected size: {} ({})",
-            size,
-            format_bytes(size)
-        ));
-        emit_event(json!({ "type": "download_size", "total": size }));
-    }
-    let mut free_space: Option<u64> = None;
-    // observe() reports the bitfield/size of a SINGLE blob — for a HashSeq
-    // collection that's just the tiny root metadata blob, not the aggregate
-    // of all files. So we only use it to confirm/refine the total for single
-    // files. For folders the authoritative total is the sender's summed
-    // `# size=` value (ORBITXFER_EXPECTED_SIZE), already emitted above.
-    if !is_collection {
-        if let Some(conn) = preflight_conn.clone() {
-            let mut observe = store
-                .remote()
-                .observe(conn, ObserveRequest::new(ticket.hash()));
-            if let Ok(Some(Ok(bitfield))) = timeout(Duration::from_secs(6), observe.next()).await {
-                let size = bitfield.size();
-                total_size = Some(size);
-                emit_line(&format!("Remote reported size: {} ({})", size, format_bytes(size)));
-                if expected_size.map(|v| v != size).unwrap_or(true) {
-                    emit_event(json!({ "type": "download_size", "total": size }));
-                }
-            }
-        }
-    }
-
-    // For a folder, fetch just the tiny collection metadata up front so the
-    // UI can show the folder's file list/count WHILE the file data is still
-    // downloading. Best-effort: if it fails (older provider, transient
-    // error), we log and carry on — the file list just won't appear until
-    // the writing-to-disk phase.
-    if is_collection {
-        if let Some(conn) = preflight_conn.clone() {
-            match timeout(
-                Duration::from_secs(8),
-                prefetch_collection_files(&store, &conn, ticket.hash()),
-            )
-            .await
-            {
-                Ok(Ok(collection)) => {
-                    let total_files = collection.len();
-                    let mut names: Vec<String> =
-                        collection.iter().map(|(n, _)| n.clone()).collect();
-                    // Bound the event size for folders with very many files.
-                    let truncated = names.len() > 500;
-                    names.truncate(500);
-                    emit_line(&format!("Folder contains {total_files} files."));
-                    emit_event(json!({
-                        "type": "collection_files",
-                        "files": total_files,
-                        "names": names,
-                        "truncated": truncated
-                    }));
-                }
-                Ok(Err(e)) => {
-                    emit_line(&format!("Could not prefetch folder file list: {e}"))
-                }
-                Err(_) => emit_line("Folder file-list prefetch timed out."),
-            }
-        }
-    }
-
-    if let Ok(local) = store.remote().local(ticket.hash_and_format()).await {
-        let local_bytes = local.local_bytes();
-        if local_bytes > 0 {
-            emit_line(&format!(
-                "Local resume data available: {} ({})",
-                local_bytes,
-                format_bytes(local_bytes)
-            ));
-            emit_event(json!({
-                "type": "download_resume_state",
-                "bytes": local_bytes,
-                "total": total_size
-            }));
-        }
-    }
-
-    if let Ok(space) = available_space(&store_dir) {
-        free_space = Some(space);
-        emit_line(&format!(
-            "Free space at store: {} ({})",
-            space,
-            format_bytes(space)
-        ));
-    }
-
-    if let (Some(size), Some(space)) = (total_size, free_space) {
-        let required = size + size / 20 + 64 * 1024 * 1024;
-        if space < required
-            && env::var("ORBITXFER_SKIP_SPACE_CHECK").ok().as_deref() != Some("1")
-        {
-            let msg = format!(
-                "Not enough free space. Need about {} but only {} available.",
-                format_bytes(required),
-                format_bytes(space)
-            );
-            emit_error("disk_space", &msg);
-            return Err(anyhow!(msg));
-        }
-    }
+    // ---- per-ticket loop. Each iteration receives ONE ticket; a warm
+    // new-receive `continue 'outer`s with the next ticket, reusing the
+    // endpoint + chat above. ----
+    let mut next_receive: Option<(String, PathBuf, Option<u64>)> =
+        Some((ticket_str, output_path, expected_size_from_env()));
+    'outer: loop {
+        let (cur_ticket_str, cur_output, cur_expected) = match next_receive.take() {
+            Some(v) => v,
+            None => break 'outer,
+        };
+        let st =
+            prepare_receive_ticket(&endpoint, &cur_ticket_str, &cur_output, cur_expected).await?;
+        // (Re)target chat at this ticket's sender. Harmless on the first
+        // pass; essential when a new ticket is from a different sender.
+        chat.set_peer(st.ticket_addr.clone());
+        let ReceiveTicketState {
+            ticket,
+            ticket_addr,
+            is_collection,
+            abs_path,
+            store,
+            store_dir,
+            auto_store_cleanup,
+            baseline_bytes,
+            total_size,
+            mut preflight_conn,
+        } = st;
 
     let max_attempts: u32 = env::var("ORBITXFER_DOWNLOAD_ATTEMPTS")
         .ok()
@@ -2234,25 +2042,75 @@ async fn run_receive(
     // survives); otherwise (chat done / window closed) we fall through
     // and exit, with the partial store preserved.
         if user_stopped {
-            emit_event(json!({ "type": "receive_stopped" }));
-            emit_line("Receive stopped by user; chat remains available.");
-            if wait_for_resume_or_done(&chat, &resume_signal).await {
-                continue 'session;
+            // A queued new-receive means this "stop" is really a ticket
+            // switch — don't flash "stopped" in that case.
+            let switching = pending_new_receive
+                .lock()
+                .map(|g| g.is_some())
+                .unwrap_or(false);
+            if !switching {
+                emit_event(json!({ "type": "receive_stopped" }));
+                emit_line("Receive stopped by user; chat remains available.");
             }
-            break 'session;
+            match wait_for_action(
+                &chat,
+                &resume_signal,
+                &new_receive_signal,
+                &pending_new_receive,
+                true,
+            )
+            .await
+            {
+                ReceiveAction::Resume => continue 'session,
+                ReceiveAction::NewReceive => {
+                    // Preserve the partial store, then switch tickets on
+                    // the SAME endpoint (warm new-receive).
+                    let _ = store.shutdown().await;
+                    if let Some((t, o, e)) =
+                        pending_new_receive.lock().ok().and_then(|mut g| g.take())
+                    {
+                        next_receive = Some((t, PathBuf::from(o), e));
+                    }
+                    continue 'outer;
+                }
+                ReceiveAction::Exit => break 'session,
+            }
         }
         if !overall_succeeded {
-            match last_err {
-                Some(ref err) => emit_error("download", err),
-                None => emit_error(
-                    "download",
-                    &anyhow!("download cancelled or budget exhausted"),
-                ),
+            let switching = pending_new_receive
+                .lock()
+                .map(|g| g.is_some())
+                .unwrap_or(false);
+            if !switching {
+                match last_err {
+                    Some(ref err) => emit_error("download", err),
+                    None => emit_error(
+                        "download",
+                        &anyhow!("download cancelled or budget exhausted"),
+                    ),
+                }
             }
-            if wait_for_resume_or_done(&chat, &resume_signal).await {
-                continue 'session;
+            match wait_for_action(
+                &chat,
+                &resume_signal,
+                &new_receive_signal,
+                &pending_new_receive,
+                true,
+            )
+            .await
+            {
+                ReceiveAction::Resume => continue 'session,
+                ReceiveAction::NewReceive => {
+                    let _ = store.shutdown().await;
+                    if let Some((t, o, e)) =
+                        pending_new_receive.lock().ok().and_then(|mut g| g.take())
+                    {
+                        next_receive = Some((t, PathBuf::from(o), e));
+                    }
+                    continue 'outer;
+                }
+                ReceiveAction::Exit => break 'session,
             }
-            break 'session;
         }
         // Success — finalize below.
         completed = true;
@@ -2327,80 +2185,307 @@ async fn run_receive(
         }
     }
 
-    // v0.1.88/90 — keep the receiver process alive after the transfer
-    // completes for as long as chat wants to live (see chat_keepalive).
-    chat_keepalive(&chat).await;
-    } else {
-        // v0.1.94 — the download stopped or errored and chat is done,
-        // so we're exiting. Flush (but preserve) the partial store for
-        // a later Resume Last Receive.
-        let _ = store.shutdown().await;
+    // v0.1.98 — keep the process alive for chat after the transfer, AND
+    // accept a warm new-receive: if the user starts a second ticket,
+    // switch to it on the SAME endpoint (chat undisturbed) instead of
+    // cold-respawning.
+    match wait_for_action(
+        &chat,
+        &resume_signal,
+        &new_receive_signal,
+        &pending_new_receive,
+        false,
+    )
+    .await
+    {
+        ReceiveAction::NewReceive => {
+            if let Some((t, o, e)) =
+                pending_new_receive.lock().ok().and_then(|mut g| g.take())
+            {
+                next_receive = Some((t, PathBuf::from(o), e));
+            }
+            continue 'outer;
+        }
+        // Resume is disabled here (a finished transfer has nothing to
+        // resume); Exit falls through to the shutdown below.
+        _ => break 'outer,
     }
+    } else {
+        // v0.1.94 — the download stopped/errored and the user chose to
+        // exit (chat done / window closed). Flush but PRESERVE the
+        // partial store for a later Resume Last Receive, then exit.
+        let _ = store.shutdown().await;
+        break 'outer;
+    }
+    }
+    // ---- end of the per-ticket 'outer loop ----
 
     // Stop the dispatcher and shut down cleanly.
     cmd_dispatch_task.abort();
 
     emit_line("Shutting down.");
-    // v0.1.90 — exit decisively (see the user_stopped path above): a
-    // bounded router shutdown closes the endpoint, then force exit so
-    // the blocking stdin reader can't keep the process alive.
+    // v0.1.90 — exit decisively: a bounded router shutdown closes the
+    // endpoint, then force exit so the blocking stdin reader can't keep
+    // the process alive.
     let _ = tokio::time::timeout(Duration::from_secs(2), chat_router.shutdown()).await;
     std::process::exit(0);
 }
 
-/// v0.1.90 — linger for chat after the transfer ends. The process
-/// stays alive while the coordinator still wants to (a session is live,
-/// a dialer is healing, or a chat connected at least once and the user
-/// hasn't closed it). Exits when chat is done (Stop Chat / never
-/// connected) or ctrl-c; the window closing trips stdin EOF, which
-/// exits the process directly. Independent of the transfer's stop
-/// signals — chat keeps working after Stop Receive.
-async fn chat_keepalive(chat: &chat::ChatCoordinator) {
-    if !chat.should_linger() {
-        return;
-    }
-    emit_event(json!({ "type": "chat_keepalive_started" }));
-    loop {
-        if !chat.should_linger() {
-            break;
-        }
-        tokio::select! {
-            _ = chat.wait_ended() => {}
-            // Periodic re-check: cheap insurance against a missed wake.
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-            _ = tokio::signal::ctrl_c() => break,
-        }
-    }
-    emit_event(json!({ "type": "chat_keepalive_ended" }));
+/// v0.1.98 — what the receiver should do after the current download
+/// reaches a resting point (stopped, errored, or completed): re-run the
+/// same ticket (warm resume), switch to a NEW ticket (warm new-receive),
+/// or exit the process.
+enum ReceiveAction {
+    Resume,
+    NewReceive,
+    Exit,
 }
 
-/// v0.1.94 — after the download stops or errors, linger for chat (like
-/// chat_keepalive) BUT also watch for a resume_receive command. Returns
-/// `true` to re-run the download IN-PROCESS (warm resume, chat
-/// undisturbed), or `false` to exit (chat is done / ctrl-c — the GUI
-/// will cold-respawn for a resume in that case). Chat stays live
-/// throughout the wait.
-async fn wait_for_resume_or_done(
+/// v0.1.98 — unified linger-and-wait used at every resting point of the
+/// receive 'outer loop. Supersedes `wait_for_resume_or_done` /
+/// `chat_keepalive`: it ALSO watches for a `start_receive_new` command so
+/// the user can accept a second ticket in the SAME process (warm endpoint
+/// + live chat, no respawn). A queued new-receive always wins immediately.
+/// `allow_resume` is false at the post-completion rest (a finished
+/// transfer has nothing to resume) and true after a stop/error.
+async fn wait_for_action(
     chat: &chat::ChatCoordinator,
     resume: &tokio::sync::Notify,
-) -> bool {
-    // If chat isn't keeping us alive, there's nothing to preserve — let
-    // the process exit so a resume is a clean cold respawn.
+    new_receive: &tokio::sync::Notify,
+    pending_new: &std::sync::Mutex<Option<(String, String, Option<u64>)>>,
+    allow_resume: bool,
+) -> ReceiveAction {
+    // A queued new-receive takes priority over everything, even if chat
+    // is no longer lingering — the user explicitly asked for it.
+    if pending_new.lock().map(|g| g.is_some()).unwrap_or(false) {
+        return ReceiveAction::NewReceive;
+    }
+    // Nothing keeping us alive and nothing queued → exit.
     if !chat.should_linger() {
-        return false;
+        return ReceiveAction::Exit;
     }
     emit_event(json!({ "type": "chat_keepalive_started" }));
     let result = loop {
+        if pending_new.lock().map(|g| g.is_some()).unwrap_or(false) {
+            break ReceiveAction::NewReceive;
+        }
         if !chat.should_linger() {
-            break false;
+            break ReceiveAction::Exit;
         }
         tokio::select! {
-            _ = resume.notified() => break true,
+            _ = resume.notified(), if allow_resume => break ReceiveAction::Resume,
+            _ = new_receive.notified() => break ReceiveAction::NewReceive,
             _ = chat.wait_ended() => {}
             _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-            _ = tokio::signal::ctrl_c() => break false,
+            _ = tokio::signal::ctrl_c() => break ReceiveAction::Exit,
         }
     };
     emit_event(json!({ "type": "chat_keepalive_ended" }));
     result
+}
+
+/// v0.1.98 — everything about a single receive that is derived from the
+/// ticket + destination. Recomputed each time the receiver switches to a
+/// new ticket (warm new-receive), while the endpoint and chat persist.
+struct ReceiveTicketState {
+    ticket: BlobTicket,
+    ticket_addr: EndpointAddr,
+    is_collection: bool,
+    abs_path: PathBuf,
+    store: FsStore,
+    store_dir: PathBuf,
+    auto_store_cleanup: bool,
+    baseline_bytes: u64,
+    total_size: Option<u64>,
+    preflight_conn: Option<iroh::endpoint::Connection>,
+}
+
+/// v0.1.98 — per-ticket setup, factored out of `run_receive` so a warm
+/// new-receive can re-run it on the EXISTING endpoint. Parses the ticket,
+/// resolves the destination, opens (or resumes) the per-destination store,
+/// preflights the provider, and probes size / folder file-list. The
+/// endpoint and chat are owned by `run_receive` and reused across calls.
+async fn prepare_receive_ticket(
+    endpoint: &Endpoint,
+    ticket_str: &str,
+    output_path: &Path,
+    expected_size: Option<u64>,
+) -> Result<ReceiveTicketState> {
+    let ticket: BlobTicket = ticket_str.parse().context("invalid ticket")?;
+    let ticket_addr = ticket.addr().clone();
+    emit_line(&format!("Ticket addr: {}", describe_addr(&ticket_addr)));
+    let is_collection = matches!(ticket.hash_and_format().format, BlobFormat::HashSeq);
+    let mut abs_path = abs_path(output_path)?;
+    if is_collection {
+        emit_line(&format!("Receiving a folder into: {}", abs_path.display()));
+        emit_event(json!({ "type": "receive_kind", "kind": "folder" }));
+    } else if abs_path.is_dir() {
+        let hash_str = ticket.hash().to_string();
+        let short = hash_str.chars().take(12).collect::<String>();
+        abs_path = abs_path.join(format!("orbitxfer-{short}.blob"));
+    }
+
+    // Optional: volunteer a label to the sender so they can see who's
+    // downloading. Opt-in — only sent when the user provided one.
+    if let Ok(label_raw) = env::var("ORBITXFER_RECEIVER_LABEL") {
+        let label = sanitize_label_text(&label_raw);
+        if !label.is_empty() {
+            match timeout(
+                Duration::from_secs(8),
+                send_receiver_label(endpoint, ticket_addr.clone(), &label),
+            )
+            .await
+            {
+                Ok(Ok(())) => emit_line(&format!("Sent receiver label: {label}")),
+                Ok(Err(e)) => emit_line(&format!("Could not send receiver label: {e}")),
+                Err(_) => emit_line("Receiver label send timed out (provider may not support it)."),
+            }
+        }
+    }
+
+    let (store_dir, auto_store_cleanup) = store_root_for_receive(&abs_path)?;
+    std::fs::create_dir_all(&store_dir)?;
+
+    // Resume baseline (walk BEFORE FsStore::load — see the long note in the
+    // git history): sum the partial store so the progress bar reflects
+    // bytes already on disk.
+    let baseline_bytes = estimate_cached_bytes(&store_dir);
+    if baseline_bytes > 0 {
+        emit_line(&format!(
+            "Resuming with {} already cached.",
+            format_bytes(baseline_bytes)
+        ));
+        emit_event(json!({
+            "type": "download_resume_baseline",
+            "bytes": baseline_bytes,
+        }));
+    }
+
+    let store = FsStore::load(store_dir.clone()).await?;
+
+    emit_line("Checking provider connectivity...");
+    emit_event(json!({ "type": "connect_check_start" }));
+    let mut preflight_conn: Option<iroh::endpoint::Connection> = None;
+    match timeout(Duration::from_secs(8), endpoint.connect(ticket_addr.clone(), iroh_blobs::ALPN))
+        .await
+    {
+        Ok(Ok(conn)) => {
+            emit_line("Provider preflight connected.");
+            emit_event(json!({ "type": "connect_check_ok" }));
+            preflight_conn = Some(conn);
+        }
+        Ok(Err(err)) => {
+            emit_line(&format!("Provider preflight failed: {err}"));
+            emit_event(json!({
+                "type": "connect_check_failed",
+                "message": err.to_string()
+            }));
+        }
+        Err(_) => {
+            emit_line("Provider preflight timed out.");
+            emit_event(json!({
+                "type": "connect_check_failed",
+                "message": "timeout"
+            }));
+        }
+    }
+
+    let mut total_size: Option<u64> = expected_size;
+    if let Some(size) = expected_size {
+        emit_line(&format!("Using expected size: {} ({})", size, format_bytes(size)));
+        emit_event(json!({ "type": "download_size", "total": size }));
+    }
+    let mut free_space: Option<u64> = None;
+    if !is_collection {
+        if let Some(conn) = preflight_conn.clone() {
+            let mut observe = store
+                .remote()
+                .observe(conn, ObserveRequest::new(ticket.hash()));
+            if let Ok(Some(Ok(bitfield))) = timeout(Duration::from_secs(6), observe.next()).await {
+                let size = bitfield.size();
+                total_size = Some(size);
+                emit_line(&format!("Remote reported size: {} ({})", size, format_bytes(size)));
+                if expected_size.map(|v| v != size).unwrap_or(true) {
+                    emit_event(json!({ "type": "download_size", "total": size }));
+                }
+            }
+        }
+    }
+
+    if is_collection {
+        if let Some(conn) = preflight_conn.clone() {
+            match timeout(
+                Duration::from_secs(8),
+                prefetch_collection_files(&store, &conn, ticket.hash()),
+            )
+            .await
+            {
+                Ok(Ok(collection)) => {
+                    let total_files = collection.len();
+                    let mut names: Vec<String> =
+                        collection.iter().map(|(n, _)| n.clone()).collect();
+                    let truncated = names.len() > 500;
+                    names.truncate(500);
+                    emit_line(&format!("Folder contains {total_files} files."));
+                    emit_event(json!({
+                        "type": "collection_files",
+                        "files": total_files,
+                        "names": names,
+                        "truncated": truncated
+                    }));
+                }
+                Ok(Err(e)) => emit_line(&format!("Could not prefetch folder file list: {e}")),
+                Err(_) => emit_line("Folder file-list prefetch timed out."),
+            }
+        }
+    }
+
+    if let Ok(local) = store.remote().local(ticket.hash_and_format()).await {
+        let local_bytes = local.local_bytes();
+        if local_bytes > 0 {
+            emit_line(&format!(
+                "Local resume data available: {} ({})",
+                local_bytes,
+                format_bytes(local_bytes)
+            ));
+            emit_event(json!({
+                "type": "download_resume_state",
+                "bytes": local_bytes,
+                "total": total_size
+            }));
+        }
+    }
+
+    if let Ok(space) = available_space(&store_dir) {
+        free_space = Some(space);
+        emit_line(&format!("Free space at store: {} ({})", space, format_bytes(space)));
+    }
+
+    if let (Some(size), Some(space)) = (total_size, free_space) {
+        let required = size + size / 20 + 64 * 1024 * 1024;
+        if space < required
+            && env::var("ORBITXFER_SKIP_SPACE_CHECK").ok().as_deref() != Some("1")
+        {
+            let msg = format!(
+                "Not enough free space. Need about {} but only {} available.",
+                format_bytes(required),
+                format_bytes(space)
+            );
+            emit_error("disk_space", &msg);
+            return Err(anyhow!(msg));
+        }
+    }
+
+    Ok(ReceiveTicketState {
+        ticket,
+        ticket_addr,
+        is_collection,
+        abs_path,
+        store,
+        store_dir,
+        auto_store_cleanup,
+        baseline_bytes,
+        total_size,
+        preflight_conn,
+    })
 }

@@ -2283,18 +2283,36 @@ function App() {
     setRecvRetryInfo(null);
     setRecvRetryReason(null);
     try {
-      // Pass expectedSize so the CLI seeds its own download total from
-      // the same canonical value and emits `download_size` immediately —
-      // long before observe() lands. Both sides now share the exact
-      // same denominator. Pass undefined when missing so Tauri's serde
-      // sees Option<u64>::None rather than 0.
-      await invoke("start_receive", {
-        ticket,
-        outputPath: finalDest,
-        expectedSize: seededTotal !== null ? seededTotal : undefined,
-        // Opt-in: only send a label if the user typed one.
-        receiverLabel: receiverLabel.trim() ? receiverLabel.trim() : undefined,
-      });
+      // v0.1.98 — if a receiver process is still alive (lingering for
+      // chat after a previous transfer), receive this NEW ticket
+      // IN-PROCESS: the chat survives and we reuse the warm,
+      // already-connected endpoint instead of cold-respawning (which
+      // dropped chat and raced connection setup, erroring the first try).
+      // Returns false when no process is running → cold start below.
+      let warm = false;
+      try {
+        warm = await invoke<boolean>("start_receive_new_warm", {
+          ticket,
+          outputPath: finalDest,
+          expectedSize: seededTotal !== null ? seededTotal : undefined,
+        });
+      } catch (err) {
+        console.warn("warm new-receive failed; falling back to cold start:", err);
+      }
+      if (!warm) {
+        // Pass expectedSize so the CLI seeds its own download total from
+        // the same canonical value and emits `download_size` immediately —
+        // long before observe() lands. Both sides now share the exact
+        // same denominator. Pass undefined when missing so Tauri's serde
+        // sees Option<u64>::None rather than 0.
+        await invoke("start_receive", {
+          ticket,
+          outputPath: finalDest,
+          expectedSize: seededTotal !== null ? seededTotal : undefined,
+          // Opt-in: only send a label if the user typed one.
+          receiverLabel: receiverLabel.trim() ? receiverLabel.trim() : undefined,
+        });
+      }
       const entry: LastReceive = {
         ticketInput: rawInput,
         outputPath: finalDest,

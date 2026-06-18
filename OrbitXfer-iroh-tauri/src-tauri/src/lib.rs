@@ -898,6 +898,45 @@ async fn resume_receive_warm(
     }
 }
 
+/// v0.1.98 — receive a NEW ticket in the EXISTING receive process (no
+/// respawn), mirroring `start_send_new_warm`. If the receive process is
+/// still alive (it stays up for chat after a completed/stopped transfer),
+/// writes an OX_CMD that switches it to `ticket`/`output_path` on the
+/// SAME endpoint, so the chat is never dropped and there's no cold
+/// connection setup. Returns `true` when it switched warm; `false` tells
+/// the frontend to cold-spawn a fresh `start_receive` instead.
+#[tauri::command]
+async fn start_receive_new_warm(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    ticket: String,
+    output_path: String,
+    expected_size: Option<u64>,
+) -> Result<bool, String> {
+    let alive = {
+        let guard = state
+            .windows
+            .lock()
+            .map_err(|e| format!("state poisoned: {e}"))?;
+        guard
+            .get(window.label())
+            .map(|ws| ws.receiver.is_some())
+            .unwrap_or(false)
+    };
+    if alive {
+        let payload = serde_json::json!({
+            "type": "start_receive_new",
+            "ticket": ticket,
+            "output_path": output_path,
+            "expected_size": expected_size,
+        });
+        write_ox_cmd(&state, window.label(), Slot::Recv, &payload.to_string())?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// v0.1.85 — push a chat text message into the active sidecar's stdin.
 /// We try the sender slot first, then the receiver — whichever is
 /// currently hosting the chat session in this window.
@@ -1237,6 +1276,7 @@ pub fn run() {
             start_receive,
             stop_receive,
             resume_receive_warm,
+            start_receive_new_warm,
             // v0.1.85 — chat-while-you-transfer.
             send_chat_message,
             stop_chat,
