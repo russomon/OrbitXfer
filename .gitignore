@@ -12,6 +12,12 @@ pnpm-debug.log*
 OrbitXfer-iroh-gui/dist/
 legacy/
 
+# Tauri build output
+OrbitXfer-iroh-tauri/dist/
+OrbitXfer-iroh-tauri/src-tauri/target/
+OrbitXfer-iroh-tauri/src-tauri/binaries/
+OrbitXfer-iroh-tauri/tauri.env
+
 # Rust
 OrbitXfer-iroh-cli/target/
 
@@ -22,3 +28,9 @@ OrbitXfer-iroh-gui/bin/orbitxfer-iroh-cli.exe
 # Local env
 .env
 .env.*
+.envrc
+
+# Signing and notarization secrets
+*.p12
+*.p8
+*.cer
